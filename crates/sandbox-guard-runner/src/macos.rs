@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::linux::{
-    guest_bwrap_args, guest_helper_path, network_warnings, wrap_guest_cgroup,
+    cgroup_probe_args, guest_bwrap_args, guest_helper_path, network_warnings, wrap_guest_cgroup,
     write_environment_file,
 };
 use crate::{
@@ -76,7 +76,7 @@ impl MacosLimaRunner {
         } else {
             None
         };
-        let (use_cgroup, mut warnings) = match resolve_guest_cgroup(&limactl, request) {
+        let (use_cgroup, mut warnings) = match resolve_guest_cgroup(&limactl, request, &helper) {
             Ok(result) => result,
             Err(error) => {
                 stop_proxy(&mut proxy);
@@ -108,7 +108,11 @@ impl MacosLimaRunner {
                 source,
             });
         let status = status_result?;
-        let retrieve_result = retrieve_guest_workspace(&limactl, request, &guest_root);
+        let retrieve_result =
+            create_retrieval_canary(&limactl, request, &guest_root).and_then(|canary| {
+                retrieve_guest_workspace(&limactl, request, &guest_root)?;
+                verify_retrieval_canary(request, &canary)
+            });
         let egress_audit = read_guest_egress_audit(&limactl, request, &guest_root);
         stop_proxy(&mut proxy);
         let cleanup_result = cleanup_guest(&limactl, request, &guest_root);
@@ -188,6 +192,52 @@ fn retrieve_guest_workspace(
         source,
     })?;
     Ok(())
+}
+
+fn create_retrieval_canary(
+    limactl: &Path,
+    request: &RunRequest,
+    guest_root: &Path,
+) -> Result<(String, String), RunnerError> {
+    let name = format!(".sandbox-guard-rsync-canary-{}", request.run_id);
+    let target = format!(".sandbox-guard-rsync-target-{}", request.run_id);
+    run_checked(
+        limactl,
+        shell_command(
+            request,
+            [
+                OsString::from("ln"),
+                OsString::from("-s"),
+                OsString::from("--"),
+                OsString::from(&target),
+                guest_root.join("workspace").join(&name).into_os_string(),
+            ],
+        ),
+        "create Lima retrieval link canary",
+    )?;
+    Ok((name, target))
+}
+
+fn verify_retrieval_canary(
+    request: &RunRequest,
+    (name, target): &(String, String),
+) -> Result<(), RunnerError> {
+    let canary = request.workspace.join(name);
+    let metadata = fs::symlink_metadata(&canary).map_err(|source| RunnerError::Inspect {
+        path: canary.clone(),
+        source,
+    })?;
+    if !metadata.file_type().is_symlink()
+        || fs::read_link(&canary).ok().as_deref() != Some(Path::new(target))
+    {
+        return Err(RunnerError::SetupFailed(
+            "Lima rsync retrieval did not preserve a hostile-link canary".to_owned(),
+        ));
+    }
+    fs::remove_file(&canary).map_err(|source| RunnerError::Inspect {
+        path: canary,
+        source,
+    })
 }
 
 fn start_mountless_instance(limactl: &Path, instance: &str) -> Result<(), RunnerError> {
@@ -328,6 +378,23 @@ fn copy_workspace_and_environment(
         ),
         "secure private Lima environment",
     )?;
+    let delivered_mode = run_checked(
+        limactl,
+        shell_command(
+            request,
+            [
+                OsString::from("stat"),
+                OsString::from("--format=%a"),
+                guest_root.join("environment.json").into_os_string(),
+            ],
+        ),
+        "verify private Lima environment mode",
+    )?;
+    if String::from_utf8_lossy(&delivered_mode.stdout).trim() != "600" {
+        return Err(RunnerError::SetupFailed(
+            "Lima environment file was not delivered with mode 0600".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -421,6 +488,7 @@ fn stop_proxy(proxy: &mut Option<Child>) {
 fn resolve_guest_cgroup(
     limactl: &Path,
     request: &RunRequest,
+    helper: &Path,
 ) -> Result<(bool, Vec<String>), RunnerError> {
     if request.cgroup_mode == CgroupMode::Disabled {
         return Ok((
@@ -429,18 +497,11 @@ fn resolve_guest_cgroup(
         ));
     }
     let status = Command::new(limactl)
-        .args(shell_command(
-            request,
-            [
-                OsString::from("systemd-run"),
-                OsString::from("--user"),
-                OsString::from("--scope"),
-                OsString::from("--quiet"),
-                OsString::from("--collect"),
-                OsString::from("--"),
-                OsString::from("true"),
-            ],
-        ))
+        .args(shell_command(request, {
+            let mut command = vec![OsString::from("systemd-run")];
+            command.extend(cgroup_probe_args(request, helper));
+            command
+        }))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()

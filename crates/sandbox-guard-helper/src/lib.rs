@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 pub use proxy::{ProxyConfig, ProxyError, run_proxy};
 pub use supervisor::{
-    ProbeConfig, ProbeReport, SuperviseConfig, SupervisorError, run_probe, supervise,
+    ControlledProxyProbeConfig, ProbeConfig, ProbeReport, SuperviseConfig, SupervisorError,
+    run_controlled_proxy_probe, run_probe, supervise, verify_current_cgroup,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

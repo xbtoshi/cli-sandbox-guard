@@ -74,6 +74,8 @@ explicitly for one run.
 - The first TLS record must be a ClientHello whose SNI exactly equals the CONNECT hostname before
   any client bytes are sent upstream.
 - The audit contains only a timestamp and successful destination hostname/port.
+- Handshakes have wall-clock deadlines, tunnels have idle timeouts, and concurrent proxy/relay
+  connections are bounded.
 
 These controls constrain destinations, not information flow to an allowed destination. The proxy
 does not inspect HTTP paths or encrypted payloads. A malicious tool can send all staged content and
@@ -84,7 +86,9 @@ every intentionally forwarded credential to an allowlisted service.
 The supervisor sets `RLIMIT_CORE=0` plus configured address-space, output-file-size, CPU-time,
 open-file, and process-count limits. With delegated cgroup v2, Guard also applies memory, swap,
 task-count, and CPU-quota controls to the entire Bubblewrap scope. `required` mode fails if this
-cannot be established; `best-effort` records a warning and retains rlimits/seccomp.
+cannot be established; `best-effort` records a warning and retains rlimits/seccomp. Capability is
+probed with the same controller properties before the run, and a helper inside that scope reads
+back `memory.max`, `memory.swap.max`, `pids.max`, and `cpu.max` before enforcement is reported.
 
 The seccomp profile is an architecture-checked classic-BPF deny profile. It rejects namespace and
 mount operations and namespace flags to `clone`; it makes `clone3` unavailable so libc falls back
@@ -92,6 +96,12 @@ to the filterable `clone` ABI. It also rejects BPF, perf, io_uring, file-handle 
 cross-process memory access, ptrace, `pidfd_getfd`, userfaultfd, module/reboot/swap/accounting, and
 kernel-keyring operations. Seccomp filters syscall numbers and arguments, not pathnames. Filesystem
 isolation remains the pathname boundary.
+
+Audit enforcement booleans mean the corresponding setup completed: a failed seccomp `pre_exec`
+aborts process creation, while cgroup `true` requires the real-property capability probe and the
+controller-file readback plus the systemd-wrapped invocation. `guard test` separately executes a
+capability-independent denied
+process-memory syscall, compares every configured rlimit, and exercises controlled-proxy denial.
 
 ## Change-export invariants
 

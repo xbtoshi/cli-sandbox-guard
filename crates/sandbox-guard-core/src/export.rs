@@ -338,12 +338,20 @@ pub fn export_changes(
         rejected,
     };
     write_manifest(&temp.path().join("manifest.json"), &manifest)?;
-    let temporary_path = temp.keep();
-    fs::rename(&temporary_path, &destination).map_err(|source| ExportError::Io {
+    sync_export_directories(temp.path())?;
+    fs::rename(temp.path(), &destination).map_err(|source| ExportError::Io {
         operation: "publish atomic change export",
         path: destination.clone(),
         source,
     })?;
+    let _published_path = temp.keep();
+    File::open(&parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ExportError::Io {
+            operation: "sync published change export parent",
+            path: parent,
+            source,
+        })?;
     Ok(ExportReport {
         destination,
         manifest,
@@ -398,6 +406,35 @@ fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf, ExportError> {
 fn current_uid() -> u32 {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() }
+}
+
+fn sync_export_directories(path: &Path) -> Result<(), ExportError> {
+    for entry in fs::read_dir(path).map_err(|source| ExportError::Io {
+        operation: "read export directory for synchronization",
+        path: path.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| ExportError::Io {
+            operation: "read export directory entry for synchronization",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| ExportError::Io {
+            operation: "inspect export directory entry for synchronization",
+            path: entry.path(),
+            source,
+        })?;
+        if file_type.is_dir() {
+            sync_export_directories(&entry.path())?;
+        }
+    }
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ExportError::Io {
+            operation: "sync export directory",
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn map_copy_error(error: CopyError, path: &Path, limit: u64) -> ExportError {

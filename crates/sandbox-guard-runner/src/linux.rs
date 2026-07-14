@@ -84,7 +84,7 @@ impl LinuxBwrapRunner {
         } else {
             None
         };
-        let (use_cgroup, mut warnings) = resolve_cgroup_mode(request.cgroup_mode)?;
+        let (use_cgroup, mut warnings) = resolve_cgroup_mode(request, &helper)?;
         let plan = Self::build_plan(request, bwrap, helper, runtime.root(), use_cgroup)?;
         warnings.extend(plan.warnings.clone());
         let status = Command::new(&plan.program)
@@ -477,7 +477,8 @@ fn supervisor_args(
 }
 
 pub(crate) fn wrap_guest_cgroup(request: &RunRequest, bwrap_args: Vec<OsString>) -> Vec<OsString> {
-    let mut args = systemd_scope_args(request);
+    let mut args = vec![OsString::from("systemd-run")];
+    args.extend(systemd_scope_args(request));
     push(&mut args, "bwrap");
     args.extend(bwrap_args);
     args
@@ -495,12 +496,16 @@ fn wrap_in_systemd_scope(
 }
 
 fn systemd_scope_args(request: &RunRequest) -> Vec<OsString> {
+    systemd_scope_args_for_unit(request, &format!("sandbox-guard-{}", request.run_id))
+}
+
+fn systemd_scope_args_for_unit(request: &RunRequest, unit: &str) -> Vec<OsString> {
     let limits = request.resource_limits;
     let mut args = Vec::new();
     for value in ["--user", "--scope", "--quiet", "--collect"] {
         push(&mut args, value);
     }
-    args.push(format!("--unit=sandbox-guard-{}", request.run_id).into());
+    args.push(format!("--unit={unit}").into());
     for property in [
         format!("MemoryMax={}", limits.memory_bytes),
         "MemorySwapMax=0".to_owned(),
@@ -514,8 +519,27 @@ fn systemd_scope_args(request: &RunRequest) -> Vec<OsString> {
     args
 }
 
-fn resolve_cgroup_mode(mode: CgroupMode) -> Result<(bool, Vec<String>), RunnerError> {
-    if mode == CgroupMode::Disabled {
+pub(crate) fn cgroup_probe_args(request: &RunRequest, helper: &Path) -> Vec<OsString> {
+    let unit = format!("sandbox-guard-probe-{}", uuid::Uuid::new_v4());
+    let mut args = systemd_scope_args_for_unit(request, &unit);
+    args.push(helper.as_os_str().to_owned());
+    push(&mut args, "cgroup-probe");
+    for (name, value) in [
+        ("--memory-bytes", request.resource_limits.memory_bytes),
+        ("--max-processes", request.resource_limits.max_processes),
+        ("--cpu-percent", request.resource_limits.cpu_percent),
+    ] {
+        push(&mut args, name);
+        args.push(value.to_string().into());
+    }
+    args
+}
+
+fn resolve_cgroup_mode(
+    request: &RunRequest,
+    helper: &Path,
+) -> Result<(bool, Vec<String>), RunnerError> {
+    if request.cgroup_mode == CgroupMode::Disabled {
         return Ok((
             false,
             vec!["cgroup enforcement disabled by request".to_owned()],
@@ -525,7 +549,7 @@ fn resolve_cgroup_mode(mode: CgroupMode) -> Result<(bool, Vec<String>), RunnerEr
         .ok()
         .and_then(|program| {
             Command::new(program)
-                .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+                .args(cgroup_probe_args(request, helper))
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -534,7 +558,7 @@ fn resolve_cgroup_mode(mode: CgroupMode) -> Result<(bool, Vec<String>), RunnerEr
         .is_some_and(|status| status.success());
     if available {
         Ok((true, Vec::new()))
-    } else if mode == CgroupMode::Required {
+    } else if request.cgroup_mode == CgroupMode::Required {
         Err(RunnerError::CgroupUnavailable)
     } else {
         Ok((
@@ -756,6 +780,22 @@ mod tests {
                 .any(|arg| arg.to_string_lossy() == "--unshare-net")
         );
         assert!(!network_warnings(NetworkMode::Unrestricted, "test").is_empty());
+    }
+
+    #[test]
+    fn cgroup_probe_uses_the_same_controller_properties_as_the_real_scope() {
+        let workspace = Path::new("/tmp/guard-test/workspace");
+        let request = request(workspace, NetworkMode::Denied);
+        let probe: Vec<_> = cgroup_probe_args(&request, Path::new("/guard-helper"))
+            .into_iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        for expected in ["MemoryMax=", "MemorySwapMax=0", "TasksMax=", "CPUQuota="] {
+            assert!(probe.iter().any(|value| value.starts_with(expected)));
+        }
+
+        let guest = wrap_guest_cgroup(&request, vec![OsString::from("--version")]);
+        assert_eq!(guest.first(), Some(&OsString::from("systemd-run")));
     }
 
     #[test]

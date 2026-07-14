@@ -603,11 +603,10 @@ fn test_command(args: TestArgs) -> Result<i32> {
         } else {
             CgroupMode::BestEffort
         },
-        helper_path: Some(helper),
+        helper_path: Some(helper.clone()),
         lima_instance: args.lima_instance,
     };
     let outcome = run_isolated(&request, backend)?;
-    drop(listener);
     if !outcome.status.success() {
         bail!("hostile backend probe exited with {}", outcome.status);
     }
@@ -617,12 +616,56 @@ fn test_command(args: TestArgs) -> Result<i32> {
     if !report.success {
         bail!("hostile backend probe reported a failed invariant: {report:#?}");
     }
+    let expected = request.resource_limits;
+    if report.open_file_limit != expected.open_files
+        || report.address_space_limit != expected.memory_bytes
+        || report.file_size_limit != expected.max_file_bytes
+        || report.cpu_time_limit != expected.cpu_seconds
+        || report.process_limit != expected.max_processes
+    {
+        bail!(
+            "hostile backend probe observed incorrect rlimits: expected {expected:?}, report {report:#?}"
+        );
+    }
+
+    let controlled_request = RunRequest {
+        workspace: stage.workspace().to_path_buf(),
+        run_id: uuid::Uuid::new_v4().to_string(),
+        tool: ToolSpec {
+            command: helper.as_os_str().to_owned(),
+            args: vec![
+                OsString::from("controlled-probe"),
+                OsString::from("--host-loopback-port"),
+                OsString::from(loopback_port.to_string()),
+            ],
+            tool_root: None,
+        },
+        network: NetworkMode::Controlled,
+        allowed_egress_hosts: vec!["allowed.example.invalid".to_owned()],
+        forwarded_env: vec![],
+        resource_limits: request.resource_limits,
+        cgroup_mode: request.cgroup_mode,
+        helper_path: Some(helper),
+        lima_instance: request.lima_instance.clone(),
+    };
+    let controlled_outcome = run_isolated(&controlled_request, backend)?;
+    drop(listener);
+    if !controlled_outcome.status.success() {
+        bail!(
+            "controlled-egress backend probe exited with {}",
+            controlled_outcome.status
+        );
+    }
+    if !controlled_outcome.egress_audit.is_empty() {
+        bail!("denied controlled-egress request was incorrectly audited as successful");
+    }
     println!("backend: {backend:?}");
     println!("filesystem boundary: ok");
     println!("environment boundary: ok");
     println!("PID namespace: ok");
     println!("host loopback isolation: ok");
-    println!("seccomp namespace-escape denial: ok");
+    println!("controlled egress denial and direct-bypass isolation: ok");
+    println!("seccomp namespace and process-memory denial: ok");
     println!("seccomp thread compatibility: ok");
     println!("trusted supervisor memory: protected");
     println!("rlimits: ok");

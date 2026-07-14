@@ -7,13 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_TLS_RECORD_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -166,16 +168,16 @@ fn handle_connection(mut client: UnixStream, state: &ProxyState) -> Result<(), P
         .write_all(&client_hello)
         .map_err(ProxyError::Connection)?;
     upstream
-        .set_read_timeout(None)
+        .set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))
         .map_err(ProxyError::Connection)?;
     upstream
-        .set_write_timeout(None)
+        .set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))
         .map_err(ProxyError::Connection)?;
     client
-        .set_read_timeout(None)
+        .set_read_timeout(Some(TUNNEL_IDLE_TIMEOUT))
         .map_err(ProxyError::Connection)?;
     client
-        .set_write_timeout(None)
+        .set_write_timeout(Some(TUNNEL_IDLE_TIMEOUT))
         .map_err(ProxyError::Connection)?;
     record_destination(&state.audit, &sni, port)?;
     tunnel(client, upstream)?;
@@ -185,10 +187,9 @@ fn handle_connection(mut client: UnixStream, state: &ProxyState) -> Result<(), P
 fn read_http_header(stream: &mut UnixStream) -> Result<Vec<u8>, ProxyError> {
     let mut result = Vec::with_capacity(1024);
     let mut byte = [0_u8; 1];
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     while result.len() < MAX_HEADER_BYTES {
-        stream
-            .read_exact(&mut byte)
-            .map_err(ProxyError::Connection)?;
+        read_exact_before(stream, &mut byte, deadline)?;
         result.push(byte[0]);
         if result.ends_with(b"\r\n\r\n") {
             return Ok(result);
@@ -325,6 +326,7 @@ fn is_public_ipv4(ip: Ipv4Addr) -> bool {
         (Ipv4Addr::new(198, 51, 100, 0), 24),
         (Ipv4Addr::new(203, 0, 113, 0), 24),
         (Ipv4Addr::new(224, 0, 0, 0), 4),
+        (Ipv4Addr::new(240, 0, 0, 0), 4),
     ]
     .iter()
     .any(|(network, prefix)| in_prefix(*network, *prefix))
@@ -347,6 +349,7 @@ fn is_public_ipv6(ip: Ipv6Addr) -> bool {
         // Discard-only and transition prefixes are not ordinary public service addresses.
         || octets[..8] == [0x01, 0x00, 0, 0, 0, 0, 0, 0]
         || octets[..2] == [0x20, 0x02]
+        || octets[..4] == [0x20, 0x01, 0x00, 0x00]
         || octets[0] & 0xfe == 0xfc
         || (octets[0] == 0xfe && octets[1] & 0xc0 == 0x80)
         || (octets[0] == 0xfe && octets[1] & 0xc0 == 0xc0)
@@ -369,9 +372,8 @@ fn connect_any(addresses: &[SocketAddr], timeout: Duration) -> Result<TcpStream,
 
 fn read_tls_client_hello(stream: &mut UnixStream) -> Result<(Vec<u8>, String), ProxyError> {
     let mut header = [0_u8; 5];
-    stream
-        .read_exact(&mut header)
-        .map_err(ProxyError::Connection)?;
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    read_exact_before(stream, &mut header, deadline)?;
     let length = u16::from_be_bytes([header[3], header[4]]) as usize;
     if header[0] != 22 || header[1] != 3 || length == 0 || length > MAX_TLS_RECORD_BYTES {
         return Err(ProxyError::TlsRequired);
@@ -379,11 +381,44 @@ fn read_tls_client_hello(stream: &mut UnixStream) -> Result<(Vec<u8>, String), P
     let mut record = Vec::with_capacity(5 + length);
     record.extend_from_slice(&header);
     record.resize(5 + length, 0);
-    stream
-        .read_exact(&mut record[5..])
-        .map_err(ProxyError::Connection)?;
+    read_exact_before(stream, &mut record[5..], deadline)?;
     let sni = parse_client_hello_sni(&record[5..])?;
     Ok((record, sni))
+}
+
+fn read_exact_before(
+    stream: &mut UnixStream,
+    mut destination: &mut [u8],
+    deadline: Instant,
+) -> Result<(), ProxyError> {
+    while !destination.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ProxyError::HandshakeTimeout)?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(ProxyError::Connection)?;
+        match stream.read(destination) {
+            Ok(0) => {
+                return Err(ProxyError::Connection(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )));
+            }
+            Ok(read) => destination = &mut destination[read..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(ProxyError::HandshakeTimeout);
+            }
+            Err(error) => return Err(ProxyError::Connection(error)),
+        }
+    }
+    Ok(())
 }
 
 fn parse_client_hello_sni(payload: &[u8]) -> Result<String, ProxyError> {
@@ -528,6 +563,8 @@ pub enum ProxyError {
     InvalidRequest,
     #[error("proxy request header exceeded the limit")]
     HeaderTooLarge,
+    #[error("proxy handshake exceeded the wall-clock deadline")]
+    HandshakeTimeout,
     #[error("destination {host}:{port} is not allowlisted")]
     DestinationDenied { host: String, port: u16 },
     #[error("failed to resolve {host}: {source}")]
@@ -600,6 +637,8 @@ mod tests {
             "100::1",
             "2002:0a00:0001::1",
             "3fff::1",
+            "2001::1",
+            "240.0.0.1",
         ] {
             assert!(!is_public_ip(address.parse().unwrap()), "{address}");
         }

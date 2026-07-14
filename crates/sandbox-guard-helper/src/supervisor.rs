@@ -7,7 +7,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -277,6 +277,111 @@ pub struct ProbeConfig {
     pub forbidden_environment: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ControlledProxyProbeConfig {
+    pub host_loopback_port: u16,
+    pub denied_host: String,
+}
+
+pub fn run_controlled_proxy_probe(
+    config: ControlledProxyProbeConfig,
+) -> Result<(), SupervisorError> {
+    let proxy = env::var("HTTPS_PROXY").map_err(|_| SupervisorError::ControlledProxyMissing)?;
+    let port = proxy
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| SupervisorError::ControlledProxyInvalid(proxy.clone()))?;
+    let host_loopback_hidden = TcpStream::connect_timeout(
+        &(Ipv4Addr::LOCALHOST, config.host_loopback_port).into(),
+        Duration::from_millis(300),
+    )
+    .is_err();
+    let direct_external_hidden = TcpStream::connect_timeout(
+        &(Ipv4Addr::new(1, 1, 1, 1), 443).into(),
+        Duration::from_millis(300),
+    )
+    .is_err();
+
+    let mut stream =
+        TcpStream::connect_timeout(&(Ipv4Addr::LOCALHOST, port).into(), Duration::from_secs(2))
+            .map_err(SupervisorError::ControlledProxy)?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(SupervisorError::ControlledProxy)?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(SupervisorError::ControlledProxy)?;
+    write!(
+        stream,
+        "CONNECT {}:443 HTTP/1.1\r\nHost: {}:443\r\n\r\n",
+        config.denied_host, config.denied_host
+    )
+    .map_err(SupervisorError::ControlledProxy)?;
+    let mut response = [0_u8; 256];
+    let read = stream
+        .read(&mut response)
+        .map_err(SupervisorError::ControlledProxy)?;
+    let destination_rejected = response[..read].starts_with(b"HTTP/1.1 403 Forbidden\r\n");
+    if host_loopback_hidden && direct_external_hidden && destination_rejected {
+        Ok(())
+    } else {
+        Err(SupervisorError::ControlledProxyInvariant {
+            host_loopback_hidden,
+            direct_external_hidden,
+            destination_rejected,
+        })
+    }
+}
+
+pub fn verify_current_cgroup(limits: ResourceLimits) -> Result<(), SupervisorError> {
+    let membership =
+        fs::read_to_string("/proc/self/cgroup").map_err(SupervisorError::CgroupMembership)?;
+    let relative = membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or(SupervisorError::CgroupV2Missing)?
+        .trim_start_matches('/');
+    let root = PathBuf::from("/sys/fs/cgroup").join(relative);
+    let memory = read_cgroup_value(&root, "memory.max")?;
+    let swap = read_cgroup_value(&root, "memory.swap.max")?;
+    let tasks = read_cgroup_value(&root, "pids.max")?;
+    let cpu = read_cgroup_value(&root, "cpu.max")?;
+    let memory_matches = memory == limits.memory_bytes.to_string();
+    let swap_matches = swap == "0";
+    let tasks_matches = tasks == limits.max_processes.to_string();
+    let mut cpu_fields = cpu.split_ascii_whitespace();
+    let quota = cpu_fields
+        .next()
+        .and_then(|value| value.parse::<u64>().ok());
+    let period = cpu_fields
+        .next()
+        .and_then(|value| value.parse::<u64>().ok());
+    let cpu_matches = quota.zip(period).is_some_and(|(quota, period)| {
+        cpu_fields.next().is_none()
+            && (quota as u128) * 100 == (limits.cpu_percent as u128) * (period as u128)
+    });
+    if memory_matches && swap_matches && tasks_matches && cpu_matches {
+        Ok(())
+    } else {
+        Err(SupervisorError::CgroupMismatch {
+            expected_memory: limits.memory_bytes,
+            observed_memory: memory,
+            observed_swap: swap,
+            expected_tasks: limits.max_processes,
+            observed_tasks: tasks,
+            expected_cpu_percent: limits.cpu_percent,
+            observed_cpu: cpu,
+        })
+    }
+}
+
+fn read_cgroup_value(root: &Path, name: &'static str) -> Result<String, SupervisorError> {
+    let path = root.join(name);
+    fs::read_to_string(&path)
+        .map(|value| value.trim().to_owned())
+        .map_err(|source| SupervisorError::CgroupFile { path, source })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeReport {
     pub success: bool,
@@ -285,11 +390,14 @@ pub struct ProbeReport {
     pub host_pid_hidden: bool,
     pub host_loopback_hidden: bool,
     pub namespace_escape_blocked: bool,
+    pub process_memory_syscall_blocked: bool,
     pub supervisor_memory_protected: bool,
     pub thread_creation_allowed: bool,
     pub core_dumps_disabled: bool,
     pub open_file_limit: u64,
     pub address_space_limit: u64,
+    pub file_size_limit: u64,
+    pub cpu_time_limit: u64,
     pub process_limit: u64,
 }
 
@@ -310,10 +418,16 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
     };
     #[cfg(not(target_os = "linux"))]
     let namespace_escape_blocked = false;
+    #[cfg(target_os = "linux")]
+    let process_memory_syscall_blocked = process_memory_read_is_blocked();
+    #[cfg(not(target_os = "linux"))]
+    let process_memory_syscall_blocked = false;
 
     let core = get_limit(libc::RLIMIT_CORE)?;
     let nofile = get_limit(libc::RLIMIT_NOFILE)?;
     let address_space = get_limit(libc::RLIMIT_AS)?;
+    let file_size = get_limit(libc::RLIMIT_FSIZE)?;
+    let cpu_time = get_limit(libc::RLIMIT_CPU)?;
     let processes = get_limit(libc::RLIMIT_NPROC)?;
     // SAFETY: getppid has no preconditions; the probe is a direct child of the supervisor.
     let supervisor_pid = unsafe { libc::getppid() };
@@ -333,6 +447,7 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
             && host_pid_hidden
             && host_loopback_hidden
             && namespace_escape_blocked
+            && process_memory_syscall_blocked
             && supervisor_memory_protected
             && thread_creation_allowed
             && core == 0,
@@ -341,11 +456,14 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
         host_pid_hidden,
         host_loopback_hidden,
         namespace_escape_blocked,
+        process_memory_syscall_blocked,
         supervisor_memory_protected,
         thread_creation_allowed,
         core_dumps_disabled: core == 0,
         open_file_limit: nofile,
         address_space_limit: address_space,
+        file_size_limit: file_size,
+        cpu_time_limit: cpu_time,
         process_limit: processes,
     };
     let bytes = serde_json::to_vec_pretty(&report).map_err(SupervisorError::ProbeJson)?;
@@ -364,6 +482,35 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
         .map_err(SupervisorError::ProbeWrite)?;
     output.flush().map_err(SupervisorError::ProbeWrite)?;
     Ok(report)
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_read_is_blocked() -> bool {
+    let source = [0x5a_u8];
+    let mut destination = [0_u8];
+    let local = libc::iovec {
+        iov_base: destination.as_mut_ptr().cast(),
+        iov_len: destination.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: source.as_ptr().cast_mut().cast(),
+        iov_len: source.len(),
+    };
+    // Reading our own memory is permitted without capabilities, so EPERM here specifically proves
+    // the installed seccomp rule rather than merely observing Bubblewrap's capability drop.
+    // SAFETY: both iovec values refer to valid one-byte buffers for the duration of the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_process_vm_readv,
+            libc::getpid(),
+            &local as *const libc::iovec,
+            1_usize,
+            &remote as *const libc::iovec,
+            1_usize,
+            0_usize,
+        )
+    };
+    result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(target_os = "linux")]
@@ -397,6 +544,38 @@ pub enum SupervisorError {
     UnsafeEnvironmentName(String),
     #[error("failed to start proxy relay: {0}")]
     Relay(io::Error),
+    #[error("controlled proxy environment was not installed")]
+    ControlledProxyMissing,
+    #[error("controlled proxy URL is invalid: {0:?}")]
+    ControlledProxyInvalid(String),
+    #[error("controlled proxy probe failed: {0}")]
+    ControlledProxy(io::Error),
+    #[error(
+        "controlled proxy invariant failed (host_loopback_hidden={host_loopback_hidden}, direct_external_hidden={direct_external_hidden}, destination_rejected={destination_rejected})"
+    )]
+    ControlledProxyInvariant {
+        host_loopback_hidden: bool,
+        direct_external_hidden: bool,
+        destination_rejected: bool,
+    },
+    #[error("failed to read cgroup membership: {0}")]
+    CgroupMembership(io::Error),
+    #[error("the probe process is not in a cgroup v2 hierarchy")]
+    CgroupV2Missing,
+    #[error("failed to read cgroup controller file {path}: {source}")]
+    CgroupFile { path: PathBuf, source: io::Error },
+    #[error(
+        "cgroup properties do not match: memory expected {expected_memory}, observed {observed_memory}; swap observed {observed_swap}; tasks expected {expected_tasks}, observed {observed_tasks}; CPU expected {expected_cpu_percent}%, observed {observed_cpu}"
+    )]
+    CgroupMismatch {
+        expected_memory: u64,
+        observed_memory: String,
+        observed_swap: String,
+        expected_tasks: u64,
+        observed_tasks: String,
+        expected_cpu_percent: u64,
+        observed_cpu: String,
+    },
     #[error("failed to protect the trusted supervisor: {0}")]
     Protect(io::Error),
     #[error("failed to execute {command:?}: {source}")]

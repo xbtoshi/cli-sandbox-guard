@@ -30,7 +30,7 @@ jobs:
       - run: cargo test --workspace
       - run: cargo build --workspace
       - name: Exercise hostile fixtures through Bubblewrap
-        run: target/debug/guard test --backend linux-bwrap --helper "$PWD/target/debug/guard-helper"
+        run: target/debug/guard test --backend linux-bwrap --require-cgroup --helper "$PWD/target/debug/guard-helper"
   macos:
     runs-on: macos-latest
     steps:

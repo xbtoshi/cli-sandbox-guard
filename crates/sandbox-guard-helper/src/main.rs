@@ -6,7 +6,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use sandbox_guard_helper::{
-    ProbeConfig, ProxyConfig, ResourceLimits, SuperviseConfig, run_probe, run_proxy, supervise,
+    ControlledProxyProbeConfig, ProbeConfig, ProxyConfig, ResourceLimits, SuperviseConfig,
+    run_controlled_proxy_probe, run_probe, run_proxy, supervise, verify_current_cgroup,
 };
 
 #[derive(Debug, Parser)]
@@ -21,6 +22,8 @@ enum Command {
     Proxy(ProxyArgs),
     Supervise(SuperviseArgs),
     Probe(ProbeArgs),
+    ControlledProbe(ControlledProbeArgs),
+    CgroupProbe(CgroupProbeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -71,6 +74,24 @@ struct ProbeArgs {
     loopback_port: u16,
     #[arg(long)]
     forbidden_environment: String,
+}
+
+#[derive(Debug, Args)]
+struct ControlledProbeArgs {
+    #[arg(long)]
+    host_loopback_port: u16,
+    #[arg(long, default_value = "denied.example.invalid")]
+    denied_host: String,
+}
+
+#[derive(Debug, Args)]
+struct CgroupProbeArgs {
+    #[arg(long)]
+    memory_bytes: u64,
+    #[arg(long)]
+    max_processes: u64,
+    #[arg(long)]
+    cpu_percent: u64,
 }
 
 fn main() -> ExitCode {
@@ -128,6 +149,22 @@ fn execute(cli: Cli) -> Result<i32> {
             if !report.success {
                 bail!("one or more sandbox invariants failed")
             }
+            Ok(0)
+        }
+        Command::ControlledProbe(args) => {
+            run_controlled_proxy_probe(ControlledProxyProbeConfig {
+                host_loopback_port: args.host_loopback_port,
+                denied_host: args.denied_host,
+            })?;
+            Ok(0)
+        }
+        Command::CgroupProbe(args) => {
+            verify_current_cgroup(ResourceLimits {
+                memory_bytes: args.memory_bytes,
+                max_processes: args.max_processes,
+                cpu_percent: args.cpu_percent,
+                ..ResourceLimits::default()
+            })?;
             Ok(0)
         }
     }

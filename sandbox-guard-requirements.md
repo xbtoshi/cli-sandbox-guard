@@ -125,7 +125,8 @@ fixtures cover the staging and hostile-export parsers. Remaining unchecked items
 label in place:
 
 - [x] Malicious repository content and hard-link aliases.
-- [x] Host loopback service inaccessible from the isolated network namespace.
+- [x] Host loopback service inaccessible from denied and controlled network namespaces; controlled
+  proxy rejects a non-allowlisted CONNECT and direct external bypass.
 - [x] Source mutation detected across staging copy.
 - [x] Orphan-stage garbage collection, ownership, age, and active-lock behavior.
 - [ ] Aggregate disk exhaustion (`fallocate`/many files) trips a deployment-level quota.
@@ -136,7 +137,10 @@ label in place:
 - [ ] Downloader/updater argument-shape tests; no network updater exists yet.
 - [ ] Root-owned canonical-wrapper and replaced-install-path deployment tests.
 - [x] Live `/proc` probe sees no host PID and cannot read the trusted supervisor's memory.
-- [~] Live `unshare` probe plus filter-construction tests for `setns`, `clone3`, namespace
+- [x] Every configured rlimit is read back exactly; CI requires the real cgroup controller-property
+  probe and scope.
+- [~] Live `unshare` and self-`process_vm_readv` denial probes plus filter-construction tests for
+  `setns`, `clone3`, namespace
   `clone` flags, BPF, perf, io_uring, and cross-process memory. Direct live probes for every denied
   syscall remain to be added.
 - [ ] Live Lima backend in CI and end-to-end login/API/subprocess tests for each supported vendor

@@ -123,10 +123,14 @@ fn denied_syscalls() -> Vec<u32> {
         libc::SYS_name_to_handle_at as u32,
         libc::SYS_process_vm_readv as u32,
         libc::SYS_process_vm_writev as u32,
+        libc::SYS_process_madvise as u32,
+        libc::SYS_pidfd_open as u32,
+        libc::SYS_pidfd_send_signal as u32,
         libc::SYS_pidfd_getfd as u32,
         libc::SYS_ptrace as u32,
         libc::SYS_userfaultfd as u32,
         libc::SYS_kexec_load as u32,
+        libc::SYS_kexec_file_load as u32,
         libc::SYS_init_module as u32,
         libc::SYS_finit_module as u32,
         libc::SYS_delete_module as u32,
@@ -192,6 +196,8 @@ mod tests {
             libc::SYS_bpf as u32,
             libc::SYS_perf_event_open as u32,
             libc::SYS_io_uring_setup as u32,
+            libc::SYS_process_madvise as u32,
+            libc::SYS_pidfd_open as u32,
             libc::SYS_pidfd_getfd as u32,
         ] {
             assert!(filter.iter().any(|instruction| instruction.k == syscall));

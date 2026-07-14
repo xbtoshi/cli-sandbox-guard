@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 use sandbox_guard_core::{ChangeKind, CompiledPolicy, Stage, StageOptions, export_changes};
 
@@ -131,4 +131,32 @@ fn refuses_to_publish_an_export_inside_the_source_tree() {
         .is_err()
     );
     assert!(!nested_parent.exists());
+
+    let stage_destination = stage.workspace().join("must-not-be-created");
+    assert!(
+        export_changes(
+            stage.workspace(),
+            source.path(),
+            stage.manifest(),
+            &policy,
+            &stage_destination,
+        )
+        .is_err()
+    );
+    assert!(!stage_destination.exists());
+
+    let outside = tempfile::tempdir().unwrap();
+    let writable_parent = outside.path().join("group-writable");
+    fs::create_dir(&writable_parent).unwrap();
+    fs::set_permissions(&writable_parent, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(
+        export_changes(
+            stage.workspace(),
+            source.path(),
+            stage.manifest(),
+            &policy,
+            &writable_parent.join("changes"),
+        )
+        .is_err()
+    );
 }

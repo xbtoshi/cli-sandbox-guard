@@ -48,7 +48,7 @@ change export creates a separate review bundle; Guard never applies changes to t
 - Review-only export of added, modified, and deleted paths, with hostile output reopened and
   validated by the trusted staging layer.
 - Offline Ed25519 verification against a pinned signer fingerprint before atomic tool install.
-- A hostile live probe through the real backend with `guard test`.
+- Hostile denied-network and controlled-proxy probes through the real backend with `guard test`.
 
 ## Build and self-test
 
@@ -92,7 +92,9 @@ files must declare a narrow installation root:
 Linux staging requires `openat2` (kernel 5.6 or newer). The default cgroup mode is `best-effort`:
 rlimits and seccomp are always requested, while cgroup memory, process, and CPU quotas are used
 when a delegated user systemd instance is available. Use `--cgroup required` to fail closed if it
-is not.
+is not. Before reporting cgroup enforcement, Guard launches a transient probe with the same
+memory, swap, task, and CPU controller properties required by the real scope, then reads the probe
+scope's cgroup v2 controller files back and requires exact effective values.
 
 ## macOS
 
@@ -118,7 +120,8 @@ known 9p, VirtioFS, and SSHFS host shares. It copies only the sanitized workspac
 environment file into a unique guest directory. After execution it retrieves the disposable
 workspace with rsync's link-preserving transport into the private host stage, so hostile links are
 not followed and the same hostile-output validator can reject them before producing a change
-export. It then removes the guest directory.
+export. A per-run dangling-link canary makes retrieval fail closed if that transport ever
+dereferences links. It then removes the guest directory.
 
 ## Network and credentials
 
@@ -139,6 +142,9 @@ HTTP CONNECT to port 443, resolves outside the sandbox, rejects loopback/private
 metadata/documentation/transition addresses, connects to the validated IP, and requires the first
 TLS ClientHello record to contain SNI exactly matching the CONNECT hostname. Successful
 destinations—not URLs, headers, or credentials—are written to the run audit.
+
+Proxy handshakes have wall-clock deadlines, established tunnels have idle timeouts, and both the
+trusted proxy and sandbox relay cap concurrent connections.
 
 The tool must honor the standard HTTP proxy environment variables. Direct networking still fails.
 The proxy does not inspect HTTP paths or application payloads, and an allowed service can receive
