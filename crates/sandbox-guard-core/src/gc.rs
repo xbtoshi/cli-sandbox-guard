@@ -22,13 +22,24 @@ pub fn garbage_collect(
     dry_run: bool,
 ) -> Result<GcReport, GcError> {
     let mut report = GcReport::default();
-    let entries = match fs::read_dir(staging_base) {
+    let staging_base = match fs::canonicalize(staging_base) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(source) => {
+            return Err(GcError::Io {
+                operation: "canonicalize staging base",
+                path: staging_base.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let entries = match fs::read_dir(&staging_base) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(report),
         Err(source) => {
             return Err(GcError::Io {
                 operation: "read staging base",
-                path: staging_base.to_path_buf(),
+                path: staging_base.clone(),
                 source,
             });
         }
@@ -39,7 +50,7 @@ pub fn garbage_collect(
     for entry in entries {
         let entry = entry.map_err(|source| GcError::Io {
             operation: "read staging entry",
-            path: staging_base.to_path_buf(),
+            path: staging_base.clone(),
             source,
         })?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
