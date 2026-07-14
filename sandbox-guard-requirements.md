@@ -1,8 +1,9 @@
 # AI-CLI Sandbox Guard — Requirements & Blockers
 
-**Status**: active prototype as of 2026-07-14. The Rust implementation currently targets
-fail-closed staging and read-only/discarded execution. It is not yet a production security
-boundary; the remaining blockers in this document are release gates.
+**Status**: version 0.2 alpha as of 2026-07-15. The shared Rust layer now implements fail-closed
+staging, isolated execution, controlled HTTPS egress, credential-file delivery, focused seccomp,
+resource controls, reviewable change export, and offline signature-verified tool installation. It
+is not yet a production security boundary; the open items below remain release gates.
 
 **Context**: Grok Build CLI auto-uploads git bundles to xAI GCS on session start. `/privacy opt-out` is our current mitigation, plus grok is removed from all CCB session configs and `grok-api.luc.wtf` uses headless `grok -p` (which does not trigger the upload). This document captures what we'd have to build if we ever need a real sandbox.
 
@@ -15,17 +16,23 @@ Prevent AI coding CLIs (grok, codex, opencode) from reading sensitive files (`.e
 - Shared Rust policy, staging, synthetic-Git, and audit layer.
 - Linux execution through Bubblewrap.
 - macOS execution inside a mountless Lima Linux VM, with Bubblewrap inside the guest.
-- Network denied by default. An explicitly acknowledged unrestricted mode exists for development,
-  but does not satisfy blocker 7.
-- Tool writes affect only the disposable staged tree and are discarded. Reviewed copy-back is not
-  implemented.
-- Automated vendor updates, controlled egress, seccomp, and cgroup enforcement are not implemented.
+- Network denied by default. Controlled mode uses a hostname/SNI-gated HTTPS CONNECT proxy while
+  keeping the tool in a separate network namespace. Acknowledged unrestricted mode remains for
+  development.
+- Tool writes affect only the disposable stage unless the user requests a separate, hostile-output-
+  validated review bundle. Guard never applies that bundle to the source.
+- A focused seccomp deny profile and rlimits are always requested. cgroup v2 can be required or
+  used on a best-effort basis.
+- Local Ed25519-signed artifacts can be verified against a pinned signer and installed atomically.
+  Network download, privileged installation, canonical wrapper enforcement, and per-run
+  re-verification remain open.
 - The repository must remain clearly labeled as an alpha until every applicable release blocker
   and fixture-backed test passes.
 
 ## Non-goals (explicit)
 
-- Not a defense against network exfiltration to vendor endpoints — Grok Build **does** upload the workspace; we sanitize the workspace, we don't block the network.
+- Not a defense against exfiltration to an explicitly allowlisted endpoint. Controlled mode limits
+  destinations, but an allowed vendor can receive the sanitized workspace and forwarded token.
 - Not a defense against kernel or bwrap escape (documented in threat model).
 - Not a defense against xAI/OpenAI subpoena of already-uploaded content.
 - **Constraining potentially hostile or overreaching tool code IS the sandbox's central purpose** — this is a goal, not a non-goal.
@@ -39,6 +46,23 @@ Prevent AI coding CLIs (grok, codex, opencode) from reading sensitive files (`.e
 | v2 @ codex sol high | **gpt-5.6-sol high** | **5.3** | **6.0** | **not shippable** |
 
 The sol/high review is authoritative. The 12 blockers below come from that pass.
+
+## Version 0.2 closure status
+
+| blocker | status | version 0.2 result |
+|---:|---|---|
+| 1 | closed | `--clearenv`, closed descriptors, strict forwarding rules, private credential file |
+| 2 | partial | verify-before-install exists; downloader, root policy, canonical wrapper, and automatic enforcement do not |
+| 3 | partial | hostile-output-validated review bundle exists; conflict-aware atomic application does not |
+| 4 | closed | fresh one-commit synthetic Git repository, with original metadata absent |
+| 5 | closed | descriptor-relative staging and Linux `openat2`, no unsafe tar pipeline |
+| 6 | closed | multiply linked files are rejected during staging and export |
+| 7 | closed for controlled mode | separate netns plus exact/wildcard hostname, public-IP, CONNECT-port, and TLS-SNI enforcement |
+| 8 | partial | tool/runtime/CA bindings and proxy-aware HTTPS work; real vendor workflows are not all gated in CI |
+| 9 | partial | architecture-checked deny profile covers named syscall families; maintained OCI allowlist and workload qualification remain |
+| 10 | open | no root-owned canonical command wrapper or shell-resolution deployment |
+| 11 | partial | rlimits plus optional/required cgroup v2; aggregate disk and bandwidth limits remain |
+| 12 | closed | malicious vendor behavior is explicitly inside the threat model up to kernel/hypervisor escape |
 
 ## Critical blockers (must fix before shipping)
 
@@ -94,22 +118,27 @@ The sol/high review is authoritative. The 12 blockers below come from that pass.
 
 ## Test matrix (must-cover)
 
-Every rule needs a fixture-backed test:
+`guard test` now drives a real backend and Ubuntu CI runs it through Bubblewrap. Unit/integration
+fixtures cover the staging and hostile-export parsers. Remaining unchecked items keep the alpha
+label in place:
 
-- Malicious repository content (denylist files under innocent names via hard-link)
-- Local-network services (loopback egress from inside jail — must fail)
-- Staging races (concurrent write to a source file during copy)
-- Hard-link aliases (denylisted file linked to allowed name)
-- Crash cleanup (SIGKILL during staging → `/dev/shm/guard-*` GC)
-- Disk exhaustion (`fallocate` inside jail → cgroup limit trips)
-- Copy-back attacks (jail writes a symlink that resolves outside on the host)
-- Ignored, untracked, nested, symlinked denylist paths
-- `.git` leaks (assert absent in bundles + archives)
-- Language-runtime configs (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `PYTHONPATH`, `GOPATH`, `NODE_PATH`) must be scrubbed
-- Malicious updater arguments (assert `guard update <tool>` rejects unknown subcommand shape)
-- Replaced `~/.local/bin` symlink (assert `guard doctor` detects + repairs)
-- `/proc` visibility (only jail PIDs)
-- Namespace-escape attempts (`unshare`, `setns`, `clone3` with namespace flags → EPERM)
+- [x] Malicious repository content and hard-link aliases.
+- [x] Host loopback service inaccessible from the isolated network namespace.
+- [x] Source mutation detected across staging copy.
+- [x] Orphan-stage garbage collection, ownership, age, and active-lock behavior.
+- [ ] Aggregate disk exhaustion (`fallocate`/many files) trips a deployment-level quota.
+- [x] Returned symlinks and multiply linked files rejected by change export.
+- [x] Ignored, untracked, nested, and symlinked denylist paths.
+- [x] Synthetic Git has no reachable original secret blob, history, config, hooks, or alternates.
+- [x] Loader, Git, and major language-runtime environment controls are scrubbed.
+- [ ] Downloader/updater argument-shape tests; no network updater exists yet.
+- [ ] Root-owned canonical-wrapper and replaced-install-path deployment tests.
+- [x] Live `/proc` probe sees no host PID and cannot read the trusted supervisor's memory.
+- [~] Live `unshare` probe plus filter-construction tests for `setns`, `clone3`, namespace
+  `clone` flags, BPF, perf, io_uring, and cross-process memory. Direct live probes for every denied
+  syscall remain to be added.
+- [ ] Live Lima backend in CI and end-to-end login/API/subprocess tests for each supported vendor
+  CLI.
 
 ## Reference implementation shape
 
@@ -118,7 +147,9 @@ Every rule needs a fixture-backed test:
 - **Wrapper binary**: root-owned in `/usr/local/libexec/sensitive-guard/bin/`, verifies own SHA256 against `/etc/sensitive-guard/wrapper.sha256` on startup
 - **Privileged installer**: separate root-only binary that handles updates; verifies signer identity + pinned key fingerprints from `/etc/sensitive-guard/keys/`
 - **Egress proxy**: minimal HTTP(S) forward proxy running in host netns, allow-listed by destination hostname
-- **CLI surface**: `guard run <tool> [args]`, `guard update <tool>`, `guard doctor`, `guard test`, `guard policy`
+- **Current CLI surface**: `guard run <tool> [args]`, `guard tool install|verify`, `guard doctor`,
+  `guard test`, `guard policy`, `guard gc`. A constrained network updater remains a target, not a
+  current command.
 
 ## Rollout
 

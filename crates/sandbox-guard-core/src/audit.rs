@@ -75,6 +75,21 @@ pub struct RunRecord {
     pub network: String,
     pub tool: String,
     pub forwarded_environment_names: Vec<String>,
+    pub allowed_egress_hosts: Vec<String>,
+    pub egress_audit: Vec<String>,
+    pub resource_limits: ResourceLimitRecord,
+    pub cgroup_enforced: bool,
+    pub seccomp_enforced: bool,
     pub exit_code: Option<i32>,
     pub success: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceLimitRecord {
+    pub memory_bytes: u64,
+    pub max_file_bytes: u64,
+    pub cpu_seconds: u64,
+    pub open_files: u64,
+    pub max_processes: u64,
+    pub cpu_percent: u64,
 }

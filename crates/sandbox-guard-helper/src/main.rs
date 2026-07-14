@@ -1,0 +1,134 @@
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand};
+use sandbox_guard_helper::{
+    ProbeConfig, ProxyConfig, ResourceLimits, SuperviseConfig, run_probe, run_proxy, supervise,
+};
+
+#[derive(Debug, Parser)]
+#[command(name = "guard-helper", version, hide = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Proxy(ProxyArgs),
+    Supervise(SuperviseArgs),
+    Probe(ProbeArgs),
+}
+
+#[derive(Debug, Args)]
+struct ProxyArgs {
+    #[arg(long)]
+    socket: PathBuf,
+    #[arg(long)]
+    audit_log: PathBuf,
+    #[arg(long = "allow-host", required = true)]
+    allow_hosts: Vec<String>,
+    #[arg(long, default_value_t = 443)]
+    allow_port: u16,
+    #[arg(long, default_value_t = 30)]
+    connect_timeout_seconds: u64,
+}
+
+#[derive(Debug, Args)]
+struct SuperviseArgs {
+    #[arg(long)]
+    environment: PathBuf,
+    #[arg(long)]
+    proxy_socket: Option<PathBuf>,
+    #[arg(long)]
+    memory_bytes: u64,
+    #[arg(long)]
+    max_file_bytes: u64,
+    #[arg(long, default_value_t = 3600)]
+    cpu_seconds: u64,
+    #[arg(long, default_value_t = 1024)]
+    open_files: u64,
+    #[arg(long, default_value_t = 256)]
+    max_processes: u64,
+    #[arg(long, default_value_t = 200)]
+    cpu_percent: u64,
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+struct ProbeArgs {
+    #[arg(long)]
+    output: PathBuf,
+    #[arg(long)]
+    outside_path: PathBuf,
+    #[arg(long)]
+    host_pid: u32,
+    #[arg(long)]
+    loopback_port: u16,
+    #[arg(long)]
+    forbidden_environment: String,
+}
+
+fn main() -> ExitCode {
+    match execute(Cli::parse()) {
+        Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+        Err(error) => {
+            eprintln!("guard-helper: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn execute(cli: Cli) -> Result<i32> {
+    match cli.command {
+        Command::Proxy(args) => {
+            run_proxy(ProxyConfig {
+                socket: args.socket,
+                audit_log: args.audit_log,
+                allow_hosts: args.allow_hosts,
+                allow_port: args.allow_port,
+                connect_timeout: Duration::from_secs(args.connect_timeout_seconds),
+            })?;
+            Ok(0)
+        }
+        Command::Supervise(args) => {
+            let (command, command_args) = args
+                .command
+                .split_first()
+                .context("supervise command cannot be empty")?;
+            let limits = ResourceLimits {
+                memory_bytes: args.memory_bytes,
+                max_file_bytes: args.max_file_bytes,
+                cpu_seconds: args.cpu_seconds,
+                open_files: args.open_files,
+                max_processes: args.max_processes,
+                cpu_percent: args.cpu_percent,
+            };
+            let status = supervise(SuperviseConfig {
+                environment_file: args.environment,
+                proxy_socket: args.proxy_socket,
+                limits,
+                command: command.clone(),
+                args: command_args.to_vec(),
+            })?;
+            Ok(status.code().unwrap_or(128))
+        }
+        Command::Probe(args) => {
+            let report = run_probe(ProbeConfig {
+                output: args.output,
+                outside_path: args.outside_path,
+                host_pid: args.host_pid,
+                loopback_port: args.loopback_port,
+                forbidden_environment: args.forbidden_environment,
+            })?;
+            if !report.success {
+                bail!("one or more sandbox invariants failed")
+            }
+            Ok(0)
+        }
+    }
+}

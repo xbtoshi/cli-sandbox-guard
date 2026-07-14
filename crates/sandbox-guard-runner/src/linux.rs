@@ -1,12 +1,24 @@
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use sandbox_guard_helper::EnvironmentEntry;
+use tempfile::{Builder as TempBuilder, TempDir};
 
 use crate::{
-    BackendKind, CommandPlan, NetworkMode, RunOutcome, RunRequest, RunnerError, path_is_within,
+    BackendKind, CgroupMode, CommandPlan, NetworkMode, RunOutcome, RunRequest, RunnerError,
+    path_is_within,
 };
+
+const GUEST_RUNTIME: &str = "/run/sandbox-guard";
+const GUEST_ENVIRONMENT: &str = "/run/sandbox-guard/environment.json";
+const GUEST_PROXY_SOCKET: &str = "/run/sandbox-guard/egress.sock";
+const GUEST_HELPER: &str = "/opt/sandbox-guard/helper";
 
 pub struct LinuxBwrapRunner;
 
@@ -16,116 +28,65 @@ impl LinuxBwrapRunner {
             name: "bwrap",
             source,
         })?;
-        Self::build_plan(request, bwrap)
+        let helper = resolve_host_helper(request)?;
+        let workspace = canonical_workspace(request)?;
+        let runtime = planned_runtime_path(request, &workspace);
+        let use_cgroup =
+            request.cgroup_mode != CgroupMode::Disabled && which::which("systemd-run").is_ok();
+        Self::build_plan(request, bwrap, helper, &runtime, use_cgroup)
     }
 
-    fn build_plan(request: &RunRequest, bwrap: PathBuf) -> Result<CommandPlan, RunnerError> {
-        let workspace =
-            fs::canonicalize(&request.workspace).map_err(|source| RunnerError::Inspect {
-                path: request.workspace.clone(),
-                source,
-            })?;
-
+    fn build_plan(
+        request: &RunRequest,
+        bwrap: PathBuf,
+        helper: PathBuf,
+        runtime: &Path,
+        use_cgroup: bool,
+    ) -> Result<CommandPlan, RunnerError> {
+        let workspace = canonical_workspace(request)?;
         let (tool_command, tool_mount) = resolve_host_tool(request)?;
-        let mut args = Vec::<OsString>::new();
-        let mut redacted = BTreeSet::new();
-
-        push(&mut args, "--die-with-parent");
-        push(&mut args, "--new-session");
-        push(&mut args, "--unshare-user");
-        push(&mut args, "--unshare-pid");
-        push(&mut args, "--unshare-ipc");
-        push(&mut args, "--unshare-uts");
-        push(&mut args, "--unshare-cgroup");
-        if request.network == NetworkMode::Denied {
-            push(&mut args, "--unshare-net");
-        }
-        push(&mut args, "--hostname");
-        push(&mut args, "sandbox-guard");
-        push(&mut args, "--cap-drop");
-        push(&mut args, "ALL");
-        push(&mut args, "--clearenv");
-        push(&mut args, "--close-fds");
-        push(&mut args, "--tmpfs");
-        push(&mut args, "/");
-        push(&mut args, "--proc");
-        push(&mut args, "/proc");
-        push(&mut args, "--dev");
-        push(&mut args, "/dev");
-        push(&mut args, "--tmpfs");
-        push(&mut args, "/tmp");
-        push(&mut args, "--tmpfs");
-        push(&mut args, "/dev/shm");
-        push(&mut args, "--dir");
-        push(&mut args, "/home");
-        push(&mut args, "--dir");
-        push(&mut args, "/home/guard");
-        push(&mut args, "--dir");
-        push(&mut args, "/opt");
-        push(&mut args, "--dir");
-        push(&mut args, "/opt/sandbox-guard");
-        bind_if_present(&mut args, "/usr", "/usr");
-        bind_if_present(&mut args, "/bin", "/bin");
-        bind_if_present(&mut args, "/lib", "/lib");
-        bind_if_present(&mut args, "/lib64", "/lib64");
-        bind_if_present(&mut args, "/etc/ssl", "/etc/ssl");
-        bind_if_present(&mut args, "/etc/pki", "/etc/pki");
-        bind_if_present(&mut args, "/etc/ca-certificates", "/etc/ca-certificates");
-        for path in [
-            "/etc/passwd",
-            "/etc/group",
-            "/etc/nsswitch.conf",
-            "/etc/localtime",
-        ] {
-            bind_file_if_present(&mut args, path, path);
-        }
-        if request.network == NetworkMode::Unrestricted {
-            bind_file_if_present(&mut args, "/etc/resolv.conf", "/etc/resolv.conf");
-            bind_file_if_present(&mut args, "/etc/hosts", "/etc/hosts");
-        }
-        if let Some((host, guest)) = tool_mount {
-            push(&mut args, "--ro-bind");
-            args.push(host.into_os_string());
-            args.push(guest.into_os_string());
-        }
-        push(&mut args, "--bind");
-        args.push(workspace.into_os_string());
-        push(&mut args, "/workspace");
-        push(&mut args, "--chdir");
-        push(&mut args, "/workspace");
-        push(&mut args, "--setenv");
-        push(&mut args, "HOME");
-        push(&mut args, "/home/guard");
-        push(&mut args, "--setenv");
-        push(&mut args, "PATH");
-        push(
-            &mut args,
-            "/opt/sandbox-guard/tool:/usr/local/bin:/usr/bin:/bin",
+        let bwrap_args = build_bwrap_args(
+            request,
+            &workspace,
+            runtime,
+            &helper,
+            Path::new(GUEST_HELPER),
+            tool_command,
+            tool_mount,
         );
-        push(&mut args, "--setenv");
-        push(&mut args, "LANG");
-        push(&mut args, "C.UTF-8");
-        for (name, value) in &request.forwarded_env {
-            push(&mut args, "--setenv");
-            args.push(name.into());
-            redacted.insert(args.len());
-            args.push(value.into());
-        }
-        push(&mut args, "--");
-        args.push(tool_command);
-        args.extend(request.tool.args.iter().cloned());
-
-        let warnings = network_warnings(request.network, "host");
+        let (program, args) = if use_cgroup {
+            wrap_in_systemd_scope(request, bwrap, bwrap_args)
+        } else {
+            (bwrap, bwrap_args)
+        };
         Ok(CommandPlan {
-            program: bwrap,
+            program,
             args,
-            redacted_args: redacted,
-            warnings,
+            redacted_args: BTreeSet::new(),
+            warnings: network_warnings(request.network, "host"),
         })
     }
 
     pub fn run(request: &RunRequest) -> Result<RunOutcome, RunnerError> {
-        let plan = Self::plan(request)?;
+        let bwrap = which::which("bwrap").map_err(|source| RunnerError::DependencyMissing {
+            name: "bwrap",
+            source,
+        })?;
+        let helper = resolve_host_helper(request)?;
+        let workspace = canonical_workspace(request)?;
+        let runtime = RuntimeDirectory::new(&workspace, &request.forwarded_env)?;
+        let proxy = if request.network == NetworkMode::Controlled {
+            Some(ProxyProcess::start(
+                &helper,
+                &runtime,
+                &request.allowed_egress_hosts,
+            )?)
+        } else {
+            None
+        };
+        let (use_cgroup, mut warnings) = resolve_cgroup_mode(request.cgroup_mode)?;
+        let plan = Self::build_plan(request, bwrap, helper, runtime.root(), use_cgroup)?;
+        warnings.extend(plan.warnings.clone());
         let status = Command::new(&plan.program)
             .args(&plan.args)
             .status()
@@ -133,16 +94,173 @@ impl LinuxBwrapRunner {
                 program: plan.program.clone(),
                 source,
             })?;
+        drop(proxy);
+        let egress_audit = fs::read_to_string(&runtime.audit_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
         Ok(RunOutcome {
             backend: BackendKind::LinuxBwrap,
             status,
-            warnings: plan.warnings,
+            warnings,
+            cgroup_enforced: use_cgroup,
+            seccomp_enforced: true,
+            egress_audit,
         })
     }
 }
 
-pub(crate) fn guest_bwrap_args(request: &RunRequest, workspace: &Path) -> Vec<OsString> {
-    let mut args = Vec::new();
+fn canonical_workspace(request: &RunRequest) -> Result<PathBuf, RunnerError> {
+    fs::canonicalize(&request.workspace).map_err(|source| RunnerError::Inspect {
+        path: request.workspace.clone(),
+        source,
+    })
+}
+
+struct RuntimeDirectory {
+    temp: TempDir,
+    socket: PathBuf,
+    audit_log: PathBuf,
+}
+
+impl RuntimeDirectory {
+    fn new(workspace: &Path, environment: &[(String, String)]) -> Result<Self, RunnerError> {
+        let parent = workspace
+            .parent()
+            .ok_or_else(|| RunnerError::SetupFailed("workspace has no parent".to_owned()))?;
+        let temp = TempBuilder::new()
+            .prefix(".sandbox-guard-runtime-")
+            .tempdir_in(parent)
+            .map_err(|source| RunnerError::Inspect {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).map_err(|source| {
+            RunnerError::Inspect {
+                path: temp.path().to_path_buf(),
+                source,
+            }
+        })?;
+        write_environment_file(&temp.path().join("environment.json"), environment)?;
+        Ok(Self {
+            socket: temp.path().join("egress.sock"),
+            audit_log: temp.path().join("egress-audit.log"),
+            temp,
+        })
+    }
+
+    fn root(&self) -> &Path {
+        self.temp.path()
+    }
+}
+
+pub(crate) fn write_environment_file(
+    path: &Path,
+    environment: &[(String, String)],
+) -> Result<(), RunnerError> {
+    let entries: Vec<_> = environment
+        .iter()
+        .map(|(name, value)| EnvironmentEntry {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|source| RunnerError::Inspect {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    serde_json::to_writer(&mut file, &entries).map_err(|source| {
+        RunnerError::SetupFailed(format!("serialize private environment: {source}"))
+    })?;
+    file.sync_all().map_err(|source| RunnerError::Inspect {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+struct ProxyProcess {
+    child: Child,
+}
+
+impl ProxyProcess {
+    fn start(
+        helper: &Path,
+        runtime: &RuntimeDirectory,
+        allowed_hosts: &[String],
+    ) -> Result<Self, RunnerError> {
+        let mut command = Command::new(helper);
+        command
+            .arg("proxy")
+            .arg("--socket")
+            .arg(&runtime.socket)
+            .arg("--audit-log")
+            .arg(&runtime.audit_log)
+            .stdout(Stdio::null());
+        for host in allowed_hosts {
+            command.arg("--allow-host").arg(host);
+        }
+        let mut child = command.spawn().map_err(|source| RunnerError::Execute {
+            program: helper.to_path_buf(),
+            source,
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().map_err(|source| RunnerError::Execute {
+                program: helper.to_path_buf(),
+                source,
+            })? {
+                return Err(RunnerError::HelperFailed(format!(
+                    "egress proxy exited with {status}"
+                )));
+            }
+            let socket_ready = fs::symlink_metadata(&runtime.socket)
+                .map(|metadata| {
+                    metadata.file_type().is_socket() && metadata.permissions().mode() & 0o077 == 0
+                })
+                .unwrap_or(false);
+            let audit_ready = fs::symlink_metadata(&runtime.audit_log)
+                .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o077 == 0)
+                .unwrap_or(false);
+            if socket_ready && audit_ready {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(RunnerError::HelperFailed(
+                    "egress proxy did not become ready".to_owned(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(Self { child })
+    }
+}
+
+impl Drop for ProxyProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn build_bwrap_args(
+    request: &RunRequest,
+    workspace: &Path,
+    runtime_host: &Path,
+    helper_host: &Path,
+    helper_guest: &Path,
+    tool_command: OsString,
+    tool_mount: Option<(PathBuf, PathBuf)>,
+) -> Vec<OsString> {
+    let mut args = Vec::<OsString>::new();
     push(&mut args, "--die-with-parent");
     push(&mut args, "--new-session");
     push(&mut args, "--unshare-user");
@@ -150,7 +268,7 @@ pub(crate) fn guest_bwrap_args(request: &RunRequest, workspace: &Path) -> Vec<Os
     push(&mut args, "--unshare-ipc");
     push(&mut args, "--unshare-uts");
     push(&mut args, "--unshare-cgroup");
-    if request.network == NetworkMode::Denied {
+    if request.network != NetworkMode::Unrestricted {
         push(&mut args, "--unshare-net");
     }
     push(&mut args, "--hostname");
@@ -169,14 +287,103 @@ pub(crate) fn guest_bwrap_args(request: &RunRequest, workspace: &Path) -> Vec<Os
     push(&mut args, "/tmp");
     push(&mut args, "--tmpfs");
     push(&mut args, "/dev/shm");
-    push(&mut args, "--dir");
-    push(&mut args, "/home");
-    push(&mut args, "--dir");
-    push(&mut args, "/home/guard");
-    push(&mut args, "--dir");
-    push(&mut args, "/opt");
-    push(&mut args, "--dir");
-    push(&mut args, "/opt/sandbox-guard");
+    for directory in ["/home", "/home/guard", "/opt", "/opt/sandbox-guard", "/run"] {
+        push(&mut args, "--dir");
+        push(&mut args, directory);
+    }
+    bind_if_present(&mut args, "/usr", "/usr");
+    bind_if_present(&mut args, "/bin", "/bin");
+    bind_if_present(&mut args, "/lib", "/lib");
+    bind_if_present(&mut args, "/lib64", "/lib64");
+    bind_if_present(&mut args, "/etc/ssl", "/etc/ssl");
+    bind_if_present(&mut args, "/etc/pki", "/etc/pki");
+    bind_if_present(&mut args, "/etc/ca-certificates", "/etc/ca-certificates");
+    for path in [
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/nsswitch.conf",
+        "/etc/localtime",
+    ] {
+        bind_file_if_present(&mut args, path, path);
+    }
+    if request.network == NetworkMode::Unrestricted {
+        bind_file_if_present(&mut args, "/etc/resolv.conf", "/etc/resolv.conf");
+        bind_file_if_present(&mut args, "/etc/hosts", "/etc/hosts");
+    }
+    push(&mut args, "--ro-bind");
+    args.push(helper_host.as_os_str().to_owned());
+    args.push(helper_guest.as_os_str().to_owned());
+    push(&mut args, "--ro-bind");
+    args.push(runtime_host.as_os_str().to_owned());
+    push(&mut args, GUEST_RUNTIME);
+    if let Some((host, guest)) = tool_mount {
+        push(&mut args, "--ro-bind");
+        args.push(host.into_os_string());
+        args.push(guest.into_os_string());
+    }
+    push(&mut args, "--bind");
+    args.push(workspace.as_os_str().to_owned());
+    push(&mut args, "/workspace");
+    push(&mut args, "--chdir");
+    push(&mut args, "/workspace");
+    for (name, value) in [
+        ("HOME", "/home/guard"),
+        (
+            "PATH",
+            "/opt/sandbox-guard/tool:/usr/local/bin:/usr/bin:/bin",
+        ),
+        ("LANG", "C.UTF-8"),
+    ] {
+        push(&mut args, "--setenv");
+        push(&mut args, name);
+        push(&mut args, value);
+    }
+    args.extend(supervisor_args(
+        request,
+        helper_guest,
+        tool_command,
+        &request.tool.args,
+    ));
+    args
+}
+
+pub(crate) fn guest_bwrap_args(
+    request: &RunRequest,
+    workspace: &Path,
+    runtime_root: &Path,
+    helper: &Path,
+) -> Vec<OsString> {
+    let mut args = Vec::new();
+    push(&mut args, "--die-with-parent");
+    push(&mut args, "--new-session");
+    push(&mut args, "--unshare-user");
+    push(&mut args, "--unshare-pid");
+    push(&mut args, "--unshare-ipc");
+    push(&mut args, "--unshare-uts");
+    push(&mut args, "--unshare-cgroup");
+    if request.network != NetworkMode::Unrestricted {
+        push(&mut args, "--unshare-net");
+    }
+    push(&mut args, "--hostname");
+    push(&mut args, "sandbox-guard");
+    push(&mut args, "--cap-drop");
+    push(&mut args, "ALL");
+    push(&mut args, "--clearenv");
+    push(&mut args, "--close-fds");
+    push(&mut args, "--tmpfs");
+    push(&mut args, "/");
+    push(&mut args, "--proc");
+    push(&mut args, "/proc");
+    push(&mut args, "--dev");
+    push(&mut args, "/dev");
+    push(&mut args, "--tmpfs");
+    push(&mut args, "/tmp");
+    push(&mut args, "--tmpfs");
+    push(&mut args, "/dev/shm");
+    for directory in ["/home", "/home/guard", "/opt", "/opt/sandbox-guard", "/run"] {
+        push(&mut args, "--dir");
+        push(&mut args, directory);
+    }
     for path in [
         "/usr",
         "/bin",
@@ -208,32 +415,181 @@ pub(crate) fn guest_bwrap_args(request: &RunRequest, workspace: &Path) -> Vec<Os
             push(&mut args, path);
         }
     }
+    push(&mut args, "--ro-bind");
+    args.push(runtime_root.as_os_str().to_owned());
+    push(&mut args, GUEST_RUNTIME);
     push(&mut args, "--bind");
     args.push(workspace.as_os_str().to_owned());
     push(&mut args, "/workspace");
     push(&mut args, "--chdir");
     push(&mut args, "/workspace");
-    push(&mut args, "--setenv");
-    push(&mut args, "HOME");
-    push(&mut args, "/home/guard");
-    push(&mut args, "--setenv");
-    push(&mut args, "PATH");
-    push(
-        &mut args,
-        "/opt/sandbox-guard/tools:/usr/local/bin:/usr/bin:/bin",
-    );
-    push(&mut args, "--setenv");
-    push(&mut args, "LANG");
-    push(&mut args, "C.UTF-8");
-    for (name, value) in &request.forwarded_env {
+    for (name, value) in [
+        ("HOME", "/home/guard"),
+        (
+            "PATH",
+            "/opt/sandbox-guard/tools:/usr/local/bin:/usr/bin:/bin",
+        ),
+        ("LANG", "C.UTF-8"),
+    ] {
         push(&mut args, "--setenv");
-        args.push(name.into());
-        args.push(value.into());
+        push(&mut args, name);
+        push(&mut args, value);
+    }
+    args.extend(supervisor_args(
+        request,
+        helper,
+        request.tool.command.clone(),
+        &request.tool.args,
+    ));
+    args
+}
+
+fn supervisor_args(
+    request: &RunRequest,
+    helper: &Path,
+    tool_command: OsString,
+    tool_args: &[OsString],
+) -> Vec<OsString> {
+    let limits = request.resource_limits;
+    let mut args = Vec::new();
+    push(&mut args, "--");
+    args.push(helper.as_os_str().to_owned());
+    push(&mut args, "supervise");
+    push(&mut args, "--environment");
+    push(&mut args, GUEST_ENVIRONMENT);
+    if request.network == NetworkMode::Controlled {
+        push(&mut args, "--proxy-socket");
+        push(&mut args, GUEST_PROXY_SOCKET);
+    }
+    for (name, value) in [
+        ("--memory-bytes", limits.memory_bytes),
+        ("--max-file-bytes", limits.max_file_bytes),
+        ("--cpu-seconds", limits.cpu_seconds),
+        ("--open-files", limits.open_files),
+        ("--max-processes", limits.max_processes),
+        ("--cpu-percent", limits.cpu_percent),
+    ] {
+        push(&mut args, name);
+        args.push(value.to_string().into());
     }
     push(&mut args, "--");
-    args.push(request.tool.command.clone());
-    args.extend(request.tool.args.iter().cloned());
+    args.push(tool_command);
+    args.extend(tool_args.iter().cloned());
     args
+}
+
+pub(crate) fn wrap_guest_cgroup(request: &RunRequest, bwrap_args: Vec<OsString>) -> Vec<OsString> {
+    let mut args = systemd_scope_args(request);
+    push(&mut args, "bwrap");
+    args.extend(bwrap_args);
+    args
+}
+
+fn wrap_in_systemd_scope(
+    request: &RunRequest,
+    bwrap: PathBuf,
+    bwrap_args: Vec<OsString>,
+) -> (PathBuf, Vec<OsString>) {
+    let mut args = systemd_scope_args(request);
+    args.push(bwrap.into_os_string());
+    args.extend(bwrap_args);
+    (PathBuf::from("systemd-run"), args)
+}
+
+fn systemd_scope_args(request: &RunRequest) -> Vec<OsString> {
+    let limits = request.resource_limits;
+    let mut args = Vec::new();
+    for value in ["--user", "--scope", "--quiet", "--collect"] {
+        push(&mut args, value);
+    }
+    args.push(format!("--unit=sandbox-guard-{}", request.run_id).into());
+    for property in [
+        format!("MemoryMax={}", limits.memory_bytes),
+        "MemorySwapMax=0".to_owned(),
+        format!("TasksMax={}", limits.max_processes),
+        format!("CPUQuota={}%", limits.cpu_percent),
+    ] {
+        push(&mut args, "--property");
+        args.push(property.into());
+    }
+    push(&mut args, "--");
+    args
+}
+
+fn resolve_cgroup_mode(mode: CgroupMode) -> Result<(bool, Vec<String>), RunnerError> {
+    if mode == CgroupMode::Disabled {
+        return Ok((
+            false,
+            vec!["cgroup enforcement disabled by request".to_owned()],
+        ));
+    }
+    let available = which::which("systemd-run")
+        .ok()
+        .and_then(|program| {
+            Command::new(program)
+                .args(["--user", "--scope", "--quiet", "--collect", "--", "true"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .ok()
+        })
+        .is_some_and(|status| status.success());
+    if available {
+        Ok((true, Vec::new()))
+    } else if mode == CgroupMode::Required {
+        Err(RunnerError::CgroupUnavailable)
+    } else {
+        Ok((
+            false,
+            vec![
+                "cgroup v2 user delegation unavailable; rlimits and seccomp remain enforced"
+                    .to_owned(),
+            ],
+        ))
+    }
+}
+
+pub(crate) fn guest_helper_path(request: &RunRequest) -> PathBuf {
+    request
+        .helper_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/usr/local/bin/guard-helper"))
+}
+
+fn resolve_host_helper(request: &RunRequest) -> Result<PathBuf, RunnerError> {
+    let candidate = if let Some(path) = &request.helper_path {
+        path.clone()
+    } else if let Ok(current) = std::env::current_exe() {
+        let sibling = current.with_file_name("guard-helper");
+        if sibling.is_file() {
+            sibling
+        } else {
+            which::which("guard-helper").map_err(|source| RunnerError::DependencyMissing {
+                name: "guard-helper",
+                source,
+            })?
+        }
+    } else {
+        which::which("guard-helper").map_err(|source| RunnerError::DependencyMissing {
+            name: "guard-helper",
+            source,
+        })?
+    };
+    let path = fs::canonicalize(&candidate).map_err(|source| RunnerError::Inspect {
+        path: candidate,
+        source,
+    })?;
+    if !path.is_file() {
+        return Err(RunnerError::InvalidHelperPath(path));
+    }
+    Ok(path)
+}
+
+fn planned_runtime_path(request: &RunRequest, workspace: &Path) -> PathBuf {
+    workspace
+        .parent()
+        .unwrap_or(workspace)
+        .join(format!(".sandbox-guard-runtime-{}", request.run_id))
 }
 
 fn resolve_host_tool(
@@ -288,7 +644,6 @@ fn resolve_host_tool(
     {
         return Ok((resolved.into_os_string(), None));
     }
-
     Ok((
         OsString::from("/opt/sandbox-guard/tool"),
         Some((resolved, PathBuf::from("/opt/sandbox-guard/tool"))),
@@ -316,12 +671,11 @@ fn push(args: &mut Vec<OsString>, value: impl AsRef<OsStr>) {
 }
 
 pub(crate) fn network_warnings(mode: NetworkMode, boundary: &str) -> Vec<String> {
-    if mode == NetworkMode::Unrestricted {
-        vec![format!(
+    match mode {
+        NetworkMode::Denied | NetworkMode::Controlled => Vec::new(),
+        NetworkMode::Unrestricted => vec![format!(
             "UNSAFE NETWORK MODE: sharing the {boundary} network namespace exposes loopback, private and LAN services, cloud metadata (169.254.169.254), and Linux abstract UNIX sockets. Abstract sockets are outside filesystem isolation and may permit code execution in that network namespace. Development use only."
-        )]
-    } else {
-        Vec::new()
+        )],
     }
 }
 
@@ -335,12 +689,20 @@ mod tests {
             workspace: workspace.to_path_buf(),
             run_id: "00000000-0000-4000-8000-000000000000".to_owned(),
             tool: ToolSpec {
-                command: OsString::from("tool"),
+                command: OsString::from("/bin/echo"),
                 args: vec![OsString::from("--version")],
                 tool_root: None,
             },
             network,
+            allowed_egress_hosts: if network == NetworkMode::Controlled {
+                vec!["api.example.com".to_owned()]
+            } else {
+                vec![]
+            },
             forwarded_env: vec![("GROK_TOKEN".to_owned(), "secret".to_owned())],
+            resource_limits: crate::ResourceLimits::default(),
+            cgroup_mode: CgroupMode::BestEffort,
+            helper_path: Some(PathBuf::from("/bin/true")),
             lima_instance: "sandbox-guard".to_owned(),
         }
     }
@@ -348,7 +710,14 @@ mod tests {
     #[test]
     fn guest_plan_clears_environment_and_denies_network() {
         let workspace = Path::new("/tmp/guard-test/workspace");
-        let args = guest_bwrap_args(&request(workspace, NetworkMode::Denied), workspace);
+        let runtime = Path::new("/tmp/guard-test/runtime");
+        let helper = Path::new("/usr/local/bin/guard-helper");
+        let args = guest_bwrap_args(
+            &request(workspace, NetworkMode::Denied),
+            workspace,
+            runtime,
+            helper,
+        );
         let strings: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
         assert!(strings.iter().any(|arg| arg == "--clearenv"));
         assert!(strings.iter().any(|arg| arg == "--close-fds"));
@@ -356,13 +725,34 @@ mod tests {
         assert!(strings.iter().any(|arg| arg == "--unshare-pid"));
         assert!(strings.iter().any(|arg| arg == "--cap-drop"));
         assert!(strings.iter().any(|arg| arg == "/workspace"));
-        assert!(!strings.iter().any(|arg| arg.contains("/Users/")));
+        assert!(strings.iter().any(|arg| arg == "supervise"));
+        assert!(!strings.iter().any(|arg| arg.contains("secret")));
+    }
+
+    #[test]
+    fn controlled_mode_keeps_network_namespace_and_uses_proxy_socket() {
+        let workspace = Path::new("/tmp/guard-test/workspace");
+        let args = guest_bwrap_args(
+            &request(workspace, NetworkMode::Controlled),
+            workspace,
+            Path::new("/tmp/guard-test/runtime"),
+            Path::new("/usr/local/bin/guard-helper"),
+        );
+        let strings: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert!(strings.iter().any(|arg| arg == "--unshare-net"));
+        assert!(strings.iter().any(|arg| arg == "--proxy-socket"));
+        assert!(strings.iter().any(|arg| arg == GUEST_PROXY_SOCKET));
     }
 
     #[test]
     fn unrestricted_network_is_explicit_in_plan_and_warning() {
         let workspace = Path::new("/tmp/guard-test/workspace");
-        let args = guest_bwrap_args(&request(workspace, NetworkMode::Unrestricted), workspace);
+        let args = guest_bwrap_args(
+            &request(workspace, NetworkMode::Unrestricted),
+            workspace,
+            Path::new("/tmp/guard-test/runtime"),
+            Path::new("/usr/local/bin/guard-helper"),
+        );
         assert!(
             !args
                 .iter()
@@ -372,13 +762,35 @@ mod tests {
     }
 
     #[test]
-    fn real_linux_plan_redacts_forwarded_values() {
+    fn real_linux_plan_contains_no_forwarded_value() {
         let workspace = tempfile::tempdir().unwrap();
-        let mut request = request(workspace.path(), NetworkMode::Denied);
-        request.tool.command = OsString::from("/bin/echo");
-        let plan = LinuxBwrapRunner::build_plan(&request, PathBuf::from("/usr/bin/bwrap")).unwrap();
+        let request = request(workspace.path(), NetworkMode::Denied);
+        let plan = LinuxBwrapRunner::build_plan(
+            &request,
+            PathBuf::from("/usr/bin/bwrap"),
+            PathBuf::from("/bin/true"),
+            Path::new("/tmp/runtime"),
+            false,
+        )
+        .unwrap();
         let rendered = plan.rendered();
         assert!(!rendered.contains("secret"));
-        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn private_environment_file_contains_values_but_has_private_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("environment.json");
+        write_environment_file(
+            &path,
+            &[("VENDOR_TOKEN".to_owned(), "secret-value".to_owned())],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_to_string(path).unwrap().contains("secret-value"));
     }
 }

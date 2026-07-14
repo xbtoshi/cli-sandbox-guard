@@ -2,7 +2,7 @@
 
 use std::fs;
 
-use sandbox_guard_core::{CompiledPolicy, RunRecord, Stage, StageOptions};
+use sandbox_guard_core::{CompiledPolicy, ResourceLimitRecord, RunRecord, Stage, StageOptions};
 
 #[test]
 fn persisted_run_audit_never_contains_a_forwarded_secret_value() {
@@ -25,6 +25,18 @@ fn persisted_run_audit_never_contains_a_forwarded_secret_value() {
             .iter()
             .map(|(name, _)| name.clone())
             .collect(),
+        allowed_egress_hosts: vec![],
+        egress_audit: vec![],
+        resource_limits: ResourceLimitRecord {
+            memory_bytes: 1024,
+            max_file_bytes: 1024,
+            cpu_seconds: 60,
+            open_files: 64,
+            max_processes: 16,
+            cpu_percent: 100,
+        },
+        cgroup_enforced: false,
+        seccomp_enforced: true,
         exit_code: Some(0),
         success: true,
     });

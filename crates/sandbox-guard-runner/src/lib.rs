@@ -1,7 +1,7 @@
 //! Platform execution backends.
 //!
 //! Both backends run against a disposable staged workspace. Network access is denied by default;
-//! unrestricted networking is deliberately noisy and is recorded in the audit manifest.
+//! controlled proxy egress or deliberately noisy unrestricted networking is recorded in audit.
 
 mod linux;
 mod macos;
@@ -16,6 +16,7 @@ use thiserror::Error;
 
 pub use linux::LinuxBwrapRunner;
 pub use macos::MacosLimaRunner;
+pub use sandbox_guard_helper::ResourceLimits;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -42,6 +43,7 @@ impl BackendKind {
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkMode {
     Denied,
+    Controlled,
     Unrestricted,
 }
 
@@ -49,9 +51,18 @@ impl NetworkMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Denied => "denied",
+            Self::Controlled => "controlled",
             Self::Unrestricted => "unrestricted",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CgroupMode {
+    Required,
+    BestEffort,
+    Disabled,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +80,12 @@ pub struct RunRequest {
     pub run_id: String,
     pub tool: ToolSpec,
     pub network: NetworkMode,
+    pub allowed_egress_hosts: Vec<String>,
     pub forwarded_env: Vec<(String, String)>,
+    pub resource_limits: ResourceLimits,
+    pub cgroup_mode: CgroupMode,
+    /// Linux host helper path or absolute helper path inside the managed Lima guest.
+    pub helper_path: Option<PathBuf>,
     pub lima_instance: String,
 }
 
@@ -78,6 +94,9 @@ pub struct RunOutcome {
     pub backend: BackendKind,
     pub status: ExitStatus,
     pub warnings: Vec<String>,
+    pub cgroup_enforced: bool,
+    pub seccomp_enforced: bool,
+    pub egress_audit: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,10 +147,56 @@ fn validate_request(request: &RunRequest) -> Result<(), RunnerError> {
     if request.tool.command.is_empty() {
         return Err(RunnerError::EmptyToolCommand);
     }
+    if uuid::Uuid::parse_str(&request.run_id)
+        .ok()
+        .is_none_or(|run_id| run_id.to_string() != request.run_id)
+    {
+        return Err(RunnerError::InvalidRunId(request.run_id.clone()));
+    }
+    if request.lima_instance.is_empty()
+        || request.lima_instance.len() > 64
+        || !request
+            .lima_instance
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') && index > 0
+            })
+    {
+        return Err(RunnerError::InvalidLimaInstance(
+            request.lima_instance.clone(),
+        ));
+    }
+    let limits = request.resource_limits;
+    if limits.memory_bytes == 0
+        || limits.max_file_bytes == 0
+        || limits.cpu_seconds == 0
+        || limits.open_files < 16
+        || limits.max_processes == 0
+        || limits.cpu_percent == 0
+    {
+        return Err(RunnerError::InvalidResourceLimits);
+    }
     if let Some(root) = &request.tool.tool_root
         && !root.is_absolute()
     {
         return Err(RunnerError::InvalidToolRoot(root.clone()));
+    }
+    if let Some(helper) = &request.helper_path
+        && !helper.is_absolute()
+    {
+        return Err(RunnerError::InvalidHelperPath(helper.clone()));
+    }
+    match request.network {
+        NetworkMode::Controlled if request.allowed_egress_hosts.is_empty() => {
+            return Err(RunnerError::ControlledEgressWithoutHosts);
+        }
+        NetworkMode::Denied | NetworkMode::Unrestricted
+            if !request.allowed_egress_hosts.is_empty() =>
+        {
+            return Err(RunnerError::EgressHostsWithoutControlledMode);
+        }
+        _ => {}
     }
     for (name, _) in &request.forwarded_env {
         validate_forwarded_environment_name(name)?;
@@ -215,6 +280,12 @@ pub enum RunnerError {
     WorkspaceMissing(PathBuf),
     #[error("tool command cannot be empty")]
     EmptyToolCommand,
+    #[error("run ID must be a canonical UUID: {0:?}")]
+    InvalidRunId(String),
+    #[error("invalid Lima instance name: {0:?}")]
+    InvalidLimaInstance(String),
+    #[error("resource limits must be positive and the open-file limit must be at least 16")]
+    InvalidResourceLimits,
     #[error("environment variable {0:?} is unsafe to forward")]
     UnsafeEnvironmentName(String),
     #[error("required executable {name} was not found: {source}")]
@@ -233,6 +304,16 @@ pub enum RunnerError {
     ToolOutsideRoot { tool: PathBuf, root: PathBuf },
     #[error("tool root must be an absolute directory: {0}")]
     InvalidToolRoot(PathBuf),
+    #[error("runtime helper path must be absolute: {0}")]
+    InvalidHelperPath(PathBuf),
+    #[error("controlled network mode requires at least one --allow-host")]
+    ControlledEgressWithoutHosts,
+    #[error("--allow-host is valid only with controlled network mode")]
+    EgressHostsWithoutControlledMode,
+    #[error("required cgroup v2 delegation through systemd-run is unavailable")]
+    CgroupUnavailable,
+    #[error("runtime helper failed before the sandbox started: {0}")]
+    HelperFailed(String),
     #[error("failed to inspect {path}: {source}")]
     Inspect {
         path: PathBuf,
@@ -265,7 +346,11 @@ mod tests {
                 tool_root: None,
             },
             network: NetworkMode::Denied,
+            allowed_egress_hosts: vec![],
             forwarded_env: vec![],
+            resource_limits: ResourceLimits::default(),
+            cgroup_mode: CgroupMode::BestEffort,
+            helper_path: None,
             lima_instance: "sandbox-guard".to_owned(),
         }
     }
@@ -317,6 +402,35 @@ mod tests {
         assert!(matches!(
             validate_request(&request),
             Err(RunnerError::InvalidToolRoot(_))
+        ));
+    }
+
+    #[test]
+    fn path_shaping_identifiers_are_strictly_validated() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut request = request(workspace.path());
+        request.run_id = "../../host".to_owned();
+        assert!(matches!(
+            validate_request(&request),
+            Err(RunnerError::InvalidRunId(_))
+        ));
+
+        request.run_id = "00000000-0000-4000-8000-000000000000".to_owned();
+        request.lima_instance = "--debug".to_owned();
+        assert!(matches!(
+            validate_request(&request),
+            Err(RunnerError::InvalidLimaInstance(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_resource_limits_fail_before_backend_setup() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut request = request(workspace.path());
+        request.resource_limits.max_processes = 0;
+        assert!(matches!(
+            validate_request(&request),
+            Err(RunnerError::InvalidResourceLimits)
         ));
     }
 

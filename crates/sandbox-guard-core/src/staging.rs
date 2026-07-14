@@ -582,7 +582,7 @@ pub fn is_valid_candidate_path(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn open_relative_no_links(root: &File, relative: &Path) -> std::io::Result<File> {
+pub(crate) fn open_relative_no_links(root: &File, relative: &Path) -> std::io::Result<File> {
     #[repr(C)]
     struct OpenHow {
         flags: u64,
@@ -623,7 +623,7 @@ fn open_relative_no_links(root: &File, relative: &Path) -> std::io::Result<File>
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_relative_no_links(root: &File, relative: &Path) -> std::io::Result<File> {
+pub(crate) fn open_relative_no_links(root: &File, relative: &Path) -> std::io::Result<File> {
     let components: Vec<&OsStr> = relative
         .components()
         .map(|component| match component {
@@ -658,19 +658,19 @@ fn open_relative_no_links(root: &File, relative: &Path) -> std::io::Result<File>
     Ok(File::from(descriptor))
 }
 
-struct CopiedFile {
-    bytes: u64,
-    sha256: String,
-    executable: bool,
+pub(crate) struct CopiedFile {
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
+    pub(crate) executable: bool,
 }
 
-enum CopyError {
+pub(crate) enum CopyError {
     Io(std::io::Error),
     Changed,
     Limit(u64),
 }
 
-fn copy_stable_file(
+pub(crate) fn copy_stable_file(
     mut source: File,
     before: &fs::Metadata,
     destination: &Path,

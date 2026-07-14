@@ -1,21 +1,23 @@
 [package]
-name = "sandbox-guard-runner"
-description = "Isolated execution backends for Sandbox Guard"
+name = "sandbox-guard-helper"
+description = "Trusted proxy, limit, and self-test helper for Sandbox Guard"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "guard-helper"
+path = "src/main.rs"
+
 [dependencies]
-sandbox-guard-helper = { path = "../sandbox-guard-helper" }
+anyhow.workspace = true
+clap.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
-which.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
