@@ -143,7 +143,12 @@ fn preserves_only_the_executable_permission_class() {
 
 #[test]
 fn rejects_a_staging_base_inside_the_source_tree() {
-    let fixture = tempfile::tempdir().unwrap();
+    // macOS exposes /tmp through the /private/tmp alias. This ensures both source and staging base
+    // are compared in canonical form rather than relying on their caller-provided spellings.
+    let fixture = tempfile::Builder::new()
+        .prefix("sandbox-guard-source-")
+        .tempdir_in("/tmp")
+        .unwrap();
     fs::write(fixture.path().join("README.md"), "public\n").unwrap();
     let policy = CompiledPolicy::builtin().unwrap();
     let mut options = StageOptions::new(fixture.path(), policy);

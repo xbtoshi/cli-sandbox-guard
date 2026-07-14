@@ -84,6 +84,17 @@ impl Stage {
             path: base.clone(),
             source: source_error,
         })?;
+        let base = fs::canonicalize(&base).map_err(|source_error| StageError::Io {
+            operation: "canonicalize staging base",
+            path: base.clone(),
+            source: source_error,
+        })?;
+        if base.starts_with(&source) {
+            return Err(StageError::StagingInsideSource {
+                source_root: source,
+                staging: base,
+            });
+        }
         let temp = TempBuilder::new()
             .prefix(STAGE_PREFIX)
             .tempdir_in(&base)
