@@ -68,7 +68,9 @@ The sol/high review is authoritative. The 12 blockers below come from that pass.
 
 ### 1. bwrap inherits env by default
 - **Bug in v2**: `--setenv PATH ... --setenv HOME ...` doesn't remove other env vars. `GITHUB_TOKEN`, `AWS_*`, `ANTHROPIC_*`, all shell vars pass through untouched.
-- **Fix**: `--clearenv --close-fds --dir /tmp/jail-home`, then only audited variables. Treat the forwarded vendor auth token as intentionally exposed to that specific tool.
+- **Fix**: `--clearenv`, Bubblewrap's automatic extra-descriptor closure, and a private synthetic
+  home, then only audited variables. Treat a forwarded vendor token as intentionally exposed to
+  that specific tool.
 
 ### 2. Updater runs vendor code before verification
 - **Bug in v2**: pinned-hash check happens *after* the vendor updater runs. By then, malicious update code has already had normal-home access — post-verification can't undo credential theft or host modification.

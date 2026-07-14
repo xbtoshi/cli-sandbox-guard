@@ -276,7 +276,6 @@ fn build_bwrap_args(
     push(&mut args, "--cap-drop");
     push(&mut args, "ALL");
     push(&mut args, "--clearenv");
-    push(&mut args, "--close-fds");
     push(&mut args, "--tmpfs");
     push(&mut args, "/");
     push(&mut args, "--proc");
@@ -369,7 +368,6 @@ pub(crate) fn guest_bwrap_args(
     push(&mut args, "--cap-drop");
     push(&mut args, "ALL");
     push(&mut args, "--clearenv");
-    push(&mut args, "--close-fds");
     push(&mut args, "--tmpfs");
     push(&mut args, "/");
     push(&mut args, "--proc");
@@ -720,7 +718,6 @@ mod tests {
         );
         let strings: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
         assert!(strings.iter().any(|arg| arg == "--clearenv"));
-        assert!(strings.iter().any(|arg| arg == "--close-fds"));
         assert!(strings.iter().any(|arg| arg == "--unshare-net"));
         assert!(strings.iter().any(|arg| arg == "--unshare-pid"));
         assert!(strings.iter().any(|arg| arg == "--cap-drop"));
