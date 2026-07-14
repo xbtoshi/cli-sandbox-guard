@@ -1,0 +1,27 @@
+[package]
+name = "sandbox-guard-core"
+description = "Policy, secure staging, and audit primitives for Sandbox Guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+globset.workspace = true
+hex.workspace = true
+ignore.workspace = true
+libc.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+uuid.workspace = true
+which.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

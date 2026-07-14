@@ -1,0 +1,19 @@
+[package]
+name = "sandbox-guard-runner"
+description = "Isolated execution backends for Sandbox Guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sandbox-guard-core = { path = "../sandbox-guard-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+which.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

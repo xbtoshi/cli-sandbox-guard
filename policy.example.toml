@@ -1,0 +1,12 @@
+# User policy is additive. Built-in deny rules cannot be removed and limits can only be lowered.
+schema_version = 1
+
+deny = [
+  "**/*.secret",
+  "**/*.pem",
+  "**/secrets/**",
+]
+
+max_file_bytes = 33554432
+max_total_bytes = 1073741824
+max_files = 50000
