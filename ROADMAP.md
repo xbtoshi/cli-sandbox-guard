@@ -65,9 +65,9 @@ We will not adopt these weaker postures:
 
 - [ ] Bump the release candidate version and create a signed Git tag.
 - [ ] Publish checksummed macOS ARM64 and Linux x86-64/ARM64 binaries.
-- [ ] Verify that release artifacts contain the exact binaries tested in CI.
+- [x] Verify that release artifacts contain the exact binaries tested in CI.
 - [x] Add installation, upgrade, rollback, and removal instructions.
-- [ ] Run and record live Bubblewrap and Lima hostile-fixture tests against the release artifacts.
+- [x] Run and record live Bubblewrap and Lima hostile-fixture tests against the release artifacts.
 - [x] Keep the README, security model, and CLI output explicitly labelled as alpha.
 - [x] Require an independent adversarial review for changes to a trusted boundary component.
 
