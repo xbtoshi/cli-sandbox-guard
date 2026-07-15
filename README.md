@@ -63,9 +63,10 @@ Pass Grok arguments after `--`, for example:
 
 `guard grok` is a thin application adapter over the vendor-neutral staging and runner core. It
 always selects controlled egress to `cli-chat-proxy.grok.com`, disables Grok web search and memory,
-uses inline terminal rendering, and runs `grok login` as an isolated preflight inside the
-disposable synthetic home. The host refresh token and `~/.grok/auth.json` are never copied into
-the workspace or Lima guest.
+uses Grok's minimal scrollback-native rendering plus inline terminal mode so output can be selected
+and copied normally, and runs `grok login` as an isolated preflight inside the disposable synthetic
+home. The host refresh token and `~/.grok/auth.json` are never copied into the workspace or Lima
+guest.
 
 Guard reads only the current short-lived OAuth access token from an owner-only, singly linked
 host auth file. When it is stale, Guard first asks the host Grok CLI to perform a silent refresh in

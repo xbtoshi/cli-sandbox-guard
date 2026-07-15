@@ -19,6 +19,12 @@ const GROK_PROXY_HOST: &str = "cli-chat-proxy.grok.com";
 const GROK_SESSION_TOKEN: &str = "GROK_SESSION_TOKEN";
 const GROK_AUTH_PROVIDER_COMMAND: &str = "GROK_AUTH_PROVIDER_COMMAND";
 const AUTH_PROVIDER_COMMAND: &str = "printf '%s\\n' \"$GROK_SESSION_TOKEN\"";
+const SAFE_GROK_ARGUMENTS: &[&str] = &[
+    "--disable-web-search",
+    "--no-memory",
+    "--minimal",
+    "--no-alt-screen",
+];
 const MINIMUM_TOKEN_VALIDITY_MINUTES: i64 = 10;
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -113,12 +119,8 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
             .format("%Y-%m-%d %H:%M:%S %z")
     );
 
-    let mut tool = vec![
-        OsString::from("grok"),
-        OsString::from("--disable-web-search"),
-        OsString::from("--no-memory"),
-        OsString::from("--no-alt-screen"),
-    ];
+    let mut tool = vec![OsString::from("grok")];
+    tool.extend(SAFE_GROK_ARGUMENTS.iter().map(OsString::from));
     tool.extend(args.grok_args);
 
     let run_args = RunArgs {
@@ -428,5 +430,11 @@ mod tests {
             "printf '%s\\n' \"$GROK_SESSION_TOKEN\""
         );
         assert!(!AUTH_PROVIDER_COMMAND.contains("test-access-token"));
+    }
+
+    #[test]
+    fn safe_defaults_use_native_scrollback_for_selection() {
+        assert!(SAFE_GROK_ARGUMENTS.contains(&"--minimal"));
+        assert!(SAFE_GROK_ARGUMENTS.contains(&"--no-alt-screen"));
     }
 }
