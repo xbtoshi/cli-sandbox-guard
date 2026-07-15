@@ -7,6 +7,9 @@ use std::process::{Command, Stdio};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
+#[cfg(target_os = "macos")]
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 
 use crate::RunnerError;
@@ -15,22 +18,68 @@ const MAX_DECISION_FILE_BYTES: u64 = 1024 * 1024;
 
 #[cfg(target_os = "macos")]
 const MACOS_APPROVAL_SCRIPT: &str = r#"
-on run argv
-    set destination to item 1 of argv
-    set messageText to "An isolated tool requested an HTTPS tunnel to " & destination & ".\n\nSandbox Guard can verify the exact hostname and port. The full URL, HTTP method, headers, and body remain encrypted and are not visible without intercepting TLS.\n\nAllowing access may disclose workspace data available to the tool. Only approve destinations you expect."
-    try
-        set dialogResult to display dialog messageText with title "Sandbox Guard Network Approval" buttons {"Deny", "Allow Once", "Allow for Session"} default button "Deny" with icon caution giving up after 45
-        if gave up of dialogResult then return "Deny"
-        set selectedDecision to button returned of dialogResult
-        set rememberResult to display dialog "Remember this exact-host decision for future Sandbox Guard sessions?\n\nYou can review or remove remembered choices with guard approvals." with title "Remember Network Decision" buttons {"Not Now", "Remember"} default button "Not Now" with icon caution giving up after 15
-        if gave up of rememberResult or button returned of rememberResult is "Not Now" then return selectedDecision
-        if selectedDecision is "Deny" then return "Always Deny"
-        return "Always Allow"
-    on error number -128
-        return "Deny"
-    end try
-end run
+ObjC.import("AppKit");
+
+function buildAlert(destination) {
+    const alert = $.NSAlert.alloc.init;
+    alert.alertStyle = $.NSAlertStyleWarning;
+    alert.messageText = "An isolated tool requested an HTTPS tunnel to " + destination + ".";
+    alert.informativeText = "Sandbox Guard can verify the exact hostname and port. The full URL, HTTP method, headers, and body remain encrypted and are not visible without intercepting TLS.\n\nAllowing access may disclose workspace data available to the tool. Only approve destinations you expect.";
+    alert.addButtonWithTitle("Deny");
+    alert.addButtonWithTitle("Allow Once");
+    alert.addButtonWithTitle("Allow for Session");
+
+    const remember = $.NSButton.alloc.initWithFrame($.NSMakeRect(0, 0, 420, 24));
+    remember.setButtonType($.NSSwitchButton);
+    remember.title = "Always allow or deny this exact host in future sessions";
+    remember.state = $.NSControlStateValueOff;
+    alert.accessoryView = remember;
+    alert.window.title = "Sandbox Guard Network Approval";
+    return [alert, remember];
+}
+
+function decisionFor(response, remembered) {
+    if (response === Number($.NSAlertFirstButtonReturn)) {
+        return remembered ? "Always Deny" : "Deny";
+    }
+    if (response === Number($.NSAlertSecondButtonReturn)) {
+        return remembered ? "Always Allow" : "Allow Once";
+    }
+    if (response === Number($.NSAlertThirdButtonReturn)) {
+        return remembered ? "Always Allow" : "Allow for Session";
+    }
+    return "Deny";
+}
+
+function run(argv) {
+    if (argv.length !== 1) {
+        return "Deny";
+    }
+    if (argv[0] === "--self-test") {
+        const first = Number($.NSAlertFirstButtonReturn);
+        const second = Number($.NSAlertSecondButtonReturn);
+        const third = Number($.NSAlertThirdButtonReturn);
+        const decisions = [
+            decisionFor(first, false), decisionFor(first, true),
+            decisionFor(second, false), decisionFor(second, true),
+            decisionFor(third, false), decisionFor(third, true),
+            decisionFor(0, true)
+        ].join(",");
+        return decisions === "Deny,Always Deny,Allow Once,Always Allow,Allow for Session,Always Allow,Deny"
+            ? "SELF_TEST_OK" : "Deny";
+    }
+
+    const pair = buildAlert(argv[0]);
+    $.NSApplication.sharedApplication;
+    $.NSApp.activateIgnoringOtherApps(true);
+    const response = Number(pair[0].runModal);
+    const remembered = Number(pair[1].state) === Number($.NSControlStateValueOn);
+    return decisionFor(response, remembered);
+}
 "#;
+
+#[cfg(target_os = "macos")]
+const MACOS_APPROVAL_TIMEOUT: Duration = Duration::from_secs(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalDecision {
@@ -465,22 +514,44 @@ fn valid_exact_hostname(host: &str) -> bool {
 #[cfg(target_os = "macos")]
 fn native_approval(host: &str, port: u16) -> ApprovalDecision {
     let destination = format!("{host}:{port}");
-    let output = Command::new("/usr/bin/osascript")
+    let Ok(mut child) = Command::new("/usr/bin/osascript")
+        .args(["-l", "JavaScript"])
         .arg("-e")
         .arg(MACOS_APPROVAL_SCRIPT)
         .arg("--")
         .arg(destination)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .output();
-    ApprovalDecision::from_dialog_output(
-        output
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .as_deref()
-            .unwrap_or_default(),
-    )
+        .stdout(Stdio::piped())
+        .spawn()
+    else {
+        return ApprovalDecision::Deny;
+    };
+    let deadline = Instant::now() + MACOS_APPROVAL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut output = String::new();
+                if status.success()
+                    && child
+                        .stdout
+                        .take()
+                        .is_some_and(|mut stdout| stdout.read_to_string(&mut output).is_ok())
+                {
+                    return ApprovalDecision::from_dialog_output(output.trim());
+                }
+                return ApprovalDecision::Deny;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ApprovalDecision::Deny;
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -634,6 +705,7 @@ mod tests {
     fn macos_native_approval_script_compiles_without_displaying_it() {
         let directory = tempfile::tempdir().unwrap();
         let output = Command::new("/usr/bin/osacompile")
+            .args(["-l", "JavaScript"])
             .arg("-o")
             .arg(directory.path().join("approval.scpt"))
             .arg("-e")
@@ -644,6 +716,31 @@ mod tests {
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_native_approval_maps_the_checkbox_without_displaying_ui() {
+        let output = Command::new("/usr/bin/osascript")
+            .args([
+                "-l",
+                "JavaScript",
+                "-e",
+                MACOS_APPROVAL_SCRIPT,
+                "--",
+                "--self-test",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "SELF_TEST_OK"
         );
     }
 }

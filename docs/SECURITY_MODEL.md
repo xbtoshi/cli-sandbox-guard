@@ -112,8 +112,9 @@ content; sanitization protects the file/decoder boundary, not model interpretati
 - Optional interactive grants cross a private stdio pipe owned by the trusted proxy transport, not
   the tool terminal. The host revalidates an exact normalized hostname and port 443 before showing
   a native dialog. Choices cover one CONNECT, one Guard session, or—only when the user explicitly
-  remembers them—future sessions. Remembered choices are exact-host port-443 entries and never add
-  wildcard rules.
+  remembers them—future sessions. macOS collects the decision and optional remember state in one
+  `NSAlert`; Linux presents the persistent variants in the same `zenity` window. Remembered choices
+  are exact-host port-443 entries and never add wildcard rules.
 - Remembered allow and deny choices live in an owner-only, singly linked regular file under an
   owner-only Guard data directory. Writes are locked, merged, fsynced, and atomically renamed. The
   file path is outside the staged workspace and optional writable tool state. Persistence failure

@@ -69,15 +69,16 @@ Pass Grok arguments after `--`, for example:
 always selects controlled egress to `cli-chat-proxy.grok.com`, disables Grok web search and memory,
 keeps Grok's normal UI in inline terminal mode, and runs `grok login` as an isolated preflight
 inside the disposable synthetic home. Unknown HTTPS destinations trigger a trusted host-native
-approval dialog with deny, allow-once, and allow-for-session choices. The dialog can remember an
-exact-host allow or deny for later Guard sessions; `guard approvals` lists those choices, while
-`guard approvals --forget HOST` and `guard approvals --clear` remove them. `--no-egress-prompts`
-keeps the original fixed allowlist for automation or stricter sessions. Grok mouse reporting is
-enabled by default so wheel scrolling works in the regular TUI. Press `Ctrl+S` to enter trusted
-host selection/copy mode, which temporarily disables tool mouse reporting; press it again to
-restore Grok scrolling. The toggle is consumed by Guard and is not delivered to Grok. The optional
-`--scrollback` flag still selects Grok's experimental native-scrollback renderer, which uses a
-visibly different pinned-region layout. The host refresh token and `~/.grok/auth.json` are never
+approval dialog with deny, allow-once, and allow-for-session choices. On macOS the same alert has a
+single optional “remember” checkbox, so persistence never requires a second confirmation. The
+dialog can remember an exact-host allow or deny for later Guard sessions; `guard approvals` lists
+those choices, while `guard approvals --forget HOST` and `guard approvals --clear` remove them.
+`--no-egress-prompts` keeps the original fixed allowlist for automation or stricter sessions. Grok
+mouse reporting is enabled by default so wheel scrolling works in the regular TUI. Press `Ctrl+S`
+to enter trusted host selection/copy mode, which temporarily disables tool mouse reporting; press
+it again to restore Grok scrolling. The toggle is consumed by Guard and is not delivered to Grok.
+The optional `--scrollback` flag still selects Grok's experimental native-scrollback renderer,
+which uses a visibly different pinned-region layout. The host refresh token and `~/.grok/auth.json` are never
 copied into the workspace or Lima guest.
 
 On macOS, pressing `Ctrl+V` in an interactive Guard session explicitly imports one image from the
@@ -233,8 +234,10 @@ destinations—not URLs, headers, or credentials—are written to the run audit.
 `--ask-egress` carries approval requests over a private protocol pipe from the trusted proxy to a
 host-native dialog. The untrusted tool never receives approval input. A grant is always for the
 exact requested hostname on port 443 and can cover one CONNECT, the current Guard session, or
-future sessions when the user explicitly remembers the choice. Remembered allow and deny choices
-live in an owner-only Guard data file outside every staged or sandbox-writable tree. Dialog
+future sessions when the user explicitly remembers the choice. The macOS alert collects the scope
+and optional remember choice in one step; Linux presents persistent choices in the same `zenity`
+window. Remembered allow and deny choices live in an owner-only Guard data file outside every
+staged or sandbox-writable tree. Dialog
 cancellation, timeout, malformed protocol, missing native UI, persistence failure, and
 noninteractive execution all fail closed. Native prompts are serialized and capped at 16 per run
 to bound prompt flooding. Approval decisions are recorded separately in the audit. On macOS Guard
