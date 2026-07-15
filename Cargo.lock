@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guard"
-version = "0.3.0-alpha.1"
+version = "0.3.0-alpha.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guard-core"
-version = "0.3.0-alpha.1"
+version = "0.3.0-alpha.2"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guard-helper"
-version = "0.3.0-alpha.1"
+version = "0.3.0-alpha.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guard-runner"
-version = "0.3.0-alpha.1"
+version = "0.3.0-alpha.2"
 dependencies = [
  "hex",
  "image",

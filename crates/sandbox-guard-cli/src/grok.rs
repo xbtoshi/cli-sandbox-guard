@@ -90,6 +90,10 @@ pub(super) struct GrokArgs {
     #[arg(long, value_name = "DIRECTORY")]
     export_changes: Option<PathBuf>,
 
+    /// Discard isolated workspace changes without the default trusted review/apply prompt.
+    #[arg(long)]
+    no_change_review: bool,
+
     /// Keep the disposable staged workspace after Grok exits.
     #[arg(long)]
     keep_stage: bool,
@@ -173,6 +177,7 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
         open_files: args.open_files,
         max_processes: args.max_processes,
         cpu_percent: args.cpu_percent,
+        review_changes: args.export_changes.is_none() && !args.no_change_review,
         export_changes: args.export_changes,
         no_synthetic_git: false,
         dry_run: false,

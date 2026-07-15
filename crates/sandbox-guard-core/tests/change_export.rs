@@ -3,7 +3,10 @@
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
-use sandbox_guard_core::{ChangeKind, CompiledPolicy, Stage, StageOptions, export_changes};
+use sandbox_guard_core::{
+    ApplyAuthorization, ApplyError, ChangeKind, CompiledPolicy, Stage, StageOptions,
+    apply_exported_changes, decode_change_path, export_changes,
+};
 
 #[test]
 fn exports_only_reopened_regular_changes_and_records_deletions() {
@@ -159,4 +162,324 @@ fn refuses_to_publish_an_export_inside_the_source_tree() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn conflict_checked_apply_updates_only_validated_host_paths() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("modified.txt"), "before\n").unwrap();
+    fs::write(source.path().join("deleted.txt"), "delete me\n").unwrap();
+    fs::write(source.path().join("unchanged.txt"), "same\n").unwrap();
+    fs::set_permissions(
+        source.path().join("modified.txt"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let policy = CompiledPolicy::builtin().unwrap();
+    let mut options = StageOptions::new(source.path(), policy.clone());
+    options.synthetic_git = false;
+    let stage = Stage::build(options).unwrap();
+
+    fs::write(stage.workspace().join("modified.txt"), "after\n").unwrap();
+    fs::remove_file(stage.workspace().join("deleted.txt")).unwrap();
+    fs::create_dir(stage.workspace().join("nested")).unwrap();
+    fs::write(stage.workspace().join("nested/added.sh"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        stage.workspace().join("nested/added.sh"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("changes");
+    let report = export_changes(
+        stage.workspace(),
+        source.path(),
+        stage.manifest(),
+        &policy,
+        &destination,
+    )
+    .unwrap();
+    let error = apply_exported_changes(
+        source.path(),
+        stage.manifest(),
+        &destination,
+        &report.manifest,
+        ApplyAuthorization::additions_and_modifications_only(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ApplyError::DeletionAuthorizationRequired(1)
+    ));
+    assert_eq!(
+        fs::read_to_string(source.path().join("modified.txt")).unwrap(),
+        "before\n"
+    );
+    assert!(source.path().join("deleted.txt").exists());
+    assert!(!source.path().join("nested/added.sh").exists());
+
+    let applied = apply_exported_changes(
+        source.path(),
+        stage.manifest(),
+        &destination,
+        &report.manifest,
+        ApplyAuthorization::including_confirmed_deletions(),
+    )
+    .unwrap();
+
+    assert_eq!(applied.added, 1);
+    assert_eq!(applied.modified, 1);
+    assert_eq!(applied.deleted, 1);
+    assert_eq!(
+        fs::read_to_string(source.path().join("modified.txt")).unwrap(),
+        "after\n"
+    );
+    assert_eq!(
+        fs::metadata(source.path().join("modified.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    assert_eq!(
+        fs::read_to_string(source.path().join("nested/added.sh")).unwrap(),
+        "#!/bin/sh\n"
+    );
+    assert_ne!(
+        fs::metadata(source.path().join("nested/added.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+    assert!(!source.path().join("deleted.txt").exists());
+    assert_eq!(
+        fs::read_to_string(source.path().join("unchanged.txt")).unwrap(),
+        "same\n"
+    );
+    assert!(fs::read_dir(source.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".sandbox-guard-")
+    }));
+}
+
+#[test]
+fn denied_output_disables_automatic_apply_and_never_enters_bundle() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("safe.txt"), "before\n").unwrap();
+    let policy = CompiledPolicy::builtin().unwrap();
+    let mut options = StageOptions::new(source.path(), policy.clone());
+    options.synthetic_git = false;
+    let stage = Stage::build(options).unwrap();
+    fs::write(stage.workspace().join("safe.txt"), "after\n").unwrap();
+    fs::write(stage.workspace().join(".env"), "NEVER_EXPORT=secret\n").unwrap();
+
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("changes");
+    let report = export_changes(
+        stage.workspace(),
+        source.path(),
+        stage.manifest(),
+        &policy,
+        &destination,
+    )
+    .unwrap();
+    assert!(!destination.join("files/.env").exists());
+    assert!(
+        !fs::read(destination.join("manifest.json"))
+            .unwrap()
+            .windows(b"NEVER_EXPORT=secret".len())
+            .any(|window| window == b"NEVER_EXPORT=secret")
+    );
+    assert!(
+        report
+            .manifest
+            .rejected
+            .iter()
+            .any(|item| item.path == ".env")
+    );
+
+    let error = apply_exported_changes(
+        source.path(),
+        stage.manifest(),
+        &destination,
+        &report.manifest,
+        ApplyAuthorization::additions_and_modifications_only(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ApplyError::RejectedOutput(1)));
+    assert_eq!(
+        fs::read_to_string(source.path().join("safe.txt")).unwrap(),
+        "before\n"
+    );
+    assert!(!source.path().join(".env").exists());
+}
+
+#[test]
+fn host_conflict_refuses_every_change_before_mutation() {
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("a.txt"), "before a\n").unwrap();
+    fs::write(source.path().join("b.txt"), "before b\n").unwrap();
+    let policy = CompiledPolicy::builtin().unwrap();
+    let mut options = StageOptions::new(source.path(), policy.clone());
+    options.synthetic_git = false;
+    let stage = Stage::build(options).unwrap();
+    fs::write(stage.workspace().join("a.txt"), "after a\n").unwrap();
+    fs::write(stage.workspace().join("b.txt"), "after b\n").unwrap();
+
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("changes");
+    let report = export_changes(
+        stage.workspace(),
+        source.path(),
+        stage.manifest(),
+        &policy,
+        &destination,
+    )
+    .unwrap();
+    fs::write(source.path().join("b.txt"), "host edit\n").unwrap();
+
+    assert!(matches!(
+        apply_exported_changes(
+            source.path(),
+            stage.manifest(),
+            &destination,
+            &report.manifest,
+            ApplyAuthorization::additions_and_modifications_only(),
+        ),
+        Err(ApplyError::Conflict { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(source.path().join("a.txt")).unwrap(),
+        "before a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(source.path().join("b.txt")).unwrap(),
+        "host edit\n"
+    );
+}
+
+#[test]
+fn apply_failure_rolls_back_files_created_earlier_in_the_transaction() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("locked")).unwrap();
+    let policy = CompiledPolicy::builtin().unwrap();
+    let mut options = StageOptions::new(source.path(), policy.clone());
+    options.synthetic_git = false;
+    let stage = Stage::build(options).unwrap();
+    fs::write(stage.workspace().join("a.txt"), "first\n").unwrap();
+    fs::create_dir_all(stage.workspace().join("locked")).unwrap();
+    fs::write(stage.workspace().join("locked/z.txt"), "second\n").unwrap();
+
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("changes");
+    let report = export_changes(
+        stage.workspace(),
+        source.path(),
+        stage.manifest(),
+        &policy,
+        &destination,
+    )
+    .unwrap();
+    fs::set_permissions(
+        source.path().join("locked"),
+        fs::Permissions::from_mode(0o555),
+    )
+    .unwrap();
+
+    assert!(
+        apply_exported_changes(
+            source.path(),
+            stage.manifest(),
+            &destination,
+            &report.manifest,
+            ApplyAuthorization::additions_and_modifications_only(),
+        )
+        .is_err()
+    );
+    assert!(!source.path().join("a.txt").exists());
+    assert!(!source.path().join("locked/z.txt").exists());
+    assert!(fs::read_dir(source.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".sandbox-guard-")
+    }));
+    fs::set_permissions(
+        source.path().join("locked"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+}
+
+#[test]
+fn change_paths_decode_strictly_without_traversal() {
+    assert_eq!(
+        decode_change_path("dir/100%25.txt").unwrap(),
+        std::path::Path::new("dir/100%.txt")
+    );
+    assert!(decode_change_path("../escape").is_err());
+    assert!(decode_change_path("%2e%2e/escape").is_err());
+    assert!(decode_change_path("bad%2fpath").is_err());
+    assert!(decode_change_path("nul%00byte").is_err());
+}
+
+#[test]
+fn apply_refuses_a_symlinked_export_or_files_directory() {
+    let source = tempfile::tempdir().unwrap();
+    let policy = CompiledPolicy::builtin().unwrap();
+    let mut options = StageOptions::new(source.path(), policy.clone());
+    options.synthetic_git = false;
+    let stage = Stage::build(options).unwrap();
+    fs::write(stage.workspace().join("safe.txt"), "safe\n").unwrap();
+
+    let parent = tempfile::tempdir().unwrap();
+    let destination = parent.path().join("changes");
+    let report = export_changes(
+        stage.workspace(),
+        source.path(),
+        stage.manifest(),
+        &policy,
+        &destination,
+    )
+    .unwrap();
+    let export_link = parent.path().join("changes-link");
+    symlink(&destination, &export_link).unwrap();
+    assert!(matches!(
+        apply_exported_changes(
+            source.path(),
+            stage.manifest(),
+            &export_link,
+            &report.manifest,
+            ApplyAuthorization::additions_and_modifications_only(),
+        ),
+        Err(ApplyError::UnsafeExport(_))
+    ));
+
+    fs::remove_dir_all(destination.join("files")).unwrap();
+    let alternate = parent.path().join("alternate-files");
+    fs::create_dir(&alternate).unwrap();
+    fs::set_permissions(&alternate, fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(&alternate, destination.join("files")).unwrap();
+    assert!(
+        apply_exported_changes(
+            source.path(),
+            stage.manifest(),
+            &destination,
+            &report.manifest,
+            ApplyAuthorization::additions_and_modifications_only(),
+        )
+        .is_err()
+    );
+    assert!(!source.path().join("safe.txt").exists());
 }

@@ -24,6 +24,10 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     "sandbox-guard-inputs/**",
     "**/sandbox-guard-inputs",
     "**/sandbox-guard-inputs/**",
+    ".sandbox-guard-apply-*",
+    "**/.sandbox-guard-apply-*",
+    ".sandbox-guard-rollback-*",
+    "**/.sandbox-guard-rollback-*",
     ".env*",
     "**/.env*",
     ".dev.vars*",
@@ -317,6 +321,8 @@ mod tests {
             ".git/config",
             "sandbox-guard-inputs/clipboard.png",
             "nested/sandbox-guard-inputs/clipboard.png",
+            ".sandbox-guard-apply-deadbeef",
+            "nested/.sandbox-guard-rollback-deadbeef",
         ] {
             assert!(
                 policy.denied_by(Path::new(path)).is_some(),

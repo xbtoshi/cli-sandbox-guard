@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -9,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::RunnerError;
 
+const CTRL_S: u8 = 0x13;
 const CTRL_V: u8 = 0x16;
 const POLL_INTERVAL_MS: i32 = 50;
 const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -54,6 +56,9 @@ where
     let child_stderr = slave
         .try_clone()
         .map_err(|source| execute_error(program, source))?;
+    write_host_notice(
+        "tool mouse scrolling is enabled; press Ctrl+S to toggle host selection/copy mode",
+    );
     let mut command = Command::new(program);
     command.args(args);
     command
@@ -124,19 +129,19 @@ where
             // SAFETY: input is a valid writable buffer and stdin_fd remains open.
             let count = unsafe { libc::read(stdin_fd, input.as_mut_ptr().cast(), input.len()) };
             if count > 0 {
-                for segment in input[..count as usize].split_inclusive(|byte| *byte == CTRL_V) {
-                    let has_clipboard = segment.last() == Some(&CTRL_V);
-                    let ordinary = if has_clipboard {
-                        &segment[..segment.len() - 1]
-                    } else {
-                        segment
-                    };
+                let mut ordinary = Vec::with_capacity(count as usize);
+                for &byte in &input[..count as usize] {
+                    if !matches!(byte, CTRL_S | CTRL_V) {
+                        ordinary.push(byte);
+                        continue;
+                    }
                     if !ordinary.is_empty() {
                         master_writer
-                            .write_all(ordinary)
+                            .write_all(&ordinary)
                             .map_err(|source| execute_error(program, source))?;
+                        ordinary.clear();
                     }
-                    if has_clipboard {
+                    if byte == CTRL_V {
                         match clipboard() {
                             Ok(paste) => {
                                 write_bracketed_paste(&mut master_writer, &paste.text)
@@ -147,7 +152,21 @@ where
                                 write_host_notice(&format!("{error}"));
                             }
                         }
+                    } else {
+                        let (control, selection_mode) = output_filter.toggle_selection_mode();
+                        write_host_control(&control)
+                            .map_err(|source| execute_error(program, source))?;
+                        write_host_notice(if selection_mode {
+                            "host selection/copy mode enabled; press Ctrl+S to restore tool mouse scrolling"
+                        } else {
+                            "tool mouse scrolling restored; press Ctrl+S for host selection/copy mode"
+                        });
                     }
+                }
+                if !ordinary.is_empty() {
+                    master_writer
+                        .write_all(&ordinary)
+                        .map_err(|source| execute_error(program, source))?;
                 }
             } else if count == 0 {
                 stdin_open = false;
@@ -380,6 +399,11 @@ fn write_host_notice(message: &str) {
     let _ = writeln!(io::stderr(), "\r\nguard: {message}\r");
 }
 
+fn write_host_control(control: &[u8]) -> io::Result<()> {
+    io::stdout().write_all(control)?;
+    io::stdout().flush()
+}
+
 fn execute_error(program: &Path, source: io::Error) -> RunnerError {
     RunnerError::Execute {
         program: PathBuf::from(program),
@@ -393,9 +417,20 @@ fn disable_host_mouse_reporting() {
         .and_then(|()| io::stdout().flush());
 }
 
-#[derive(Default)]
 struct TerminalOutputFilter {
     state: OutputState,
+    selection_mode: bool,
+    requested_mouse_modes: BTreeSet<u16>,
+}
+
+impl Default for TerminalOutputFilter {
+    fn default() -> Self {
+        Self {
+            state: OutputState::Normal,
+            selection_mode: false,
+            requested_mouse_modes: BTreeSet::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -490,7 +525,7 @@ impl TerminalOutputFilter {
                 OutputState::Csi { mut bytes } => {
                     bytes.push(byte);
                     if (0x40..=0x7e).contains(&byte) {
-                        output.extend_from_slice(&without_mouse_reporting_modes(&bytes));
+                        output.extend_from_slice(&self.filter_mouse_reporting_modes(&bytes));
                         OutputState::Normal
                     } else if bytes.len() > MAX_CSI_BYTES {
                         OutputState::DiscardCsi
@@ -509,6 +544,73 @@ impl TerminalOutputFilter {
         }
         output
     }
+
+    fn toggle_selection_mode(&mut self) -> (Vec<u8>, bool) {
+        self.selection_mode = !self.selection_mode;
+        let control = if self.selection_mode {
+            DISABLE_MOUSE_REPORTING.to_vec()
+        } else {
+            enable_mouse_reporting(&self.requested_mouse_modes)
+        };
+        (control, self.selection_mode)
+    }
+
+    fn filter_mouse_reporting_modes(&mut self, sequence: &[u8]) -> Vec<u8> {
+        let Some(body) = sequence.strip_prefix(b"\x1b[?") else {
+            return sequence.to_vec();
+        };
+        let Some((&final_byte, parameters)) = body.split_last() else {
+            return sequence.to_vec();
+        };
+        if !matches!(final_byte, b'h' | b'l') || parameters.is_empty() {
+            return sequence.to_vec();
+        }
+
+        let mut retained = Vec::new();
+        for parameter in parameters.split(|byte| *byte == b';') {
+            let Ok(parameter_text) = std::str::from_utf8(parameter) else {
+                return if self.selection_mode && contains_mouse_mode_digits(parameters) {
+                    Vec::new()
+                } else {
+                    sequence.to_vec()
+                };
+            };
+            let Ok(mode) = parameter_text.parse::<u16>() else {
+                return if self.selection_mode && contains_mouse_mode_digits(parameters) {
+                    Vec::new()
+                } else {
+                    sequence.to_vec()
+                };
+            };
+            if is_mouse_reporting_mode(mode) {
+                if final_byte == b'h' {
+                    self.requested_mouse_modes.insert(mode);
+                } else {
+                    self.requested_mouse_modes.remove(&mode);
+                }
+                if !self.selection_mode {
+                    retained.push(parameter);
+                }
+            } else {
+                retained.push(parameter);
+            }
+        }
+
+        if retained.is_empty() {
+            return Vec::new();
+        }
+
+        let mut rewritten = Vec::with_capacity(sequence.len());
+        rewritten.extend_from_slice(b"\x1b[?");
+        for (index, parameter) in retained.iter().enumerate() {
+            if index > 0 {
+                rewritten.push(b';');
+            }
+            rewritten.extend_from_slice(parameter);
+        }
+        rewritten.push(final_byte);
+        rewritten
+    }
 }
 
 fn is_host_sensitive_osc(sequence: &[u8]) -> bool {
@@ -523,48 +625,34 @@ fn is_host_sensitive_osc(sequence: &[u8]) -> bool {
         .is_some_and(|command| matches!(command, 52 | 1337))
 }
 
-fn without_mouse_reporting_modes(sequence: &[u8]) -> Vec<u8> {
-    let (prefix, body) = if let Some(body) = sequence.strip_prefix(b"\x1b[?") {
-        (b"\x1b[?".as_slice(), body)
-    } else {
-        return sequence.to_vec();
-    };
-    let Some((&final_byte, parameters)) = body.split_last() else {
-        return sequence.to_vec();
-    };
-    if !matches!(final_byte, b'h' | b'l') || parameters.is_empty() {
-        return sequence.to_vec();
-    }
+fn is_mouse_reporting_mode(mode: u16) -> bool {
+    matches!(
+        mode,
+        9 | 1000 | 1001 | 1002 | 1003 | 1005 | 1006 | 1015 | 1016
+    )
+}
 
-    let mut retained = Vec::new();
-    for parameter in parameters.split(|byte| *byte == b';') {
-        let Ok(parameter_text) = std::str::from_utf8(parameter) else {
-            return sequence.to_vec();
-        };
-        let Ok(mode) = parameter_text.parse::<u16>() else {
-            return sequence.to_vec();
-        };
-        if !matches!(
-            mode,
-            9 | 1000 | 1001 | 1002 | 1003 | 1005 | 1006 | 1015 | 1016
-        ) {
-            retained.push(parameter);
-        }
-    }
-    if retained.is_empty() {
+fn contains_mouse_mode_digits(parameters: &[u8]) -> bool {
+    parameters
+        .split(|byte| !byte.is_ascii_digit())
+        .filter_map(|digits| std::str::from_utf8(digits).ok())
+        .filter_map(|digits| digits.parse::<u16>().ok())
+        .any(is_mouse_reporting_mode)
+}
+
+fn enable_mouse_reporting(modes: &BTreeSet<u16>) -> Vec<u8> {
+    if modes.is_empty() {
         return Vec::new();
     }
-
-    let mut rewritten = Vec::with_capacity(sequence.len());
-    rewritten.extend_from_slice(prefix);
-    for (index, parameter) in retained.iter().enumerate() {
+    let mut sequence = b"\x1b[?".to_vec();
+    for (index, mode) in modes.iter().enumerate() {
         if index > 0 {
-            rewritten.push(b';');
+            sequence.push(b';');
         }
-        rewritten.extend_from_slice(parameter);
+        sequence.extend_from_slice(mode.to_string().as_bytes());
     }
-    rewritten.push(final_byte);
-    rewritten
+    sequence.push(b'h');
+    sequence
 }
 
 #[cfg(test)]
@@ -608,17 +696,31 @@ mod tests {
     }
 
     #[test]
-    fn output_filter_suppresses_mouse_reporting_without_breaking_other_private_modes() {
+    fn output_filter_toggles_mouse_reporting_without_breaking_other_private_modes() {
         let mut filter = TerminalOutputFilter::default();
         assert_eq!(
             filter.filter(b"before\x1b[?1000h\x1b[?1002;1006hafter"),
-            b"beforeafter"
+            b"before\x1b[?1000h\x1b[?1002;1006hafter"
         );
+        let (disabled, selection_mode) = filter.toggle_selection_mode();
+        assert!(selection_mode);
+        assert_eq!(disabled, DISABLE_MOUSE_REPORTING);
         assert_eq!(
             filter.filter(b"\x1b[?25;1003l\x1b[?2004h"),
             b"\x1b[?25l\x1b[?2004h"
         );
         assert_eq!(filter.filter(b"\x1b[?10"), b"");
         assert_eq!(filter.filter(b"00hvisible"), b"visible");
+        let (enabled, selection_mode) = filter.toggle_selection_mode();
+        assert!(!selection_mode);
+        assert_eq!(enabled, b"\x1b[?1000;1002;1006h");
+    }
+
+    #[test]
+    fn selection_mode_fails_closed_on_ambiguous_mouse_mode_sequences() {
+        let mut filter = TerminalOutputFilter::default();
+        let _ = filter.toggle_selection_mode();
+        assert_eq!(filter.filter(b"visible\x1b[?1000:1hafter"), b"visibleafter");
+        assert_eq!(filter.filter(b"\x1b[?25:1h"), b"\x1b[?25:1h");
     }
 }

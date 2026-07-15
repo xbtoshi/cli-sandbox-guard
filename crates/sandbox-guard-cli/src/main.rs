@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use sandbox_guard_core::{
-    CompiledPolicy, ResourceLimitRecord, RunRecord, Stage, StageOptions, default_staging_base,
+    ApplyAuthorization, ChangeKind, CompiledPolicy, ExportReport, ResourceLimitRecord, RunRecord,
+    Stage, StageOptions, apply_exported_changes, decode_change_path, default_staging_base,
     export_changes, garbage_collect, install_verified_tool, is_valid_candidate_path,
     verify_installed_tool,
 };
@@ -25,6 +26,10 @@ use sandbox_guard_runner::{
 
 mod grok;
 use grok::GrokArgs;
+
+const MASS_DELETION_MIN_FILES: usize = 5;
+const MASS_DELETION_PERCENT: usize = 25;
+const MASS_DELETION_ABSOLUTE_FILES: usize = 50;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,7 +47,7 @@ struct Cli {
 enum Command {
     /// Run Grok with private OAuth delivery and safe network defaults.
     Grok(GrokArgs),
-    /// Stage and run an untrusted tool. Changes are discarded unless explicitly exported.
+    /// Stage and run an untrusted tool. Changes are discarded unless reviewed or exported.
     Run(RunArgs),
     /// Create a persistent sanitized workspace without running a tool.
     Stage(StageArgs),
@@ -141,6 +146,10 @@ struct RunArgs {
     /// Atomically export safe changed files plus a review manifest outside the source tree.
     #[arg(long, value_name = "DIRECTORY")]
     export_changes: Option<PathBuf>,
+
+    /// Create a trusted post-run review bundle and offer conflict-checked host apply.
+    #[arg(long, conflicts_with = "export_changes")]
+    review_changes: bool,
 
     /// Skip creation of synthetic Git metadata.
     #[arg(long)]
@@ -415,6 +424,9 @@ fn run_command_with(
     if args.dry_run && args.export_changes.is_some() {
         bail!("--export-changes cannot be combined with --dry-run");
     }
+    if args.dry_run && args.review_changes {
+        bail!("--review-changes cannot be combined with --dry-run");
+    }
 
     let policy_path = resolve_policy_path(args.policy)?;
     let policy = CompiledPolicy::load(policy_path.as_deref())?;
@@ -535,11 +547,14 @@ fn run_command_with(
             if let Some(result) = state_result {
                 result?;
             }
-            publish_change_export(
+            handoff_changes(
                 args.export_changes.as_deref(),
+                args.review_changes,
+                interactive,
                 &stage,
                 &source_root,
                 &export_policy,
+                args.keep_stage,
             )?;
             if args.keep_stage {
                 let kept = stage.keep()?;
@@ -921,14 +936,26 @@ fn resource_limits(
     })
 }
 
-fn publish_change_export(
+fn handoff_changes(
     destination: Option<&Path>,
+    review_changes: bool,
+    interactive: bool,
     stage: &Stage,
     source_root: &Path,
     policy: &CompiledPolicy,
+    keep_stage: bool,
 ) -> Result<()> {
-    let Some(destination) = destination else {
+    if destination.is_none() && !review_changes {
         return Ok(());
+    }
+    let pending_destination;
+    let destination = if let Some(destination) = destination {
+        destination
+    } else {
+        let parent = default_pending_changes_dir()?;
+        ensure_private_directory(&parent)?;
+        pending_destination = parent.join(stage.manifest().run_id.to_string());
+        &pending_destination
     };
     let report = export_changes(
         stage.workspace(),
@@ -949,7 +976,291 @@ fn publish_change_export(
             rejected.path, rejected.reason
         );
     }
+    if !review_changes {
+        return Ok(());
+    }
+    review_and_apply_changes(report, stage, source_root, interactive, keep_stage)
+}
+
+fn review_and_apply_changes(
+    report: ExportReport,
+    stage: &Stage,
+    source_root: &Path,
+    interactive: bool,
+    keep_stage: bool,
+) -> Result<()> {
+    if report.manifest.changes.is_empty() && report.manifest.rejected.is_empty() {
+        fs::remove_dir_all(&report.destination).with_context(|| {
+            format!(
+                "remove empty pending change bundle {}",
+                report.destination.display()
+            )
+        })?;
+        println!("workspace changes: none");
+        return Ok(());
+    }
+
+    let risk = assess_change_risk(&report, stage.manifest().included.len());
+    println!(
+        "workspace change summary: {} added, {} modified, {} deleted",
+        risk.added, risk.modified, risk.deleted
+    );
+    let apply_allowed = report.manifest.rejected.is_empty();
+    if !apply_allowed {
+        eprintln!(
+            "warning: automatic apply is disabled because policy-denied or unsafe output was detected"
+        );
+        eprintln!(
+            "warning: rejected contents were not opened or exported and remain isolated{}",
+            if keep_stage {
+                "; --keep-stage will preserve the private stage for debugging"
+            } else {
+                "; they will be discarded with the stage"
+            }
+        );
+    }
+    if risk.mass_deletion {
+        eprintln!(
+            "DANGER: mass deletion detected ({} of {} staged files)",
+            risk.deleted, risk.baseline_files
+        );
+        eprintln!("DANGER: trusted diff review is required before destructive Apply is offered");
+    } else if risk.deleted > 0 {
+        eprintln!(
+            "warning: Apply includes {} deletion(s) and will require typed confirmation",
+            risk.deleted
+        );
+    }
+    if !interactive {
+        println!(
+            "pending changes kept for trusted review: {}",
+            report.destination.display()
+        );
+        return Ok(());
+    }
+
+    let mut reviewed = false;
+    loop {
+        if apply_allowed && risk.mass_deletion && !reviewed {
+            print!("Mass deletion: [r] required diff  [k] keep bundle  [d] discard: ");
+        } else if apply_allowed {
+            print!("Review changes? [r] diff  [a] apply  [k] keep bundle  [d] discard: ");
+        } else {
+            print!("Review safe changes? [r] diff  [k] keep bundle  [d] discard: ");
+        }
+        io::stdout().flush().context("flush change review prompt")?;
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer)? == 0 {
+            println!();
+            println!("pending changes kept: {}", report.destination.display());
+            return Ok(());
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "r" | "review" | "diff" => match render_change_diff(source_root, &report) {
+                Ok(()) => reviewed = true,
+                Err(error) => {
+                    eprintln!("warning: could not render trusted diff: {error:#}");
+                }
+            },
+            "a" | "apply" if apply_allowed && risk.mass_deletion && !reviewed => {
+                eprintln!("mass deletion cannot be applied until the trusted diff succeeds");
+            }
+            "a" | "apply" if apply_allowed => {
+                let authorization = if risk.deleted > 0 {
+                    if !confirm_deletions(&risk)? {
+                        continue;
+                    }
+                    ApplyAuthorization::including_confirmed_deletions()
+                } else {
+                    ApplyAuthorization::additions_and_modifications_only()
+                };
+                let applied = apply_exported_changes(
+                    source_root,
+                    stage.manifest(),
+                    &report.destination,
+                    &report.manifest,
+                    authorization,
+                )
+                .context("trusted change apply failed closed")?;
+                fs::remove_dir_all(&report.destination).with_context(|| {
+                    format!(
+                        "remove applied change bundle {}",
+                        report.destination.display()
+                    )
+                })?;
+                println!(
+                    "applied to host working tree: {} added, {} modified, {} deleted",
+                    applied.added, applied.modified, applied.deleted
+                );
+                println!(
+                    "Git metadata and credentials remained on the host; review, commit, and push normally."
+                );
+                return Ok(());
+            }
+            "k" | "keep" | "" => {
+                println!("pending changes kept: {}", report.destination.display());
+                return Ok(());
+            }
+            "d" | "discard" => {
+                fs::remove_dir_all(&report.destination).with_context(|| {
+                    format!(
+                        "discard pending change bundle {}",
+                        report.destination.display()
+                    )
+                })?;
+                if keep_stage {
+                    println!(
+                        "review bundle discarded; the isolated stage will still be kept because --keep-stage was requested"
+                    );
+                } else {
+                    println!("isolated workspace changes discarded");
+                }
+                return Ok(());
+            }
+            _ => eprintln!("choose review, apply, keep, or discard"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChangeRisk {
+    added: usize,
+    modified: usize,
+    deleted: usize,
+    baseline_files: usize,
+    mass_deletion: bool,
+}
+
+fn assess_change_risk(report: &ExportReport, baseline_files: usize) -> ChangeRisk {
+    let mut added = 0;
+    let mut modified = 0;
+    let mut deleted = 0;
+    for change in &report.manifest.changes {
+        match change.kind {
+            ChangeKind::Added => added += 1,
+            ChangeKind::Modified => modified += 1,
+            ChangeKind::Deleted => deleted += 1,
+        }
+    }
+    ChangeRisk {
+        added,
+        modified,
+        deleted,
+        baseline_files,
+        mass_deletion: is_mass_deletion(deleted, baseline_files),
+    }
+}
+
+fn is_mass_deletion(deleted: usize, baseline_files: usize) -> bool {
+    deleted > 0
+        && baseline_files > 0
+        && (deleted == baseline_files
+            || deleted >= MASS_DELETION_ABSOLUTE_FILES
+            || (deleted >= MASS_DELETION_MIN_FILES
+                && deleted.saturating_mul(100)
+                    >= baseline_files.saturating_mul(MASS_DELETION_PERCENT)))
+}
+
+fn deletion_confirmation_phrase(risk: &ChangeRisk) -> String {
+    format!(
+        "DELETE {} {} OF {}",
+        risk.deleted,
+        if risk.deleted == 1 { "FILE" } else { "FILES" },
+        risk.baseline_files
+    )
+}
+
+fn confirm_deletions(risk: &ChangeRisk) -> Result<bool> {
+    let phrase = deletion_confirmation_phrase(risk);
+    eprintln!(
+        "DESTRUCTIVE APPLY: this will remove {} host file(s) after conflict checks",
+        risk.deleted
+    );
+    print!("Type {phrase} to continue: ");
+    io::stdout()
+        .flush()
+        .context("flush deletion confirmation prompt")?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0 || answer.trim() != phrase {
+        eprintln!("deletion confirmation did not match; nothing was applied");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn render_change_diff(source_root: &Path, report: &ExportReport) -> Result<()> {
+    let git = which::which("git").context("find Git for trusted diff review")?;
+    for change in &report.manifest.changes {
+        let relative = decode_change_path(&change.path)?;
+        println!("\n--- {:?}: {} ---", change.kind, change.path);
+        let (before, after) = match change.kind {
+            ChangeKind::Added => (
+                PathBuf::from("/dev/null"),
+                report.destination.join("files").join(&relative),
+            ),
+            ChangeKind::Modified => (
+                source_root.join(&relative),
+                report.destination.join("files").join(&relative),
+            ),
+            ChangeKind::Deleted => (source_root.join(&relative), PathBuf::from("/dev/null")),
+        };
+        let status = std::process::Command::new(&git)
+            .args([
+                "--no-pager",
+                "diff",
+                "--no-index",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--color=always",
+                "--",
+            ])
+            .arg(&before)
+            .arg(&after)
+            .current_dir(&report.destination)
+            .env_clear()
+            .env("HOME", &report.destination)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("GIT_PAGER", "cat")
+            .env("LANG", "C.UTF-8")
+            .status()
+            .context("run trusted Git diff")?;
+        if !status.success() && status.code() != Some(1) {
+            bail!("Git diff failed for {} with {status}", change.path);
+        }
+    }
     Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("create private directory {}", path.display()))?;
+    let mut metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect private directory {}", path.display()))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || std::os::unix::fs::MetadataExt::uid(&metadata) != current_uid()
+    {
+        bail!("private directory is unsafe: {}", path.display());
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure private directory {}", path.display()))?;
+    metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reinspect private directory {}", path.display()))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || std::os::unix::fs::MetadataExt::uid(&metadata) != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("private directory is unsafe: {}", path.display());
+    }
+    Ok(())
+}
+
+fn current_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions.
+    unsafe { libc::geteuid() }
 }
 
 fn report_executable(name: &str, purpose: &str) -> bool {
@@ -1048,6 +1359,12 @@ fn default_audit_dir() -> Result<PathBuf> {
     Ok(project.data_local_dir().join("audit"))
 }
 
+fn default_pending_changes_dir() -> Result<PathBuf> {
+    let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
+        .ok_or_else(|| anyhow!("could not determine the user data directory"))?;
+    Ok(project.data_local_dir().join("pending-changes"))
+}
+
 fn default_egress_decision_path() -> Result<PathBuf> {
     let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
         .ok_or_else(|| anyhow!("could not determine the user data directory"))?;
@@ -1078,4 +1395,44 @@ fn print_stage_summary(stage: &Stage) {
         totals.included_files, totals.included_bytes, totals.excluded_paths
     );
     println!("policy: {}", stage.manifest().policy_sha256);
+}
+
+#[cfg(test)]
+mod change_risk_tests {
+    use super::*;
+
+    #[test]
+    fn mass_deletion_catches_full_small_trees_and_large_or_proportional_removal() {
+        assert!(is_mass_deletion(1, 1));
+        assert!(is_mass_deletion(5, 20));
+        assert!(is_mass_deletion(50, 1_000));
+        assert!(is_mass_deletion(37, 37));
+        assert!(!is_mass_deletion(0, 37));
+        assert!(!is_mass_deletion(4, 10));
+        assert!(!is_mass_deletion(5, 100));
+    }
+
+    #[test]
+    fn deletion_confirmation_phrase_binds_exact_count_and_baseline() {
+        assert_eq!(
+            deletion_confirmation_phrase(&ChangeRisk {
+                added: 0,
+                modified: 0,
+                deleted: 1,
+                baseline_files: 8,
+                mass_deletion: false,
+            }),
+            "DELETE 1 FILE OF 8"
+        );
+        assert_eq!(
+            deletion_confirmation_phrase(&ChangeRisk {
+                added: 0,
+                modified: 0,
+                deleted: 37,
+                baseline_files: 37,
+                mass_deletion: true,
+            }),
+            "DELETE 37 FILES OF 37"
+        );
+    }
 }

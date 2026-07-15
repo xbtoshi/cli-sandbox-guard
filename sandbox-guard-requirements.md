@@ -2,8 +2,9 @@
 
 **Status**: version 0.3 alpha as of 2026-07-15. The shared Rust layer now implements fail-closed
 staging, isolated execution, controlled HTTPS egress, credential-file delivery, focused seccomp,
-resource controls, reviewable change export, and offline signature-verified tool installation. It
-is not yet a production security boundary; the open items below remain release gates.
+resource controls, reviewable conflict-checked change apply, manual change export, and offline
+signature-verified tool installation. It is not yet a production security boundary; the open
+items below remain release gates.
 
 **Context**: Grok Build CLI auto-uploads git bundles to xAI GCS on session start. `/privacy opt-out` is our current mitigation, plus grok is removed from all CCB session configs and `grok-api.luc.wtf` uses headless `grok -p` (which does not trigger the upload). This document captures what we'd have to build if we ever need a real sandbox.
 
@@ -23,8 +24,9 @@ are source-relative and contain no host-specific absolute paths.
 - Network denied by default. Controlled mode uses a hostname/SNI-gated HTTPS CONNECT proxy while
   keeping the tool in a separate network namespace. Acknowledged unrestricted mode remains for
   development.
-- Tool writes affect only the disposable stage unless the user requests a separate, hostile-output-
-  validated review bundle. Guard never applies that bundle to the source.
+- Tool writes affect only the disposable stage until the trusted host-side review phase. Manual
+  export never applies a bundle; interactive review can apply only accepted output after baseline
+  conflict checks, while any denied or unsafe output disables automatic apply for the run.
 - A focused seccomp deny profile and rlimits are always requested. cgroup v2 can be required or
   used on a best-effort basis.
 - Local Ed25519-signed artifacts can be verified against a pinned signer and installed atomically.
@@ -85,6 +87,13 @@ The sol/high review is authoritative. The 12 blockers below come from that pass.
 - **Fix**: pick one:
   - **A**: explicit read-only mode; document that edits are discarded (fine for review, useless for editing).
   - **B**: reviewed copy-back phase — accept only regular non-denylisted files, check source-snapshot for conflicts, reject links + special files, atomic writes.
+- **Implemented in v0.3 alpha**: `guard grok` now defaults to a trusted review/apply handoff and
+  `guard run --review-changes` opts into it. Any denied/unsafe output disables automatic apply;
+  accepted files use baseline conflict checks, descriptor-relative operations, atomic per-file
+  publication, and an in-process rollback transaction. Every deletion requires a typed,
+  count-bound confirmation; mass deletion requires successful trusted diff review first. The core
+  apply API independently rejects unconfirmed deletions. Manual `--export-changes` remains
+  export-only.
 
 ### 4. `.git` absent breaks git-native workflows
 - **Bug in v2**: `git bundle --all` fails inside jail, so the sanitized-bundle test passes vacuously. Also `git status/diff/log` broken → agents can't work normally.

@@ -5,8 +5,8 @@ untrusted tool a sanitized, disposable repository instead of the real host works
 
 > [!WARNING]
 > Version 0.3 is an alpha security prototype, not a production sandbox. It now has controlled
-> HTTPS egress, a focused seccomp deny profile, resource controls, reviewable change export, and
-> offline signature-verified tool installation. Important release blockers remain. Read the
+> HTTPS egress, a focused seccomp deny profile, resource controls, a trusted review/apply handoff,
+> and offline signature-verified tool installation. Important release blockers remain. Read the
 > [security model](docs/SECURITY_MODEL.md) before using it.
 
 ## The boundary
@@ -29,8 +29,9 @@ untrusted tool a sanitized, disposable repository instead of the real host works
           v
     untrusted AI CLI
 
-The original repository is never mounted. The tool edits only its disposable copy. An optional
-change export creates a separate review bundle; Guard never applies changes to the source tree.
+The original repository is never mounted. The tool edits only its disposable copy. After the tool
+exits, Guard can create a separate review bundle and apply accepted changes through trusted,
+conflict-checked host code; the tool never receives access to the source tree or its Git state.
 
 ## What works now
 
@@ -45,8 +46,8 @@ change export creates a separate review bundle; Guard never applies changes to t
   that contain names but never credential values.
 - Network denied by default, or controlled HTTPS CONNECT egress to explicit hostnames.
 - A focused seccomp deny profile, rlimits, and optional cgroup v2 memory/task/CPU enforcement.
-- Review-only export of added, modified, and deleted paths, with hostile output reopened and
-  validated by the trusted staging layer.
+- Reviewable export and opt-in host apply of added, modified, and deleted paths, with hostile
+  output reopened, policy-filtered, and validated by the trusted staging layer.
 - Offline Ed25519 verification against a pinned signer fingerprint before atomic tool install.
 - Hostile denied-network and controlled-proxy probes through the real backend with `guard test`.
 
@@ -71,11 +72,13 @@ inside the disposable synthetic home. Unknown HTTPS destinations trigger a trust
 approval dialog with deny, allow-once, and allow-for-session choices. The dialog can remember an
 exact-host allow or deny for later Guard sessions; `guard approvals` lists those choices, while
 `guard approvals --forget HOST` and `guard approvals --clear` remove them. `--no-egress-prompts`
-keeps the original fixed allowlist for automation or stricter sessions. Guard suppresses Grok's
-terminal mouse-reporting modes, so normal drag selection and terminal copy work in the regular TUI;
-keyboard interaction remains unchanged. The optional `--scrollback` flag still selects Grok's
-experimental native-scrollback renderer, which uses a visibly different pinned-region layout. The
-host refresh token and `~/.grok/auth.json` are never copied into the workspace or Lima guest.
+keeps the original fixed allowlist for automation or stricter sessions. Grok mouse reporting is
+enabled by default so wheel scrolling works in the regular TUI. Press `Ctrl+S` to enter trusted
+host selection/copy mode, which temporarily disables tool mouse reporting; press it again to
+restore Grok scrolling. The toggle is consumed by Guard and is not delivered to Grok. The optional
+`--scrollback` flag still selects Grok's experimental native-scrollback renderer, which uses a
+visibly different pinned-region layout. The host refresh token and `~/.grok/auth.json` are never
+copied into the workspace or Lima guest.
 
 On macOS, pressing `Ctrl+V` in an interactive Guard session explicitly imports one image from the
 native clipboard. Guard decodes and re-encodes it as PNG under strict size and pixel limits, places
@@ -95,6 +98,17 @@ descriptor-safe policy layer, and atomically publishes a snapshot keyed to the c
 directory. It never mounts the host `~/.grok` directory. Use `--continue` for the latest stored
 conversation or `--resume SESSION_ID` for a specific one. Sessions created before this feature, or
 outside Guard, are not imported automatically.
+
+When Grok exits, Guard validates the returned workspace and shows a trusted terminal prompt to
+review, apply, keep, or discard its changes. Apply is performed by Guard only after every affected
+host file still matches the pre-run baseline. The original `.git`, remotes, SSH agent, and Git
+credentials are never exposed to Grok; after apply, use normal host `git diff`, commit, and push.
+Use `--no-change-review` to discard changes without prompting, or `--export-changes DIRECTORY` to
+keep the manual bundle workflow. If Grok creates `.env` or any other policy-denied/unsafe path,
+that content is never opened for export or copied to the host, and automatic apply is disabled for
+the entire run. Every deletion requires an exact typed host confirmation. Mass deletion requires
+a successful trusted diff first, so a one-key Apply cannot propagate a sandbox-local `rm -rf` into
+the real working tree.
 
 An access token is a credential intentionally given to the confined Grok process. Relaunch
 `guard grok` after a long-running session reaches the token's expiry; live refresh brokerage is
@@ -172,10 +186,10 @@ For Grok installed as `/opt/sandbox-guard/tools/grok`, the final command becomes
 For `guard run`, Guard automatically requests a Lima PTY when both host standard input and output
 are terminals, so interactive prompts, typing, and paste work without changing the isolation
 policy. Guard owns a narrow host-side PTY broker for interactive runs: it synchronizes window size,
-intercepts only raw `Ctrl+V` for explicit clipboard-image import, blocks host-sensitive OSC
-clipboard controls and opaque terminal-multiplexer passthrough from the untrusted tool, and
-suppresses terminal mouse reporting so host selection and copy remain available. Interactive runs
-receive a fixed
+intercepts raw `Ctrl+V` for explicit clipboard-image import and raw `Ctrl+S` for the trusted
+scroll/selection toggle, blocks host-sensitive OSC clipboard controls and opaque
+terminal-multiplexer passthrough from the untrusted tool, and restores only the mouse-reporting
+modes actually requested by the tool when scroll mode resumes. Interactive runs receive a fixed
 `TERM=xterm-256color` so line editing and bracketed paste work without forwarding host terminal
 environment. Automation, pipelines, setup commands, and `guard test` keep TTY allocation disabled.
 Bubblewrap still creates a new session to prevent terminal injection into host processes.
@@ -267,7 +281,26 @@ and new mount APIs, BPF, perf, io_uring, file handles, cross-process memory APIs
 `pidfd_getfd`, userfaultfd, kernel-module/reboot/swap operations, and kernel keyring calls. This is
 a focused deny profile, not a maintained OCI allowlist, and it makes no pathname-access claims.
 
-## Reviewable change export
+## Trusted change review and apply
+
+Interactive Grok runs enable the post-run review/apply prompt by default. The vendor-neutral
+runner exposes the same flow explicitly:
+
+    guard run --review-changes -- my-ai-cli
+
+The default action is to keep the private pending bundle. `diff` uses trusted host Git with global
+and system configuration, external diff drivers, text conversion, and paging disabled. `apply`
+preflights every affected host path against the staging baseline before the first mutation, then
+uses descriptor-relative, no-symlink operations, atomic per-file renames, and rollback records.
+Added paths must still be absent; modified and deleted paths must retain their baseline hash,
+owner, link count, filesystem, size, and executable class. Git metadata and credentials remain
+host-only. A deletion can reach the core apply transaction only after Guard receives explicit
+deletion authorization from the trusted prompt. Every deletion requires typing a count-bound
+phrase such as `DELETE 3 FILES OF 37`. Removal of the entire baseline, at least 50 files, or at
+least 5 files comprising 25% of the baseline is treated as mass deletion; Apply stays unavailable
+until the trusted diff renders successfully.
+
+For a manual bundle without an apply prompt:
 
     guard run --export-changes "$HOME/guard-reviews/run-001" -- my-ai-cli
 
@@ -278,8 +311,10 @@ metadata while copying. The destination is new, private, outside both source and
 published atomically. `manifest.json` records additions, modifications, deletions, hashes, modes,
 and rejected output. The `files/` directory contains only accepted added/modified files.
 
-This is deliberately not automatic copy-back. Review the manifest and content, resolve source
-conflicts yourself, and apply only what you accept.
+Any rejected path disables automatic apply. In particular, `.env`, private keys, credential files,
+links, special files, hard-link aliases, and mount crossings are never included under `files/`.
+Their path and rejection reason are recorded without copying their contents. The explicit export
+form remains a review bundle and is never applied automatically.
 
 ## Verified tool artifacts
 

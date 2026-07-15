@@ -4,6 +4,7 @@
 //! host before and after isolated execution.
 
 mod audit;
+mod change_apply;
 mod export;
 mod gc;
 mod git;
@@ -14,6 +15,9 @@ mod tool_store;
 pub use audit::{
     AuditManifest, ExcludedPath, ExclusionReason, IncludedFile, ResourceLimitRecord, RunRecord,
     StageTotals,
+};
+pub use change_apply::{
+    ApplyAuthorization, ApplyError, ApplyReport, apply_exported_changes, decode_change_path,
 };
 pub use export::{
     ChangeExportManifest, ChangeKind, ChangeRecord, ExportError, ExportReport, RejectedChange,

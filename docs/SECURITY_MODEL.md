@@ -20,7 +20,7 @@ boundary.
 The current trusted computing base is:
 
 - the host kernel and filesystem;
-- the Rust policy, staging, audit, export, tool-store, runner, and `guard-helper` code;
+- the Rust policy, staging, audit, export/apply, tool-store, runner, and `guard-helper` code;
 - Git during candidate enumeration and synthetic repository construction;
 - Bubblewrap and the system runtime files mounted into the sandbox;
 - systemd and cgroup v2 when cgroup enforcement is selected;
@@ -92,10 +92,12 @@ explicitly for one run.
 - The PTY filters 7-bit OSC clipboard controls, iTerm host-control OSC, and opaque DCS/SOS/PM/APC
   terminal-multiplexer passthrough emitted by the untrusted tool so those channels cannot bypass
   the explicit clipboard broker. Raw C1 byte values are treated as UTF-8 continuation data, as in
-  modern UTF-8 terminal modes. The PTY also removes DEC terminal mouse reporting modes so normal
-  host-side selection and copy remain available; mouse gestures are not delivered to the isolated
-  TUI. Clipboard audit entries contain only the sandbox path, media type, dimensions, byte count,
-  and SHA-256 digest.
+  modern UTF-8 terminal modes. DEC mouse reporting is enabled by default for normal tool scrolling.
+  Raw `Ctrl+S` switches the trusted broker into host selection/copy mode: Guard disables mouse
+  reporting at the host terminal without telling the tool, suppresses later tool attempts to
+  re-enable it, and restores only the exact requested modes when the user presses `Ctrl+S` again.
+  The toggle is not delivered to the isolated TUI. Clipboard audit entries contain only the
+  sandbox path, media type, dimensions, byte count, and SHA-256 digest.
 
 After explicit import, the image is intentionally readable by the untrusted tool and can be sent
 to any destination allowed by the network policy. The image itself may contain adversarial prompt
@@ -179,9 +181,10 @@ controller-file readback plus the systemd-wrapped invocation. `guard test` separ
 capability-independent denied
 process-memory syscall, compares every configured rlimit, and exercises controlled-proxy denial.
 
-## Change-export invariants
+## Change-export and apply invariants
 
-- Export never writes to or applies changes to the source repository.
+- The untrusted tool never receives a source-repository mount, source descriptor, Git metadata, or
+  host Git credential during export or apply.
 - The returned workspace is treated as hostile and walked without Git or ignore-file semantics.
 - Synthetic `.git`, denied paths, links, special files, multiple links, and mount crossings are
   excluded or rejected.
@@ -189,8 +192,25 @@ process-memory syscall, compares every configured rlimit, and exercises controll
   the copy.
 - The new private destination must be outside source and stage, owned by the invoking user, and not
   group/world writable. It is published atomically only after its manifest is complete.
-- Deletions are manifest records only. Added/modified content is placed under `files/` for manual
+- Deletions are manifest records only. Added/modified content is placed under `files/` for trusted
   review.
+- Any rejected path disables automatic apply for the whole run. Denied file contents—including a
+  tool-created `.env`—are never copied into the bundle or source tree.
+- Apply requires a matching run/policy baseline and canonical relative paths with no duplicates.
+  Before the first mutation, every added path must still be absent and every modified/deleted file
+  must securely reopen as an owner-owned, singly linked regular file on the source filesystem with
+  its baseline size, hash, and executable class.
+- Apply creates/opens parent directories descriptor-relative with `O_NOFOLLOW`, refuses writable
+  multi-user parents and mount crossings, re-verifies exported bytes while copying, and publishes
+  each file with a no-replace rename. Existing files first move to UUID-named rollback slots and
+  are re-hashed there; normal errors roll the transaction back in reverse order.
+- The core apply API rejects every deletion unless its trusted caller supplies explicit deletion
+  authorization. The interactive handoff issues that authorization only after the user types a
+  phrase bound to the exact deletion and baseline-file counts. Mass deletion—including removal of
+  the complete staged baseline—also requires the trusted diff to render successfully before Apply
+  is offered.
+- Manual `--export-changes` remains export-only. `--review-changes` and the default interactive
+  `guard grok` handoff require an explicit trusted-host apply choice.
 
 ## Tool-install invariants
 
@@ -226,8 +246,10 @@ from this store and does not automatically re-verify them before every run.
 - Unrestricted mode exposes the selected host or Lima-guest network namespace, including loopback,
   private/LAN networks, cloud metadata, and Linux abstract UNIX sockets. Abstract sockets are not
   covered by filesystem isolation and may provide a code-execution path in that namespace.
-- Change export is a review bundle, not conflict-aware copy-back. The user must inspect and apply
-  accepted files and deletions.
+- Change apply is rollback-backed for normal errors but not crash-atomic across multiple files. A
+  kill or host/filesystem failure during the short apply window can leave a denied
+  `.sandbox-guard-apply-*` or `.sandbox-guard-rollback-*` artifact for manual recovery. Guard does
+  not commit or push; those remain explicit host-side Git operations after review.
 - The verified tool store has no network downloader, root-owned key policy, privileged installer,
   canonical wrapper enforcement, rollback policy, or automatic verification at execution time.
 - The macOS backend requires a pre-created, correctly provisioned dedicated Lima guest and a Linux
