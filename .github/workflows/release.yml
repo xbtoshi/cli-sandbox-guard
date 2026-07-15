@@ -1,0 +1,291 @@
+name: Release
+
+# Builds, tests, packages, and verifies the v0.3 alpha artifacts, then uploads
+# them to a DRAFT prerelease. A human must verify the signed tag and the
+# checksums before publishing the draft; see docs/RELEASE.md.
+#
+# Trigger contract, enforced by the preflight job:
+#   - the tag name must equal "v" + the Cargo workspace version;
+#   - the tag must be an annotated tag object (signed tags are annotated);
+#   - the tagged commit must already be on origin/main;
+#   - Cargo.lock must be consistent with Cargo.toml.
+# workflow_dispatch runs the same build and verification as a dry run and
+# never publishes — even when dispatched against a tag ref. Publication
+# requires event_name == push, checked both in preflight and in the publish
+# job's own condition.
+#
+# Job separation: every job that checks out or executes repository code runs
+# with contents: read. The only write-scoped job (publish) checks out
+# nothing, executes no repository scripts, and consumes only the verified
+# asset bundle produced by the read-only verify job.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      # persist-credentials stays enabled only here: this job must run
+      # `git fetch origin main` with the read-only job token.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+      - name: Enforce version, tag, and branch policy
+        id: meta
+        run: |
+          set -euo pipefail
+          # --locked also proves Cargo.lock is consistent with Cargo.toml.
+          version="$(cargo metadata --format-version 1 --no-deps --locked \
+            | jq -r '.packages[] | select(.name == "sandbox-guard") | .version')"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "could not resolve the workspace version" >&2
+            exit 1
+          fi
+          publish=false
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+            if [ "$tag" != "v${version}" ]; then
+              echo "tag ${tag} does not match workspace version ${version}" >&2
+              exit 1
+            fi
+            if [ "$(git cat-file -t "refs/tags/${tag}")" != "tag" ]; then
+              echo "release tags must be annotated, signed tags; see docs/RELEASE.md" >&2
+              exit 1
+            fi
+            commit="$(git rev-parse "refs/tags/${tag}^{commit}")"
+            git fetch --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+            if ! git merge-base --is-ancestor "$commit" refs/remotes/origin/main; then
+              echo "tagged commit ${commit} is not on main; refusing to release" >&2
+              exit 1
+            fi
+            # Publication requires a tag PUSH. workflow_dispatch may target a
+            # tag ref too; it still validates everything above but must stay
+            # a dry run.
+            if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+              publish=true
+            fi
+          else
+            tag="dry-run"
+          fi
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "publish=${publish}"
+          } >>"$GITHUB_OUTPUT"
+      - name: Test the packaging and verification scripts
+        run: scripts/test-release-scripts.sh
+
+  build-linux-x86_64:
+    needs: preflight
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install Linux sandbox runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --release --locked
+      - run: cargo build --workspace --release --locked
+      - name: Exercise hostile fixtures through Bubblewrap against the release binaries
+        run: target/release/guard test --backend linux-bwrap --require-cgroup --helper "$PWD/target/release/guard-helper"
+      - name: Package
+        run: scripts/package-release.sh linux-x86_64 "${{ needs.preflight.outputs.version }}" dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  build-linux-aarch64:
+    needs: preflight
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install Linux sandbox runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --release --locked
+      - run: cargo build --workspace --release --locked
+      - name: Exercise hostile fixtures through Bubblewrap against the release binaries
+        run: target/release/guard test --backend linux-bwrap --require-cgroup --helper "$PWD/target/release/guard-helper"
+      - name: Package
+        run: scripts/package-release.sh linux-aarch64 "${{ needs.preflight.outputs.version }}" dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-linux-aarch64
+          path: dist/*
+          if-no-files-found: error
+      # The exact tested guard-helper binary is reused inside the macOS
+      # package for the Lima guest; see build-macos-arm64.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lima-guest-helper-linux-aarch64
+          path: target/release/guard-helper
+          if-no-files-found: error
+
+  build-macos-arm64:
+    needs: [preflight, build-linux-aarch64]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --release --locked
+      - run: cargo build --workspace --release --locked
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: lima-guest-helper-linux-aarch64
+          path: lima-guest-helper
+      - name: Package with the tested Linux ARM64 guard-helper for the Lima guest
+        env:
+          LIMA_GUEST_HELPER: lima-guest-helper/guard-helper
+        run: scripts/package-release.sh macos-arm64 "${{ needs.preflight.outputs.version }}" dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-macos-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  verify:
+    needs: [preflight, build-linux-x86_64, build-linux-aarch64, build-macos-arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Verify the exact packaged file set and produce checksums and manifest
+        # Prints SHA256SUMS into the log so maintainers can compare it against
+        # the draft release assets before publishing.
+        run: scripts/verify-release-artifacts.sh prepublish "${{ needs.preflight.outputs.version }}" dist
+      - name: Remove per-archive sidecars from the published asset set
+        run: rm dist/*.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [preflight, verify]
+    # Defense in depth: require the validated preflight output AND,
+    # independently, a push event, so a workflow_dispatch against a tag ref
+    # can never instantiate this write-scoped job.
+    if: needs.preflight.outputs.publish == 'true' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      # The only write-scoped job. It performs no checkout and runs no
+      # repository scripts; it uploads the verified asset bundle unchanged.
+      # GH_TOKEN is explicitly provided only to the gh step, but the pinned
+      # download-artifact action also runs inside this job and, like any
+      # action, can read the job's github.token — it is part of the release
+      # trusted computing base.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: verified-release-assets
+          path: dist
+      - name: Require the exact expected asset set
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          expected="$(printf '%s\n' \
+            "SHA256SUMS" \
+            "manifest.json" \
+            "sandbox-guard-${VERSION}-linux-aarch64.tar.gz" \
+            "sandbox-guard-${VERSION}-linux-x86_64.tar.gz" \
+            "sandbox-guard-${VERSION}-macos-arm64.tar.gz" | sort)"
+          actual="$(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+          if [ "$actual" != "$expected" ]; then
+            echo "unexpected asset set:" >&2
+            printf '%s\n' "$actual" >&2
+            exit 1
+          fi
+          sha256sum -c SHA256SUMS
+      - name: Create draft prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Sandbox Guard ${VERSION} — alpha security prototype, not production-ready."
+            echo
+            echo "Before publishing this draft, a maintainer must run"
+            echo '`git verify-tag '"${TAG}"'`, download the draft assets, and run'
+            echo '`scripts/verify-release-artifacts.sh published '"${VERSION}"' <dir>`'
+            echo "against them (see docs/RELEASE.md). Install, upgrade, rollback,"
+            echo "and removal steps: docs/INSTALL.md."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >release-notes.md
+          gh release create "$TAG" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --title "Sandbox Guard ${VERSION} (alpha)" \
+            --notes-file release-notes.md \
+            dist/*.tar.gz dist/SHA256SUMS dist/manifest.json

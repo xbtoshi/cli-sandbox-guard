@@ -31,6 +31,8 @@ jobs:
       - run: cargo build --workspace
       - name: Exercise hostile fixtures through Bubblewrap
         run: target/debug/guard test --backend linux-bwrap --require-cgroup --helper "$PWD/target/debug/guard-helper"
+      - name: Test the release packaging and verification scripts
+        run: scripts/test-release-scripts.sh
   macos:
     runs-on: macos-latest
     steps:

@@ -115,6 +115,16 @@ An access token is a credential intentionally given to the confined Grok process
 `guard grok` after a long-running session reaches the token's expiry; live refresh brokerage is
 not yet implemented.
 
+## Install
+
+Alpha release archives for macOS ARM64 and Linux x86-64/ARM64, with
+`SHA256SUMS` and a per-file manifest, are published from signed tags as
+GitHub prereleases. Verify the tag signature and checksums first, then follow
+[docs/INSTALL.md](docs/INSTALL.md) for install, upgrade, rollback, and removal
+steps, including manual Lima guest provisioning on macOS. The artifacts are
+alpha prototypes, not production-ready. Maintainers cut releases with
+[docs/RELEASE.md](docs/RELEASE.md).
+
 ## Build and self-test
 
 Rust 1.85 or newer is required.
