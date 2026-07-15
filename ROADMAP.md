@@ -68,8 +68,8 @@ We will not adopt these weaker postures:
 - [ ] Verify that release artifacts contain the exact binaries tested in CI.
 - [x] Add installation, upgrade, rollback, and removal instructions.
 - [ ] Run and record live Bubblewrap and Lima hostile-fixture tests against the release artifacts.
-- [ ] Keep the README, security model, and CLI output explicitly labelled as alpha.
-- [ ] Require an independent adversarial review for changes to a trusted boundary component.
+- [x] Keep the README, security model, and CLI output explicitly labelled as alpha.
+- [x] Require an independent adversarial review for changes to a trusted boundary component.
 
 ## Phase 1: installation and trusted tool profiles
 
@@ -101,7 +101,7 @@ We will not adopt these weaker postures:
 - [ ] Summarize blocked actions after a run, grouped by capability and exact sandbox-visible path or
   destination.
 - [ ] Keep violation monitoring observational: monitor failure must not disable enforcement.
-- [ ] Add bounded, serialized native approval for capabilities that can be safely granted without
+- [x] Add bounded, serialized native approval for capabilities that can be safely granted without
   exposing the real host workspace.
 - [ ] Add allow/deny management commands that can create, update, list, forget, and clear exact-host
   decisions without manually editing the private decision file.
@@ -139,15 +139,15 @@ still allowing approved authenticated API calls.
 
 ### macOS
 
-- [ ] Keep `macos-lima` as the recommended hardened backend.
+- [x] Keep `macos-lima` as the recommended hardened backend.
 - [ ] Evaluate an experimental `macos-native` Seatbelt backend for low-friction local use.
 - [ ] Clearly label native mode as a different assurance tier and test Apple Events, Launch
   Services, XPC, Mach services, Unix sockets, TCC, and trust-service escape paths.
-- [ ] Never silently fall back from Lima to native mode.
+- [x] Never silently fall back from Lima to native mode.
 
 ### Linux
 
-- [ ] Keep `linux-bwrap` as the reference backend.
+- [x] Keep `linux-bwrap` as the reference backend.
 - [ ] Evaluate Firejail only as an optional distribution-integrated backend.
 - [ ] Require backend parity for clean environment, private credentials, network namespace, proxy
   transport, PID boundary, seccomp, cgroups, terminal, clipboard broker, and safe export.
