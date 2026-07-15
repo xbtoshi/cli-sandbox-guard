@@ -354,6 +354,62 @@ impl Stage {
         &self.workspace
     }
 
+    /// Publish a validated workspace as a new directory beside its private staging directory.
+    /// The destination must not exist and must share the staging parent, making the rename atomic.
+    pub fn publish_workspace(mut self, destination: &Path) -> Result<PathBuf, StageError> {
+        if !destination.is_absolute() || destination.file_name().is_none() {
+            return Err(StageError::UnsafePublishDestination(
+                destination.to_path_buf(),
+            ));
+        }
+        let destination_parent = destination
+            .parent()
+            .ok_or_else(|| StageError::UnsafePublishDestination(destination.to_path_buf()))?;
+        let staging_parent = self
+            .root()
+            .parent()
+            .ok_or_else(|| StageError::UnsafePublishDestination(destination.to_path_buf()))?;
+        let destination_parent =
+            fs::canonicalize(destination_parent).map_err(|source| StageError::Io {
+                operation: "canonicalize publish parent",
+                path: destination_parent.to_path_buf(),
+                source,
+            })?;
+        let staging_parent = fs::canonicalize(staging_parent).map_err(|source| StageError::Io {
+            operation: "canonicalize staging parent",
+            path: staging_parent.to_path_buf(),
+            source,
+        })?;
+        let destination_absent = matches!(
+            fs::symlink_metadata(destination),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        if destination_parent != staging_parent || !destination_absent {
+            return Err(StageError::UnsafePublishDestination(
+                destination.to_path_buf(),
+            ));
+        }
+        let destination = destination_parent.join(
+            destination
+                .file_name()
+                .ok_or_else(|| StageError::UnsafePublishDestination(destination.to_path_buf()))?,
+        );
+        fs::rename(&self.workspace, &destination).map_err(|source| StageError::Io {
+            operation: "publish validated workspace",
+            path: destination.clone(),
+            source,
+        })?;
+        File::open(&destination_parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| StageError::Io {
+                operation: "sync publish parent",
+                path: destination_parent,
+                source,
+            })?;
+        drop(self.temp.take());
+        Ok(destination)
+    }
+
     pub fn audit_path(&self) -> &Path {
         &self.audit_path
     }
@@ -762,6 +818,8 @@ pub fn display_path(path: &Path) -> String {
 pub enum StageError {
     #[error("source is not a directory: {0}")]
     SourceNotDirectory(PathBuf),
+    #[error("validated workspace publish destination is unsafe or already exists: {0}")]
+    UnsafePublishDestination(PathBuf),
     #[error("staging directory {staging} must not be inside source tree {source_root}")]
     StagingInsideSource {
         source_root: PathBuf,
@@ -809,6 +867,7 @@ pub enum StageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UserPolicy;
 
     #[test]
     fn display_path_percent_encodes_ambiguous_bytes() {
@@ -844,5 +903,51 @@ mod tests {
         let root = File::open(fixture.path()).unwrap();
 
         assert!(open_relative_no_links(&root, Path::new("link/secret")).is_err());
+    }
+
+    #[test]
+    fn validated_workspace_publishes_atomically_only_beside_its_stage() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("summary.json"), b"{}\n").unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let mut options = StageOptions::new(
+            source.path(),
+            CompiledPolicy::with_user_policy(UserPolicy::default()).unwrap(),
+        );
+        options.synthetic_git = false;
+        options.staging_base = Some(staging.path().to_path_buf());
+        let stage = Stage::build(options).unwrap();
+        let destination = staging.path().join("published");
+
+        assert_eq!(stage.publish_workspace(&destination).unwrap(), destination);
+        assert_eq!(fs::read(destination.join("summary.json")).unwrap(), b"{}\n");
+    }
+
+    #[test]
+    fn validated_workspace_refuses_existing_or_unrelated_publish_destinations() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("summary.json"), b"{}\n").unwrap();
+        let staging = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+
+        let build = || {
+            let mut options = StageOptions::new(
+                source.path(),
+                CompiledPolicy::with_user_policy(UserPolicy::default()).unwrap(),
+            );
+            options.synthetic_git = false;
+            options.staging_base = Some(staging.path().to_path_buf());
+            Stage::build(options).unwrap()
+        };
+        let existing = staging.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        assert!(matches!(
+            build().publish_workspace(&existing),
+            Err(StageError::UnsafePublishDestination(_))
+        ));
+        assert!(matches!(
+            build().publish_workspace(&unrelated.path().join("published")),
+            Err(StageError::UnsafePublishDestination(_))
+        ));
     }
 }

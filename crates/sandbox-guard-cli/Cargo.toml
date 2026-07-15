@@ -16,12 +16,14 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 directories.workspace = true
+hex.workspace = true
 libc.workspace = true
 sandbox-guard-core = { path = "../sandbox-guard-core" }
 sandbox-guard-helper = { path = "../sandbox-guard-helper" }
 sandbox-guard-runner = { path = "../sandbox-guard-runner" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 uuid.workspace = true
 which.workspace = true

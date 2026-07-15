@@ -9,10 +9,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::approval::ApprovalController;
+use crate::clipboard::{read_clipboard_image, write_private_image};
 use crate::linux::{
-    cgroup_probe_args, guest_bwrap_args, guest_helper_path, network_warnings, wrap_guest_cgroup,
-    write_environment_file,
+    cgroup_probe_args, cleanup_workspace_inbox, guest_bwrap_args, guest_helper_path,
+    network_warnings, prepare_workspace_inbox, wrap_guest_cgroup, write_environment_file,
 };
+use crate::terminal::{ClipboardPaste, run_interactive};
 use crate::{
     BackendKind, CgroupMode, CommandPlan, NetworkMode, RunOutcome, RunRequest, RunnerError,
 };
@@ -61,6 +63,7 @@ impl MacosLimaRunner {
         verify_guest_helper(&limactl, request, &helper)?;
 
         let guest_root = guest_root(request);
+        prepare_workspace_inbox(&request.workspace)?;
         prepare_guest_root(&limactl, request, &guest_root)?;
         if let Err(error) = copy_workspace_and_environment(&limactl, request, &guest_root) {
             let _ = cleanup_guest(&limactl, request, &guest_root);
@@ -102,24 +105,57 @@ impl MacosLimaRunner {
             OsString::from("--"),
         ];
         shell_args.extend(guest_command);
-        let status_result = Command::new(&limactl)
-            .args(&shell_args)
-            .status()
-            .map_err(|source| RunnerError::Execute {
-                program: limactl.clone(),
-                source,
-            });
-        let status = status_result?;
-        let retrieve_result =
-            create_retrieval_canary(&limactl, request, &guest_root).and_then(|canary| {
-                retrieve_guest_workspace(&limactl, request, &guest_root)?;
-                verify_retrieval_canary(request, &canary)
-            });
+        let execution = if request.interactive {
+            run_interactive(&limactl, &shell_args, || {
+                import_clipboard_into_guest(&limactl, request, &guest_root)
+            })
+            .map(|outcome| (outcome.status, outcome.clipboard_imports))
+        } else {
+            Command::new(&limactl)
+                .args(&shell_args)
+                .status()
+                .map(|status| (status, Vec::new()))
+                .map_err(|source| RunnerError::Execute {
+                    program: limactl.clone(),
+                    source,
+                })
+        };
+        let (status, clipboard_imports) = match execution {
+            Ok(execution) => execution,
+            Err(error) => {
+                stop_proxy(&mut proxy);
+                let _ = cleanup_guest(&limactl, request, &guest_root);
+                return Err(error);
+            }
+        };
+        let retrieve_result = (|| {
+            let guest_workspace = guest_root.join("workspace");
+            let workspace_canary =
+                create_retrieval_canary(&limactl, request, &guest_workspace, "workspace")?;
+            retrieve_guest_directory(
+                &limactl,
+                request,
+                &guest_workspace,
+                &request.workspace,
+                "workspace",
+            )?;
+            verify_retrieval_canary(&request.workspace, &workspace_canary)?;
+
+            if let Some(state) = &request.writable_home_state {
+                let guest_state = guest_root.join("session-state");
+                let state_canary =
+                    create_retrieval_canary(&limactl, request, &guest_state, "session-state")?;
+                retrieve_guest_directory(&limactl, request, &guest_state, state, "session-state")?;
+                verify_retrieval_canary(state, &state_canary)?;
+            }
+            Ok(())
+        })();
         let egress_audit = read_guest_egress_audit(&limactl, request, &guest_root);
         let egress_approvals = stop_proxy(&mut proxy);
         let cleanup_result = cleanup_guest(&limactl, request, &guest_root);
         retrieve_result?;
         cleanup_result?;
+        cleanup_workspace_inbox(&request.workspace)?;
 
         Ok(RunOutcome {
             backend: BackendKind::MacosLima,
@@ -129,20 +165,97 @@ impl MacosLimaRunner {
             seccomp_enforced: true,
             egress_audit,
             egress_approvals,
+            clipboard_imports,
         })
     }
 }
 
-fn retrieve_guest_workspace(
+fn import_clipboard_into_guest(
     limactl: &Path,
     request: &RunRequest,
     guest_root: &Path,
+) -> Result<ClipboardPaste, RunnerError> {
+    let image = read_clipboard_image()?;
+    let local = tempfile::Builder::new()
+        .prefix("sandbox-guard-clipboard-delivery-")
+        .tempdir()
+        .map_err(|source| RunnerError::SetupFailed(source.to_string()))?;
+    fs::set_permissions(local.path(), fs::Permissions::from_mode(0o700)).map_err(|source| {
+        RunnerError::Inspect {
+            path: local.path().to_path_buf(),
+            source,
+        }
+    })?;
+    let local_image = write_private_image(local.path(), &image)?;
+    let remote = format!(
+        "{}:{}",
+        request.lima_instance,
+        guest_root.join("inbox").join(&image.filename).display()
+    );
+    run_checked(
+        limactl,
+        [
+            OsString::from("--tty=false"),
+            OsString::from("copy"),
+            OsString::from("--backend=rsync"),
+            local_image.into_os_string(),
+            OsString::from(remote),
+        ],
+        "deliver clipboard image to Lima inbox",
+    )?;
+    run_checked(
+        limactl,
+        shell_command(
+            request,
+            [
+                OsString::from("test"),
+                OsString::from("-f"),
+                guest_root
+                    .join("inbox")
+                    .join(&image.filename)
+                    .into_os_string(),
+            ],
+        ),
+        "verify Lima clipboard image type",
+    )?;
+    let mode = run_checked(
+        limactl,
+        shell_command(
+            request,
+            [
+                OsString::from("stat"),
+                OsString::from("--format=%a:%s"),
+                guest_root
+                    .join("inbox")
+                    .join(&image.filename)
+                    .into_os_string(),
+            ],
+        ),
+        "verify Lima clipboard image",
+    )?;
+    let expected = format!("600:{}", image.png.len());
+    if String::from_utf8_lossy(&mode.stdout).trim() != expected {
+        return Err(RunnerError::ClipboardUnavailable(
+            "Lima clipboard image failed private mode or size verification".to_owned(),
+        ));
+    }
+    Ok(ClipboardPaste {
+        text: image.attachment_reference(),
+        audit: image.audit_entry(),
+    })
+}
+
+fn retrieve_guest_directory(
+    limactl: &Path,
+    request: &RunRequest,
+    guest_directory: &Path,
+    host_directory: &Path,
+    label: &'static str,
 ) -> Result<(), RunnerError> {
-    let workspace_parent = request
-        .workspace
+    let host_parent = host_directory
         .parent()
-        .ok_or_else(|| RunnerError::SetupFailed("staged workspace has no parent".to_owned()))?;
-    let returned = tempfile::tempdir_in(workspace_parent)
+        .ok_or_else(|| RunnerError::SetupFailed(format!("{label} has no parent")))?;
+    let returned = tempfile::tempdir_in(host_parent)
         .map_err(|source| RunnerError::SetupFailed(source.to_string()))?;
     fs::set_permissions(returned.path(), fs::Permissions::from_mode(0o700)).map_err(|source| {
         RunnerError::Inspect {
@@ -150,12 +263,8 @@ fn retrieve_guest_workspace(
             source,
         }
     })?;
-    let remote = format!(
-        "{}:{}",
-        request.lima_instance,
-        guest_root.join("workspace").display()
-    );
-    let returned_workspace = returned.path().join("workspace");
+    let remote = format!("{}:{}", request.lima_instance, guest_directory.display());
+    let returned_directory = returned.path().join("returned");
     run_checked(
         limactl,
         [
@@ -164,29 +273,29 @@ fn retrieve_guest_workspace(
             OsString::from("--backend=rsync"),
             OsString::from("--recursive"),
             OsString::from(remote),
-            returned_workspace.as_os_str().to_owned(),
+            returned_directory.as_os_str().to_owned(),
         ],
-        "retrieve disposable Lima workspace",
+        "retrieve disposable Lima directory",
     )?;
     let metadata =
-        fs::symlink_metadata(&returned_workspace).map_err(|source| RunnerError::Inspect {
-            path: returned_workspace.clone(),
+        fs::symlink_metadata(&returned_directory).map_err(|source| RunnerError::Inspect {
+            path: returned_directory.clone(),
             source,
         })?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(RunnerError::SetupFailed(
-            "Lima returned workspace is not a real directory".to_owned(),
-        ));
+        return Err(RunnerError::SetupFailed(format!(
+            "Lima returned {label} is not a real directory"
+        )));
     }
-    let backup = workspace_parent.join(format!(".baseline-{}", request.run_id));
-    fs::rename(&request.workspace, &backup).map_err(|source| RunnerError::Inspect {
-        path: request.workspace.clone(),
+    let backup = host_parent.join(format!(".baseline-{}-{label}", request.run_id));
+    fs::rename(host_directory, &backup).map_err(|source| RunnerError::Inspect {
+        path: host_directory.to_path_buf(),
         source,
     })?;
-    if let Err(source) = fs::rename(&returned_workspace, &request.workspace) {
-        let _ = fs::rename(&backup, &request.workspace);
+    if let Err(source) = fs::rename(&returned_directory, host_directory) {
+        let _ = fs::rename(&backup, host_directory);
         return Err(RunnerError::Inspect {
-            path: returned_workspace,
+            path: returned_directory,
             source,
         });
     }
@@ -200,10 +309,11 @@ fn retrieve_guest_workspace(
 fn create_retrieval_canary(
     limactl: &Path,
     request: &RunRequest,
-    guest_root: &Path,
+    guest_directory: &Path,
+    label: &str,
 ) -> Result<(String, String), RunnerError> {
-    let name = format!(".sandbox-guard-rsync-canary-{}", request.run_id);
-    let target = format!(".sandbox-guard-rsync-target-{}", request.run_id);
+    let name = format!(".sandbox-guard-rsync-canary-{label}-{}", request.run_id);
+    let target = format!(".sandbox-guard-rsync-target-{label}-{}", request.run_id);
     run_checked(
         limactl,
         shell_command(
@@ -213,7 +323,7 @@ fn create_retrieval_canary(
                 OsString::from("-s"),
                 OsString::from("--"),
                 OsString::from(&target),
-                guest_root.join("workspace").join(&name).into_os_string(),
+                guest_directory.join(&name).into_os_string(),
             ],
         ),
         "create Lima retrieval link canary",
@@ -222,10 +332,10 @@ fn create_retrieval_canary(
 }
 
 fn verify_retrieval_canary(
-    request: &RunRequest,
+    host_directory: &Path,
     (name, target): &(String, String),
 ) -> Result<(), RunnerError> {
-    let canary = request.workspace.join(name);
+    let canary = host_directory.join(name);
     let metadata = fs::symlink_metadata(&canary).map_err(|source| RunnerError::Inspect {
         path: canary.clone(),
         source,
@@ -311,19 +421,21 @@ fn prepare_guest_root(
     guest_root: &Path,
 ) -> Result<(), RunnerError> {
     let workspace = guest_root.join("workspace");
+    let mut directories = vec![
+        OsString::from("mkdir"),
+        OsString::from("-m"),
+        OsString::from("700"),
+        OsString::from("--"),
+        guest_root.into(),
+        workspace.into_os_string(),
+        guest_root.join("inbox").into_os_string(),
+    ];
+    if request.writable_home_state.is_some() {
+        directories.push(guest_root.join("session-state").into_os_string());
+    }
     run_checked(
         limactl,
-        shell_command(
-            request,
-            [
-                OsString::from("mkdir"),
-                OsString::from("-m"),
-                OsString::from("700"),
-                OsString::from("--"),
-                guest_root.into(),
-                workspace.into_os_string(),
-            ],
-        ),
+        shell_command(request, directories),
         "create private Lima guest runtime and workspace",
     )?;
     Ok(())
@@ -347,6 +459,38 @@ fn copy_workspace_and_environment(
         ],
         "copy sanitized workspace to Lima",
     )?;
+
+    if let Some(state) = &request.writable_home_state {
+        let state_target = format!(
+            "{}:{}",
+            request.lima_instance,
+            guest_root.join("session-state").display()
+        );
+        run_checked(
+            limactl,
+            [
+                OsString::from("--tty=false"),
+                OsString::from("copy"),
+                OsString::from("--backend=rsync"),
+                OsString::from("--recursive"),
+                state.as_os_str().to_owned(),
+                OsString::from(state_target),
+            ],
+            "copy private session state to Lima",
+        )?;
+        run_checked(
+            limactl,
+            shell_command(
+                request,
+                [
+                    OsString::from("chmod"),
+                    OsString::from("700"),
+                    guest_root.join("session-state").into_os_string(),
+                ],
+            ),
+            "secure private Lima session state",
+        )?;
+    }
 
     let stage_root = request
         .workspace
@@ -452,7 +596,21 @@ fn start_guest_proxy(
         let responses = child.stdin.take().ok_or_else(|| {
             RunnerError::SetupFailed("Lima approval response pipe was not created".to_owned())
         })?;
-        Some(ApprovalController::start(requests, responses))
+        let decision_store = request.egress_decision_store.clone().ok_or_else(|| {
+            RunnerError::SetupFailed("egress decision store was not configured".to_owned())
+        })?;
+        match ApprovalController::start(requests, responses, decision_store) {
+            Ok(controller) => Some(controller),
+            Err(error) => {
+                let process_group = -(child.id() as i32);
+                // SAFETY: the child was spawned as the leader of its own process group.
+                unsafe {
+                    libc::kill(process_group, libc::SIGKILL);
+                }
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
     } else {
         None
     };
@@ -719,6 +877,8 @@ mod tests {
             network: NetworkMode::Denied,
             allowed_egress_hosts: Vec::new(),
             interactive_egress_approval: false,
+            egress_decision_store: None,
+            writable_home_state: None,
             forwarded_env: Vec::new(),
             resource_limits: ResourceLimits::default(),
             cgroup_mode: CgroupMode::BestEffort,

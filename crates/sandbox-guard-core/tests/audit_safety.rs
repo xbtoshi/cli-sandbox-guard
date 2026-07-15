@@ -29,6 +29,7 @@ fn persisted_run_audit_never_contains_a_forwarded_secret_value() {
         interactive_egress_approval: false,
         egress_audit: vec![],
         egress_approvals: vec![],
+        clipboard_imports: vec![],
         resource_limits: ResourceLimitRecord {
             memory_bytes: 1024,
             max_file_bytes: 1024,

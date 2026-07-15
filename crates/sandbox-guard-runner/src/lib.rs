@@ -4,17 +4,25 @@
 //! controlled proxy egress or deliberately noisy unrestricted networking is recorded in audit.
 
 mod approval;
+mod clipboard;
 mod linux;
 mod macos;
+mod terminal;
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use approval::{
+    RememberedEgressDecision, clear_remembered_egress_decisions, forget_remembered_egress_decision,
+    list_remembered_egress_decisions,
+};
 pub use linux::LinuxBwrapRunner;
 pub use macos::MacosLimaRunner;
 pub use sandbox_guard_helper::ResourceLimits;
@@ -94,6 +102,10 @@ pub struct RunRequest {
     pub allowed_egress_hosts: Vec<String>,
     /// Ask through a trusted host-native dialog for exact HTTPS destinations not pre-allowed.
     pub interactive_egress_approval: bool,
+    /// Private host-side file used for remembered exact-host allow and deny choices.
+    pub egress_decision_store: Option<PathBuf>,
+    /// Guard-owned writable state exposed only at `/home/guard/.grok/sessions`.
+    pub writable_home_state: Option<PathBuf>,
     pub forwarded_env: Vec<(String, String)>,
     pub resource_limits: ResourceLimits,
     pub cgroup_mode: CgroupMode,
@@ -111,6 +123,7 @@ pub struct RunOutcome {
     pub seccomp_enforced: bool,
     pub egress_audit: Vec<String>,
     pub egress_approvals: Vec<String>,
+    pub clipboard_imports: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +221,34 @@ fn validate_request(request: &RunRequest) -> Result<(), RunnerError> {
     {
         return Err(RunnerError::InvalidHelperPath(helper.clone()));
     }
+    if let Some(state) = &request.writable_home_state {
+        if !state.is_absolute() {
+            return Err(RunnerError::InvalidWritableState(state.clone()));
+        }
+        let metadata = fs::symlink_metadata(state).map_err(|source| RunnerError::Inspect {
+            path: state.clone(),
+            source,
+        })?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != current_uid()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(RunnerError::InvalidWritableState(state.clone()));
+        }
+        let state = fs::canonicalize(state).map_err(|source| RunnerError::Inspect {
+            path: state.clone(),
+            source,
+        })?;
+        let workspace =
+            fs::canonicalize(&request.workspace).map_err(|source| RunnerError::Inspect {
+                path: request.workspace.clone(),
+                source,
+            })?;
+        if path_is_within(&state, &workspace) || path_is_within(&workspace, &state) {
+            return Err(RunnerError::InvalidWritableState(state));
+        }
+    }
     match request.network {
         NetworkMode::Controlled if request.allowed_egress_hosts.is_empty() => {
             return Err(RunnerError::ControlledEgressWithoutHosts);
@@ -222,6 +263,47 @@ fn validate_request(request: &RunRequest) -> Result<(), RunnerError> {
     if request.interactive_egress_approval
         && (request.network != NetworkMode::Controlled || !request.interactive)
     {
+        return Err(RunnerError::InvalidInteractiveEgressApproval);
+    }
+    if let Some(path) = &request.egress_decision_store {
+        let Some(parent) = path.parent() else {
+            return Err(RunnerError::InvalidEgressDecisionStore(path.clone()));
+        };
+        let parent_metadata =
+            fs::symlink_metadata(parent).map_err(|source| RunnerError::Inspect {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        let parent = fs::canonicalize(parent).map_err(|source| RunnerError::Inspect {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let resolved_path = parent.join(
+            path.file_name()
+                .ok_or_else(|| RunnerError::InvalidEgressDecisionStore(path.clone()))?,
+        );
+        let workspace =
+            fs::canonicalize(&request.workspace).map_err(|source| RunnerError::Inspect {
+                path: request.workspace.clone(),
+                source,
+            })?;
+        if !path.is_absolute()
+            || !parent_metadata.is_dir()
+            || parent_metadata.file_type().is_symlink()
+            || parent_metadata.uid() != current_uid()
+            || parent_metadata.permissions().mode() & 0o077 != 0
+            || path_is_within(&parent, &workspace)
+            || path_is_within(&workspace, &parent)
+            || request.writable_home_state.as_ref().is_some_and(|state| {
+                fs::canonicalize(state).is_ok_and(|state| path_is_within(&resolved_path, &state))
+            })
+        {
+            return Err(RunnerError::InvalidEgressDecisionStore(path.clone()));
+        }
+        if !request.interactive_egress_approval {
+            return Err(RunnerError::InvalidInteractiveEgressApproval);
+        }
+    } else if request.interactive_egress_approval {
         return Err(RunnerError::InvalidInteractiveEgressApproval);
     }
     for (name, _) in &request.forwarded_env {
@@ -298,6 +380,11 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root).is_ok()
 }
 
+fn current_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot invalidate Rust state.
+    unsafe { libc::geteuid() }
+}
+
 #[derive(Debug, Error)]
 pub enum RunnerError {
     #[error("unsupported platform: {0}")]
@@ -334,12 +421,18 @@ pub enum RunnerError {
     InvalidToolRoot(PathBuf),
     #[error("runtime helper path must be absolute: {0}")]
     InvalidHelperPath(PathBuf),
+    #[error(
+        "writable home state must be a private, owner-owned directory outside the workspace: {0}"
+    )]
+    InvalidWritableState(PathBuf),
     #[error("controlled network mode requires at least one --allow-host")]
     ControlledEgressWithoutHosts,
     #[error("--allow-host is valid only with controlled network mode")]
     EgressHostsWithoutControlledMode,
     #[error("interactive egress approval requires an interactive controlled-network run")]
     InvalidInteractiveEgressApproval,
+    #[error("remembered egress decision store must be an absolute host path: {0}")]
+    InvalidEgressDecisionStore(PathBuf),
     #[error("required cgroup v2 delegation through systemd-run is unavailable")]
     CgroupUnavailable,
     #[error("runtime helper failed before the sandbox started: {0}")]
@@ -358,6 +451,8 @@ pub enum RunnerError {
     },
     #[error("backend setup command failed: {0}")]
     SetupFailed(String),
+    #[error("clipboard image import failed: {0}")]
+    ClipboardUnavailable(String),
     #[error("managed Lima instance exposes a host filesystem mount: {0}")]
     UnsafeLimaMount(String),
 }
@@ -380,6 +475,8 @@ mod tests {
             network: NetworkMode::Denied,
             allowed_egress_hosts: vec![],
             interactive_egress_approval: false,
+            egress_decision_store: None,
+            writable_home_state: None,
             forwarded_env: vec![],
             resource_limits: ResourceLimits::default(),
             cgroup_mode: CgroupMode::BestEffort,
@@ -440,7 +537,34 @@ mod tests {
         request.interactive = true;
         request.network = NetworkMode::Controlled;
         request.allowed_egress_hosts = vec!["api.example.com".to_owned()];
+        let decisions = tempfile::tempdir().unwrap();
+        fs::set_permissions(decisions.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        request.egress_decision_store = Some(decisions.path().join("egress-decisions.json"));
         validate_request(&request).unwrap();
+    }
+
+    #[test]
+    fn decision_store_cannot_be_inside_a_sandbox_writable_tree() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut request = request(workspace.path());
+        request.interactive = true;
+        request.network = NetworkMode::Controlled;
+        request.allowed_egress_hosts = vec!["api.example.com".to_owned()];
+        request.interactive_egress_approval = true;
+        request.egress_decision_store = Some(workspace.path().join("decisions.json"));
+        assert!(matches!(
+            validate_request(&request),
+            Err(RunnerError::InvalidEgressDecisionStore(_))
+        ));
+
+        let state = tempfile::tempdir().unwrap();
+        fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        request.writable_home_state = Some(state.path().to_path_buf());
+        request.egress_decision_store = Some(state.path().join("decisions.json"));
+        assert!(matches!(
+            validate_request(&request),
+            Err(RunnerError::InvalidEgressDecisionStore(_))
+        ));
     }
 
     #[test]

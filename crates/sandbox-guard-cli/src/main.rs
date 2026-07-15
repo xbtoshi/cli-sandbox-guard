@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::net::{Ipv4Addr, TcpListener};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -18,7 +19,8 @@ use sandbox_guard_core::{
 use sandbox_guard_helper::ProbeReport;
 use sandbox_guard_runner::{
     BackendKind, CgroupMode, NetworkMode, ProcessSpec, ResourceLimits, RunOutcome, RunRequest,
-    ToolSpec, plan, run as run_isolated,
+    ToolSpec, clear_remembered_egress_decisions, forget_remembered_egress_decision,
+    list_remembered_egress_decisions, plan, run as run_isolated,
 };
 
 mod grok;
@@ -46,6 +48,8 @@ enum Command {
     Stage(StageArgs),
     /// Print the effective built-in plus user policy.
     Policy(PolicyArgs),
+    /// List or remove exact-host network choices remembered by native approval dialogs.
+    Approvals(ApprovalArgs),
     /// Check host prerequisites without changing the system.
     Doctor(DoctorArgs),
     /// Remove old, unlocked staging directories owned by the current user.
@@ -183,6 +187,17 @@ struct PolicyArgs {
     /// Explain whether a relative path is denied.
     #[arg(long)]
     check: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct ApprovalArgs {
+    /// Forget one exact hostname.
+    #[arg(long, value_name = "HOST", conflicts_with = "clear")]
+    forget: Option<String>,
+
+    /// Forget every remembered hostname choice.
+    #[arg(long)]
+    clear: bool,
 }
 
 #[derive(Debug, Args)]
@@ -334,6 +349,7 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Run(args) => run_command(args),
         Command::Stage(args) => stage_command(args),
         Command::Policy(args) => policy_command(args),
+        Command::Approvals(args) => approvals_command(args),
         Command::Doctor(args) => doctor_command(args),
         Command::Gc(args) => gc_command(args),
         Command::Test(args) => test_command(args),
@@ -342,13 +358,50 @@ fn execute(cli: Cli) -> Result<i32> {
 }
 
 fn run_command(args: RunArgs) -> Result<i32> {
-    run_command_with(args, Vec::new(), None)
+    run_command_with(args, Vec::new(), None, None)
+}
+
+fn approvals_command(args: ApprovalArgs) -> Result<i32> {
+    let path = default_egress_decision_path()?;
+    if args.clear {
+        let removed = clear_remembered_egress_decisions(&path)?;
+        println!("forgot {removed} remembered egress decision(s)");
+        return Ok(0);
+    }
+    if let Some(host) = args.forget {
+        let host = host.to_ascii_lowercase();
+        if forget_remembered_egress_decision(&path, &host)? {
+            println!("forgot remembered egress decision for {host}:443");
+        } else {
+            println!("no remembered egress decision for {host}:443");
+        }
+        return Ok(0);
+    }
+    let decisions = list_remembered_egress_decisions(&path)?;
+    if decisions.is_empty() {
+        println!("no remembered egress decisions");
+    } else {
+        for decision in decisions {
+            println!(
+                "{}:443\t{}",
+                decision.host,
+                if decision.allowed { "allow" } else { "deny" }
+            );
+        }
+    }
+    Ok(0)
+}
+
+pub(crate) trait PersistentRunState {
+    fn writable_path(&self) -> &Path;
+    fn publish(self: Box<Self>) -> Result<()>;
 }
 
 fn run_command_with(
     args: RunArgs,
     injected_environment: Vec<(String, String)>,
     preflight: Option<ProcessSpec>,
+    mut persistent_state: Option<Box<dyn PersistentRunState>>,
 ) -> Result<i32> {
     let network: NetworkMode = args.network.into();
     if network == NetworkMode::Unrestricted && !args.allow_unrestricted_network {
@@ -405,6 +458,7 @@ fn run_command_with(
             "warning: interactive egress approval is unavailable without a terminal; unknown destinations remain denied"
         );
     }
+    let interactive_egress_approval = args.ask_egress && interactive;
     let request = RunRequest {
         workspace: stage.workspace().to_path_buf(),
         run_id: stage.manifest().run_id.to_string(),
@@ -417,7 +471,13 @@ fn run_command_with(
         interactive,
         network,
         allowed_egress_hosts: args.allow_hosts.clone(),
-        interactive_egress_approval: args.ask_egress && interactive,
+        interactive_egress_approval,
+        egress_decision_store: interactive_egress_approval
+            .then(default_egress_decision_path)
+            .transpose()?,
+        writable_home_state: persistent_state
+            .as_ref()
+            .map(|state| state.writable_path().to_path_buf()),
         forwarded_env,
         resource_limits,
         cgroup_mode: args.cgroup.into(),
@@ -457,7 +517,9 @@ fn run_command_with(
             for warning in &outcome.warnings {
                 eprintln!("warning: {warning}");
             }
-            let success = outcome.status.success();
+            let state_result = persistent_state.take().map(|state| state.publish());
+            let success = outcome.status.success()
+                && state_result.as_ref().is_none_or(|result| result.is_ok());
             let exit_code = outcome.status.code();
             persist_run_audit(
                 &mut stage,
@@ -470,6 +532,9 @@ fn run_command_with(
                 exit_code,
                 success,
             )?;
+            if let Some(result) = state_result {
+                result?;
+            }
             publish_change_export(
                 args.export_changes.as_deref(),
                 &stage,
@@ -644,6 +709,8 @@ fn test_command(args: TestArgs) -> Result<i32> {
         network: NetworkMode::Denied,
         allowed_egress_hosts: vec![],
         interactive_egress_approval: false,
+        egress_decision_store: None,
+        writable_home_state: None,
         forwarded_env: vec![],
         resource_limits: ResourceLimits::default(),
         cgroup_mode: if args.require_cgroup {
@@ -693,6 +760,8 @@ fn test_command(args: TestArgs) -> Result<i32> {
         network: NetworkMode::Denied,
         allowed_egress_hosts: Vec::new(),
         interactive_egress_approval: false,
+        egress_decision_store: None,
+        writable_home_state: None,
         forwarded_env: Vec::new(),
         resource_limits: request.resource_limits,
         cgroup_mode: request.cgroup_mode,
@@ -721,6 +790,8 @@ fn test_command(args: TestArgs) -> Result<i32> {
         network: NetworkMode::Controlled,
         allowed_egress_hosts: vec!["allowed.example.invalid".to_owned()],
         interactive_egress_approval: false,
+        egress_decision_store: None,
+        writable_home_state: None,
         forwarded_env: vec![],
         resource_limits: request.resource_limits,
         cgroup_mode: request.cgroup_mode,
@@ -942,6 +1013,9 @@ fn persist_run_audit(
         egress_approvals: outcome
             .map(|outcome| outcome.egress_approvals.clone())
             .unwrap_or_default(),
+        clipboard_imports: outcome
+            .map(|outcome| outcome.clipboard_imports.clone())
+            .unwrap_or_default(),
         resource_limits: ResourceLimitRecord {
             memory_bytes: limits.memory_bytes,
             max_file_bytes: limits.max_file_bytes,
@@ -972,6 +1046,15 @@ fn default_audit_dir() -> Result<PathBuf> {
     let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
         .ok_or_else(|| anyhow!("could not determine the user data directory"))?;
     Ok(project.data_local_dir().join("audit"))
+}
+
+fn default_egress_decision_path() -> Result<PathBuf> {
+    let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
+        .ok_or_else(|| anyhow!("could not determine the user data directory"))?;
+    fs::create_dir_all(project.data_local_dir()).context("create private Guard data directory")?;
+    fs::set_permissions(project.data_local_dir(), fs::Permissions::from_mode(0o700))
+        .context("secure private Guard data directory")?;
+    Ok(project.data_local_dir().join("egress-decisions.json"))
 }
 
 fn default_policy_path() -> Result<PathBuf> {

@@ -11,6 +11,8 @@ use sandbox_guard_helper::EnvironmentEntry;
 use tempfile::{Builder as TempBuilder, TempDir};
 
 use crate::approval::ApprovalController;
+use crate::clipboard::{INBOX_DIRECTORY, SANDBOX_INBOX, read_clipboard_image, write_private_image};
+use crate::terminal::{ClipboardPaste, run_interactive};
 use crate::{
     BackendKind, CgroupMode, CommandPlan, NetworkMode, RunOutcome, RunRequest, RunnerError,
     path_is_within,
@@ -75,6 +77,7 @@ impl LinuxBwrapRunner {
         })?;
         let helper = resolve_host_helper(request)?;
         let workspace = canonical_workspace(request)?;
+        prepare_workspace_inbox(&workspace)?;
         let runtime = RuntimeDirectory::new(&workspace, &request.forwarded_env)?;
         let mut proxy = if request.network == NetworkMode::Controlled {
             Some(ProxyProcess::start(
@@ -82,6 +85,7 @@ impl LinuxBwrapRunner {
                 &runtime,
                 &request.allowed_egress_hosts,
                 request.interactive_egress_approval,
+                request.egress_decision_store.as_deref(),
             )?)
         } else {
             None
@@ -89,19 +93,33 @@ impl LinuxBwrapRunner {
         let (use_cgroup, mut warnings) = resolve_cgroup_mode(request, &helper)?;
         let plan = Self::build_plan(request, bwrap, helper, runtime.root(), use_cgroup)?;
         warnings.extend(plan.warnings.clone());
-        let status = Command::new(&plan.program)
-            .args(&plan.args)
-            .status()
-            .map_err(|source| RunnerError::Execute {
-                program: plan.program.clone(),
-                source,
+        let (status, clipboard_imports) = if request.interactive {
+            let interactive = run_interactive(&plan.program, &plan.args, || {
+                let image = read_clipboard_image()?;
+                write_private_image(&runtime.inbox, &image)?;
+                Ok(ClipboardPaste {
+                    text: image.attachment_reference(),
+                    audit: image.audit_entry(),
+                })
             })?;
+            (interactive.status, interactive.clipboard_imports)
+        } else {
+            let status = Command::new(&plan.program)
+                .args(&plan.args)
+                .status()
+                .map_err(|source| RunnerError::Execute {
+                    program: plan.program.clone(),
+                    source,
+                })?;
+            (status, Vec::new())
+        };
         let egress_approvals = proxy.as_mut().map(ProxyProcess::stop).unwrap_or_default();
         let egress_audit = fs::read_to_string(&runtime.audit_log)
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
             .collect();
+        cleanup_workspace_inbox(&workspace)?;
         Ok(RunOutcome {
             backend: BackendKind::LinuxBwrap,
             status,
@@ -110,6 +128,7 @@ impl LinuxBwrapRunner {
             seccomp_enforced: true,
             egress_audit,
             egress_approvals,
+            clipboard_imports,
         })
     }
 }
@@ -125,6 +144,7 @@ struct RuntimeDirectory {
     temp: TempDir,
     socket: PathBuf,
     audit_log: PathBuf,
+    inbox: PathBuf,
 }
 
 impl RuntimeDirectory {
@@ -146,9 +166,21 @@ impl RuntimeDirectory {
             }
         })?;
         write_environment_file(&temp.path().join("environment.json"), environment)?;
+        let inbox = temp.path().join("inbox");
+        fs::create_dir(&inbox).map_err(|source| RunnerError::Inspect {
+            path: inbox.clone(),
+            source,
+        })?;
+        fs::set_permissions(&inbox, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            RunnerError::Inspect {
+                path: inbox.clone(),
+                source,
+            }
+        })?;
         Ok(Self {
             socket: temp.path().join("egress.sock"),
             audit_log: temp.path().join("egress-audit.log"),
+            inbox,
             temp,
         })
     }
@@ -156,6 +188,43 @@ impl RuntimeDirectory {
     fn root(&self) -> &Path {
         self.temp.path()
     }
+}
+
+pub(crate) fn prepare_workspace_inbox(workspace: &Path) -> Result<(), RunnerError> {
+    let inbox = workspace.join(INBOX_DIRECTORY);
+    match fs::symlink_metadata(&inbox) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(RunnerError::SetupFailed(format!(
+                "reserved clipboard inbox already exists: {}",
+                inbox.display()
+            )));
+        }
+        Err(source) => {
+            return Err(RunnerError::Inspect {
+                path: inbox,
+                source,
+            });
+        }
+    }
+    fs::create_dir(&inbox).map_err(|source| RunnerError::Inspect {
+        path: inbox.clone(),
+        source,
+    })?;
+    fs::set_permissions(&inbox, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        RunnerError::Inspect {
+            path: inbox,
+            source,
+        }
+    })
+}
+
+pub(crate) fn cleanup_workspace_inbox(workspace: &Path) -> Result<(), RunnerError> {
+    let inbox = workspace.join(INBOX_DIRECTORY);
+    fs::remove_dir(&inbox).map_err(|source| RunnerError::Inspect {
+        path: inbox,
+        source,
+    })
 }
 
 pub(crate) fn write_environment_file(
@@ -200,6 +269,7 @@ impl ProxyProcess {
         runtime: &RuntimeDirectory,
         allowed_hosts: &[String],
         interactive_approval: bool,
+        decision_store: Option<&Path>,
     ) -> Result<Self, RunnerError> {
         let mut command = Command::new(helper);
         command
@@ -230,7 +300,17 @@ impl ProxyProcess {
             let responses = child.stdin.take().ok_or_else(|| {
                 RunnerError::SetupFailed("egress approval response pipe was not created".to_owned())
             })?;
-            Some(ApprovalController::start(requests, responses))
+            let decision_store = decision_store.ok_or_else(|| {
+                RunnerError::SetupFailed("egress decision store was not configured".to_owned())
+            })?;
+            match ApprovalController::start(requests, responses, decision_store.to_path_buf()) {
+                Ok(controller) => Some(controller),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -329,7 +409,14 @@ fn build_bwrap_args(
     push(&mut args, "/tmp");
     push(&mut args, "--tmpfs");
     push(&mut args, "/dev/shm");
-    for directory in ["/home", "/home/guard", "/opt", "/opt/sandbox-guard", "/run"] {
+    for directory in [
+        "/home",
+        "/home/guard",
+        "/home/guard/.grok",
+        "/opt",
+        "/opt/sandbox-guard",
+        "/run",
+    ] {
         push(&mut args, "--dir");
         push(&mut args, directory);
     }
@@ -358,6 +445,11 @@ fn build_bwrap_args(
     push(&mut args, "--ro-bind");
     args.push(runtime_host.as_os_str().to_owned());
     push(&mut args, GUEST_RUNTIME);
+    if let Some(state) = &request.writable_home_state {
+        push(&mut args, "--bind");
+        args.push(state.as_os_str().to_owned());
+        push(&mut args, "/home/guard/.grok/sessions");
+    }
     if let Some((host, guest)) = tool_mount {
         push(&mut args, "--ro-bind");
         args.push(host.into_os_string());
@@ -366,6 +458,9 @@ fn build_bwrap_args(
     push(&mut args, "--bind");
     args.push(workspace.as_os_str().to_owned());
     push(&mut args, "/workspace");
+    push(&mut args, "--ro-bind");
+    args.push(runtime_host.join("inbox").into_os_string());
+    push(&mut args, SANDBOX_INBOX);
     push(&mut args, "--chdir");
     push(&mut args, "/workspace");
     for (name, value) in [
@@ -426,7 +521,14 @@ pub(crate) fn guest_bwrap_args(
     push(&mut args, "/tmp");
     push(&mut args, "--tmpfs");
     push(&mut args, "/dev/shm");
-    for directory in ["/home", "/home/guard", "/opt", "/opt/sandbox-guard", "/run"] {
+    for directory in [
+        "/home",
+        "/home/guard",
+        "/home/guard/.grok",
+        "/opt",
+        "/opt/sandbox-guard",
+        "/run",
+    ] {
         push(&mut args, "--dir");
         push(&mut args, directory);
     }
@@ -464,9 +566,17 @@ pub(crate) fn guest_bwrap_args(
     push(&mut args, "--ro-bind");
     args.push(runtime_root.as_os_str().to_owned());
     push(&mut args, GUEST_RUNTIME);
+    if request.writable_home_state.is_some() {
+        push(&mut args, "--bind");
+        args.push(runtime_root.join("session-state").into_os_string());
+        push(&mut args, "/home/guard/.grok/sessions");
+    }
     push(&mut args, "--bind");
     args.push(workspace.as_os_str().to_owned());
     push(&mut args, "/workspace");
+    push(&mut args, "--ro-bind");
+    args.push(runtime_root.join("inbox").into_os_string());
+    push(&mut args, SANDBOX_INBOX);
     push(&mut args, "--chdir");
     push(&mut args, "/workspace");
     for (name, value) in [
@@ -789,6 +899,8 @@ mod tests {
                 vec![]
             },
             interactive_egress_approval: false,
+            egress_decision_store: None,
+            writable_home_state: None,
             forwarded_env: vec![("GROK_TOKEN".to_owned(), "secret".to_owned())],
             resource_limits: crate::ResourceLimits::default(),
             cgroup_mode: CgroupMode::BestEffort,
@@ -816,6 +928,9 @@ mod tests {
         assert!(strings.iter().any(|arg| arg == "/workspace"));
         assert!(strings.iter().any(|arg| arg == "supervise"));
         assert!(!strings.iter().any(|arg| arg.contains("secret")));
+        assert!(strings.windows(3).any(|window| {
+            window == ["--ro-bind", "/tmp/guard-test/runtime/inbox", SANDBOX_INBOX]
+        }));
     }
 
     #[test]
@@ -883,6 +998,38 @@ mod tests {
             strings
                 .windows(2)
                 .any(|window| { window == ["--preflight-arg", "login"] })
+        );
+    }
+
+    #[test]
+    fn writable_session_state_is_bound_only_at_the_narrow_grok_path() {
+        let workspace = Path::new("/tmp/guard-test/workspace");
+        let runtime = Path::new("/tmp/guard-test/runtime");
+        let mut request = request(workspace, NetworkMode::Denied);
+        request.writable_home_state = Some(PathBuf::from("/private/guard-session-stage"));
+        let args = guest_bwrap_args(
+            &request,
+            workspace,
+            runtime,
+            Path::new("/usr/local/bin/guard-helper"),
+        );
+        let strings: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(strings.windows(3).any(|window| {
+            window
+                == [
+                    "--bind",
+                    "/tmp/guard-test/runtime/session-state",
+                    "/home/guard/.grok/sessions",
+                ]
+        }));
+        assert!(
+            !strings
+                .windows(3)
+                .any(|window| { window[0] == "--bind" && window[2] == "/home/guard/.grok" })
         );
     }
 

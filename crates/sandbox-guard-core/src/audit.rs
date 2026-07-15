@@ -81,6 +81,8 @@ pub struct RunRecord {
     pub egress_audit: Vec<String>,
     #[serde(default)]
     pub egress_approvals: Vec<String>,
+    #[serde(default)]
+    pub clipboard_imports: Vec<String>,
     pub resource_limits: ResourceLimitRecord,
     pub cgroup_enforced: bool,
     pub seccomp_enforced: bool,

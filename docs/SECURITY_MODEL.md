@@ -27,6 +27,8 @@ The current trusted computing base is:
 - the trusted controlled-egress proxy running outside the tool's network namespace;
 - the host-side native approval controller and its private proxy protocol when interactive egress
   approval is enabled;
+- the host-side interactive PTY and one-shot clipboard-image controller when `Ctrl+V` import is
+  used;
 - on macOS, Lima, its hypervisor, SSH/rsync transport, and the dedicated Linux guest.
 
 The `guard grok` adapter additionally trusts the host Grok authentication subcommand only while
@@ -72,6 +74,33 @@ explicitly for one run.
 - Denied and controlled modes use a separate network namespace. Unrestricted mode requires an
   explicit acknowledgement and a high-visibility warning.
 
+## Interactive clipboard invariants
+
+- Guard never polls or automatically forwards the host clipboard. Only a raw `Ctrl+V` received by
+  the trusted host-side PTY during an interactive run triggers one read. Normal terminal `Cmd+V`
+  text paste remains terminal-provided input.
+- On macOS, the native clipboard service exports one PNG. Guard caps the encoded input at 32 MiB,
+  limits dimensions to 16,384 per side and 40 million total pixels, decodes it under allocation
+  limits, and re-encodes it as PNG before delivery. Original image metadata is not retained.
+- The sanitized file is created mode `0600` inside a mode-`0700` per-run inbox. That inbox is
+  read-only in the sandbox at `/workspace/sandbox-guard-inputs`; its name is a built-in denied
+  source path, so repository content cannot pre-seed it. Lima delivery verifies the returned file
+  type, mode, and size.
+- The inbox is not part of the original repository, change exports, or persistent Grok session
+  snapshots. It is removed from the staged workspace after execution and the backing runtime is
+  deleted with the run.
+- The PTY filters 7-bit OSC clipboard controls, iTerm host-control OSC, and opaque DCS/SOS/PM/APC
+  terminal-multiplexer passthrough emitted by the untrusted tool so those channels cannot bypass
+  the explicit clipboard broker. Raw C1 byte values are treated as UTF-8 continuation data, as in
+  modern UTF-8 terminal modes. The PTY also removes DEC terminal mouse reporting modes so normal
+  host-side selection and copy remain available; mouse gestures are not delivered to the isolated
+  TUI. Clipboard audit entries contain only the sandbox path, media type, dimensions, byte count,
+  and SHA-256 digest.
+
+After explicit import, the image is intentionally readable by the untrusted tool and can be sent
+to any destination allowed by the network policy. The image itself may contain adversarial prompt
+content; sanitization protects the file/decoder boundary, not model interpretation.
+
 ## Controlled-egress invariants
 
 - The untrusted namespace has no normal external interface. It sees a loopback HTTP-proxy relay
@@ -80,7 +109,14 @@ explicitly for one run.
 - Hostnames are normalized and must match an exact or explicit wildcard-suffix rule.
 - Optional interactive grants cross a private stdio pipe owned by the trusted proxy transport, not
   the tool terminal. The host revalidates an exact normalized hostname and port 443 before showing
-  a native dialog. Grants are one CONNECT or one Guard session and never add wildcard rules.
+  a native dialog. Choices cover one CONNECT, one Guard session, or—only when the user explicitly
+  remembers them—future sessions. Remembered choices are exact-host port-443 entries and never add
+  wildcard rules.
+- Remembered allow and deny choices live in an owner-only, singly linked regular file under an
+  owner-only Guard data directory. Writes are locked, merged, fsynced, and atomically renamed. The
+  file path is outside the staged workspace and optional writable tool state. Persistence failure
+  denies rather than widening access. `guard approvals` provides list, forget-one, and clear-all
+  operations.
 - Cancellation, timeout, malformed protocol, missing native UI, and noninteractive execution deny
   the request. Linux requires `zenity`; Guard does not accept approval input through the untrusted
   tool's shared terminal. Prompts are serialized and capped at 16 per run; excess requests deny
@@ -91,7 +127,7 @@ explicitly for one run.
 - The first TLS record must be a ClientHello whose SNI exactly equals the CONNECT hostname before
   any client bytes are sent upstream.
 - The destination audit contains only a timestamp and successful hostname/port. A separate approval
-  audit records hostname/port and deny, allow-once, or allow-session—not URLs or payloads.
+  audit records hostname/port and the scoped or remembered decision—not URLs or payloads.
 - Handshakes have wall-clock deadlines, tunnels have idle timeouts, and concurrent proxy/relay
   connections are bounded.
 
@@ -112,9 +148,14 @@ every intentionally forwarded credential to an allowlisted service.
   transport. A preflight hydrates the disposable synthetic home through Grok's documented external
   auth-provider interface before the main Grok process starts.
 - Egress starts with controlled HTTPS access for `cli-chat-proxy.grok.com`. Interactive runs may
-  grant an exact additional hostname once or for that Guard session through the trusted native
-  approval controller; `--no-egress-prompts` restores the fixed allowlist. The adapter never offers
-  unrestricted networking or permanent grants.
+  grant an exact additional hostname once, for that Guard session, or remember an exact-host allow
+  or deny through the trusted native approval controller; `--no-egress-prompts` restores the fixed
+  allowlist. The adapter never offers unrestricted networking.
+- Only a Guard-owned staged copy of `/home/guard/.grok/sessions` is writable across runs. The host
+  `~/.grok`, auth file, refresh token, configuration, and logs remain unavailable. Returned session
+  files are staged again with link, special-file, hard-link, mount-crossing, mutation, size, and
+  count checks before a per-source snapshot is atomically activated. `--resume` accepts a UUID
+  present in that snapshot; `--continue` delegates latest-session selection to Grok.
 
 ## Resource and syscall controls
 
@@ -176,8 +217,12 @@ from this store and does not automatically re-verify them before every run.
   ClientHello with SNI, does not perform TLS interception or certificate verification for the
   client, and cannot restrict URL paths or tenants behind an allowed shared endpoint.
 - Interactive approval identifies the requested hostname and port, not the executable or HTTP
-  path responsible for the request. The tool can choose misleading hostnames and can send any data
-  it can access after approval; users must approve only destinations they expected.
+  path responsible for the request. TLS remains end-to-end, so Guard cannot show the full URL,
+  method, headers, or body. The tool can choose misleading hostnames and can send any data it can
+  access after approval; users must approve only destinations they expected.
+- Host clipboard image import currently supports macOS only. The injected `@` reference is native
+  to Grok and several coding CLIs, but vendor-specific clients that do not accept file references
+  may require a dedicated adapter.
 - Unrestricted mode exposes the selected host or Lima-guest network namespace, including loopback,
   private/LAN networks, cloud metadata, and Linux abstract UNIX sockets. Abstract sockets are not
   covered by filesystem isolation and may provide a code-execution path in that namespace.
@@ -203,6 +248,9 @@ from this store and does not automatically re-verify them before every run.
 - `guard grok` does not yet provide live refresh brokerage. A session that outlives its short-lived
   access token must exit and relaunch so Guard can obtain a fresh token. The access token is
   intentionally visible to Grok and its child processes, though the refresh token is not.
+- Guard-managed Grok sessions are private but not encrypted at rest. A crash or forced termination
+  before post-run validation and atomic activation can lose the newest conversation updates while
+  leaving the previous validated snapshot intact.
 
 These limitations are release gates, not hidden assumptions. The
 [requirements register](../sandbox-guard-requirements.md) tracks historical blockers and remaining

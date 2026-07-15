@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,11 +10,14 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, TimeDelta, Utc};
 use clap::Args;
-use directories::BaseDirs;
+use directories::{BaseDirs, ProjectDirs};
+use sandbox_guard_core::{CompiledPolicy, Stage, StageOptions, UserPolicy};
 use sandbox_guard_runner::ProcessSpec;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
-use super::{BackendArg, CgroupArg, NetworkArg, RunArgs, run_command_with};
+use super::{BackendArg, CgroupArg, NetworkArg, PersistentRunState, RunArgs, run_command_with};
 
 const GROK_PROXY_HOST: &str = "cli-chat-proxy.grok.com";
 const GROK_SESSION_TOKEN: &str = "GROK_SESSION_TOKEN";
@@ -22,6 +26,11 @@ const AUTH_PROVIDER_COMMAND: &str = "printf '%s\\n' \"$GROK_SESSION_TOKEN\"";
 const SAFE_GROK_ARGUMENTS: &[&str] = &["--disable-web-search", "--no-memory", "--no-alt-screen"];
 const MINIMUM_TOKEN_VALIDITY_MINUTES: i64 = 10;
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
+const GROK_SESSION_CWD: &str = "%2Fworkspace";
+const GROK_SESSION_INDEX: &str = "session_search.sqlite";
+const GROK_PROMPT_HISTORY: &str = "prompt_history.jsonl";
+const SESSION_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const SESSION_MAX_FILES: u64 = 10_000;
 
 #[derive(Debug, Args)]
 pub(super) struct GrokArgs {
@@ -93,13 +102,26 @@ pub(super) struct GrokArgs {
     #[arg(long)]
     reauthenticate: bool,
 
-    /// Use Grok's experimental native-scrollback renderer for ordinary terminal selection.
+    /// Use Grok's experimental native-scrollback renderer.
     #[arg(long)]
     scrollback: bool,
 
     /// Keep egress fixed to Grok's API host without native prompts for additional HTTPS hosts.
     #[arg(long)]
     no_egress_prompts: bool,
+
+    /// Resume a Guard-managed Grok session by UUID.
+    #[arg(
+        long,
+        short = 'r',
+        value_name = "SESSION_ID",
+        conflicts_with = "continue_session"
+    )]
+    resume: Option<Uuid>,
+
+    /// Continue the most recently updated Guard-managed session for this source directory.
+    #[arg(long = "continue", short = 'c', conflicts_with = "resume")]
+    continue_session: bool,
 
     /// Additional Grok arguments. Place them after the double dash.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -122,7 +144,14 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
             .format("%Y-%m-%d %H:%M:%S %z")
     );
 
-    let tool = grok_tool_arguments(args.scrollback, args.grok_args);
+    reject_passthrough_session_controls(&args.grok_args)?;
+    let session_state = GrokSessionState::prepare(&args.source, args.resume)?;
+    let tool = grok_tool_arguments(
+        args.scrollback,
+        args.resume,
+        args.continue_session,
+        args.grok_args,
+    );
 
     let run_args = RunArgs {
         source: args.source,
@@ -161,17 +190,329 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
         command: OsString::from("grok"),
         args: vec![OsString::from("login")],
     };
-    run_command_with(run_args, environment, Some(preflight))
+    run_command_with(
+        run_args,
+        environment,
+        Some(preflight),
+        Some(Box::new(session_state)),
+    )
 }
 
-fn grok_tool_arguments(scrollback: bool, grok_args: Vec<OsString>) -> Vec<OsString> {
+fn grok_tool_arguments(
+    scrollback: bool,
+    resume: Option<Uuid>,
+    continue_session: bool,
+    grok_args: Vec<OsString>,
+) -> Vec<OsString> {
     let mut tool = vec![OsString::from("grok")];
     tool.extend(SAFE_GROK_ARGUMENTS.iter().map(OsString::from));
     if scrollback {
         tool.push(OsString::from("--minimal"));
     }
+    if let Some(session_id) = resume {
+        tool.push(OsString::from("--resume"));
+        tool.push(OsString::from(session_id.to_string()));
+    } else if continue_session {
+        tool.push(OsString::from("--continue"));
+    }
     tool.extend(grok_args);
     tool
+}
+
+fn reject_passthrough_session_controls(arguments: &[OsString]) -> Result<()> {
+    for argument in arguments {
+        let value = argument.to_string_lossy();
+        if matches!(value.as_ref(), "--resume" | "-r" | "--continue" | "-c")
+            || value.starts_with("--resume=")
+        {
+            bail!(
+                "pass session controls directly to Guard (`guard grok --resume ID` or `guard grok --continue`) so the private session snapshot can be restored first"
+            );
+        }
+    }
+    Ok(())
+}
+
+struct GrokSessionState {
+    store: GrokSessionStore,
+    stage: Stage,
+}
+
+impl GrokSessionState {
+    fn prepare(source: &Path, resume: Option<Uuid>) -> Result<Self> {
+        let source = fs::canonicalize(source)
+            .with_context(|| format!("resolve Grok session source {}", source.display()))?;
+        let store = GrokSessionStore::open(&source)?;
+        let empty;
+        let input = if let Some(snapshot) = store.current_snapshot()? {
+            snapshot
+        } else {
+            empty = tempfile::tempdir().context("create empty Grok session source")?;
+            fs::set_permissions(empty.path(), fs::Permissions::from_mode(0o700))?;
+            empty.path().to_path_buf()
+        };
+        let mut options = StageOptions::new(&input, session_policy()?);
+        options.synthetic_git = false;
+        let stage = Stage::build(options).context("validate stored Grok sessions")?;
+        ensure_clean_session_stage(&stage)?;
+        validate_session_layout(stage.workspace())?;
+        if let Some(session_id) = resume {
+            let session = stage
+                .workspace()
+                .join(GROK_SESSION_CWD)
+                .join(session_id.to_string());
+            let metadata = fs::symlink_metadata(&session).with_context(|| {
+                format!(
+                    "Grok session {session_id} is not stored for source {}",
+                    source.display()
+                )
+            })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                bail!("stored Grok session {session_id} is not a real directory");
+            }
+        }
+        Ok(Self { store, stage })
+    }
+}
+
+impl PersistentRunState for GrokSessionState {
+    fn writable_path(&self) -> &Path {
+        self.stage.workspace()
+    }
+
+    fn publish(self: Box<Self>) -> Result<()> {
+        let mut options = StageOptions::new(self.stage.workspace(), session_policy()?);
+        options.synthetic_git = false;
+        options.staging_base = Some(self.store.snapshots.clone());
+        let validated = Stage::build(options).context("validate returned Grok session state")?;
+        ensure_clean_session_stage(&validated)?;
+        let session_count = validate_session_layout(validated.workspace())?;
+        let snapshot_id = Uuid::new_v4();
+        let destination = self.store.snapshots.join(snapshot_id.to_string());
+        validated
+            .publish_workspace(&destination)
+            .context("publish validated Grok session snapshot")?;
+        self.store.activate(snapshot_id)?;
+        self.store.cleanup_old_snapshots(snapshot_id);
+        println!("grok sessions: {session_count} stored privately");
+        Ok(())
+    }
+}
+
+struct GrokSessionStore {
+    root: PathBuf,
+    snapshots: PathBuf,
+    previous: Option<Uuid>,
+}
+
+impl GrokSessionStore {
+    fn open(source: &Path) -> Result<Self> {
+        let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
+            .context("could not determine the application data directory")?;
+        Self::open_at(&project.data_local_dir().join("grok-sessions"), source)
+    }
+
+    fn open_at(base: &Path, source: &Path) -> Result<Self> {
+        let digest = Sha256::digest(source.as_os_str().as_bytes());
+        ensure_private_directory(base)?;
+        let root = base.join(hex::encode(digest));
+        ensure_private_directory(&root)?;
+        let snapshots = root.join("snapshots");
+        ensure_private_directory(&snapshots)?;
+        let mut store = Self {
+            root,
+            snapshots,
+            previous: None,
+        };
+        store.previous = store.read_current()?;
+        Ok(store)
+    }
+
+    fn current_snapshot(&self) -> Result<Option<PathBuf>> {
+        let Some(snapshot_id) = self.previous else {
+            return Ok(None);
+        };
+        let snapshot = self.snapshots.join(snapshot_id.to_string());
+        validate_private_directory(&snapshot)?;
+        Ok(Some(snapshot))
+    }
+
+    fn read_current(&self) -> Result<Option<Uuid>> {
+        let path = self.root.join("CURRENT");
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("open current Grok session snapshot"),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != current_uid()
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o077 != 0
+            || metadata.len() > 64
+        {
+            bail!("Grok session CURRENT pointer is not a private regular file");
+        }
+        let mut value = String::new();
+        file.read_to_string(&mut value)?;
+        Ok(Some(
+            Uuid::parse_str(value.trim()).context("parse Grok session CURRENT pointer")?,
+        ))
+    }
+
+    fn activate(&self, snapshot_id: Uuid) -> Result<()> {
+        let temporary = self.root.join(format!(".CURRENT-{snapshot_id}"));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)
+            .context("create temporary Grok session pointer")?;
+        use std::io::Write;
+        if let Err(error) = writeln!(file, "{snapshot_id}").and_then(|()| file.sync_all()) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).context("write Grok session pointer");
+        }
+        if let Err(error) = fs::rename(&temporary, self.root.join("CURRENT")) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).context("activate Grok session snapshot");
+        }
+        OpenOptions::new()
+            .read(true)
+            .open(&self.root)?
+            .sync_all()
+            .context("sync Grok session store")
+    }
+
+    fn cleanup_old_snapshots(&self, active: Uuid) {
+        let Ok(entries) = fs::read_dir(&self.snapshots) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(snapshot_id) = Uuid::parse_str(&name) else {
+                continue;
+            };
+            if snapshot_id == active || Some(snapshot_id) == self.previous {
+                continue;
+            }
+            let path = entry.path();
+            if fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                && let Err(error) = fs::remove_dir_all(&path)
+            {
+                eprintln!(
+                    "warning: could not remove old Grok session snapshot {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+fn session_policy() -> Result<CompiledPolicy> {
+    CompiledPolicy::with_user_policy(UserPolicy {
+        max_total_bytes: Some(SESSION_MAX_TOTAL_BYTES),
+        max_files: Some(SESSION_MAX_FILES),
+        ..UserPolicy::default()
+    })
+    .context("compile private Grok session policy")
+}
+
+fn ensure_clean_session_stage(stage: &Stage) -> Result<()> {
+    if let Some(excluded) = stage.manifest().excluded.first() {
+        bail!(
+            "Grok session state contains an unsafe path {} ({:?})",
+            excluded.path,
+            excluded.reason
+        );
+    }
+    Ok(())
+}
+
+fn validate_session_layout(root: &Path) -> Result<usize> {
+    let mut cwd = None;
+    for entry in fs::read_dir(root).context("inspect Grok session state root")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if name == GROK_SESSION_CWD {
+            if cwd.is_some() || !metadata.is_dir() || metadata.file_type().is_symlink() {
+                bail!("encoded Grok session workspace is not one real directory");
+            }
+            cwd = Some(entry.path());
+        } else if name == GROK_SESSION_INDEX {
+            require_private_session_file(&entry.path(), &metadata, GROK_SESSION_INDEX)?;
+        } else {
+            bail!("unexpected entry in Grok session state: {name:?}");
+        }
+    }
+    let Some(cwd) = cwd else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    for entry in fs::read_dir(cwd)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("Grok session ID is not valid UTF-8"))?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if name == GROK_PROMPT_HISTORY {
+            require_private_session_file(&entry.path(), &metadata, GROK_PROMPT_HISTORY)?;
+            continue;
+        }
+        Uuid::parse_str(&name)
+            .with_context(|| format!("invalid Grok session directory {name:?}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!("Grok session {name} is not a real directory");
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn require_private_session_file(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<()> {
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1 {
+        bail!(
+            "Grok session metadata {label} is not a singly linked regular file: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("create private directory {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure private directory {}", path.display()))?;
+    validate_private_directory(path)
+}
+
+fn validate_private_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect private directory {}", path.display()))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("private directory is unsafe: {}", path.display());
+    }
+    Ok(())
+}
+
+fn current_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and returns the current process's effective uid.
+    unsafe { libc::geteuid() }
 }
 
 struct GrokCredential {
@@ -446,11 +787,108 @@ mod tests {
 
     #[test]
     fn normal_ui_is_default_and_native_scrollback_is_opt_in() {
-        let normal = grok_tool_arguments(false, Vec::new());
-        let scrollback = grok_tool_arguments(true, Vec::new());
+        let normal = grok_tool_arguments(false, None, false, Vec::new());
+        let scrollback = grok_tool_arguments(true, None, false, Vec::new());
 
         assert!(!normal.contains(&OsString::from("--minimal")));
         assert!(scrollback.contains(&OsString::from("--minimal")));
         assert!(SAFE_GROK_ARGUMENTS.contains(&"--no-alt-screen"));
+    }
+
+    #[test]
+    fn grok_session_arguments_are_guard_owned() {
+        let session = Uuid::new_v4();
+        let resumed = grok_tool_arguments(false, Some(session), false, Vec::new());
+        assert!(resumed.windows(2).any(|values| {
+            values
+                == [
+                    OsString::from("--resume"),
+                    OsString::from(session.to_string()),
+                ]
+        }));
+        assert!(reject_passthrough_session_controls(&[OsString::from("--resume")]).is_err());
+        assert!(reject_passthrough_session_controls(&[OsString::from("--continue")]).is_err());
+    }
+
+    #[test]
+    fn private_session_snapshot_round_trips_through_validation() {
+        let data = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let source = fs::canonicalize(source.path()).unwrap();
+        let store = GrokSessionStore::open_at(data.path(), &source).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let mut options = StageOptions::new(empty.path(), session_policy().unwrap());
+        options.synthetic_git = false;
+        let stage = Stage::build(options).unwrap();
+        let session_id = Uuid::new_v4();
+        let session = stage
+            .workspace()
+            .join(GROK_SESSION_CWD)
+            .join(session_id.to_string());
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("summary.json"), b"{}\n").unwrap();
+        fs::write(stage.workspace().join(GROK_SESSION_INDEX), b"test-index\n").unwrap();
+        fs::write(
+            stage
+                .workspace()
+                .join(GROK_SESSION_CWD)
+                .join(GROK_PROMPT_HISTORY),
+            b"test prompt\n",
+        )
+        .unwrap();
+
+        Box::new(GrokSessionState { store, stage })
+            .publish()
+            .unwrap();
+
+        let reopened = GrokSessionStore::open_at(data.path(), &source).unwrap();
+        let snapshot = reopened.current_snapshot().unwrap().unwrap();
+        assert_eq!(
+            fs::read(
+                snapshot
+                    .join(GROK_SESSION_CWD)
+                    .join(session_id.to_string())
+                    .join("summary.json")
+            )
+            .unwrap(),
+            b"{}\n"
+        );
+        assert_eq!(validate_session_layout(&snapshot).unwrap(), 1);
+    }
+
+    #[test]
+    fn hostile_returned_session_link_is_never_published() {
+        let data = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let source = fs::canonicalize(source.path()).unwrap();
+        let store = GrokSessionStore::open_at(data.path(), &source).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let mut options = StageOptions::new(empty.path(), session_policy().unwrap());
+        options.synthetic_git = false;
+        let stage = Stage::build(options).unwrap();
+        let session = stage
+            .workspace()
+            .join(GROK_SESSION_CWD)
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&session).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", session.join("summary.json")).unwrap();
+
+        assert!(
+            Box::new(GrokSessionState { store, stage })
+                .publish()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn session_layout_rejects_non_uuid_and_extra_roots() {
+        let state = tempfile::tempdir().unwrap();
+        fs::create_dir(state.path().join("unexpected")).unwrap();
+        assert!(validate_session_layout(state.path()).is_err());
+
+        fs::remove_dir(state.path().join("unexpected")).unwrap();
+        fs::create_dir(state.path().join(GROK_SESSION_CWD)).unwrap();
+        fs::create_dir(state.path().join(GROK_SESSION_CWD).join("latest")).unwrap();
+        assert!(validate_session_layout(state.path()).is_err());
     }
 }

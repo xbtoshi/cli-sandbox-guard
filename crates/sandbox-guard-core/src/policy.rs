@@ -20,6 +20,10 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     ".ccb/**",
     "**/.ccb",
     "**/.ccb/**",
+    "sandbox-guard-inputs",
+    "sandbox-guard-inputs/**",
+    "**/sandbox-guard-inputs",
+    "**/sandbox-guard-inputs/**",
     ".env*",
     "**/.env*",
     ".dev.vars*",
@@ -170,34 +174,40 @@ impl CompiledPolicy {
     }
 
     pub fn load(path: Option<&Path>) -> Result<Self, PolicyError> {
-        let mut effective = EffectivePolicy::default();
-
-        if let Some(path) = path {
+        let user = if let Some(path) = path {
             let body = fs::read_to_string(path).map_err(|source| PolicyError::Read {
                 path: path.to_path_buf(),
                 source,
             })?;
-            let user: UserPolicy = toml::from_str(&body).map_err(|source| PolicyError::Parse {
+            toml::from_str(&body).map_err(|source| PolicyError::Parse {
                 path: path.to_path_buf(),
                 source,
-            })?;
+            })?
+        } else {
+            UserPolicy::default()
+        };
 
-            if let Some(version) = user.schema_version
-                && version != 1
-            {
-                return Err(PolicyError::UnsupportedSchema(version));
-            }
+        Self::with_user_policy(user)
+    }
 
-            effective.deny.extend(user.deny);
-            if let Some(value) = user.max_file_bytes {
-                effective.max_file_bytes = effective.max_file_bytes.min(value);
-            }
-            if let Some(value) = user.max_total_bytes {
-                effective.max_total_bytes = effective.max_total_bytes.min(value);
-            }
-            if let Some(value) = user.max_files {
-                effective.max_files = effective.max_files.min(value);
-            }
+    /// Compile an in-memory additive policy for trusted internal staging workflows.
+    pub fn with_user_policy(user: UserPolicy) -> Result<Self, PolicyError> {
+        if let Some(version) = user.schema_version
+            && version != 1
+        {
+            return Err(PolicyError::UnsupportedSchema(version));
+        }
+
+        let mut effective = EffectivePolicy::default();
+        effective.deny.extend(user.deny);
+        if let Some(value) = user.max_file_bytes {
+            effective.max_file_bytes = effective.max_file_bytes.min(value);
+        }
+        if let Some(value) = user.max_total_bytes {
+            effective.max_total_bytes = effective.max_total_bytes.min(value);
+        }
+        if let Some(value) = user.max_files {
+            effective.max_files = effective.max_files.min(value);
         }
 
         Self::compile(effective)
@@ -305,6 +315,8 @@ mod tests {
             ".ssh/config",
             "home/.aws/credentials",
             ".git/config",
+            "sandbox-guard-inputs/clipboard.png",
+            "nested/sandbox-guard-inputs/clipboard.png",
         ] {
             assert!(
                 policy.denied_by(Path::new(path)).is_some(),

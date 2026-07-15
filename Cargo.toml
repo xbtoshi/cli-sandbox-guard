@@ -23,6 +23,7 @@ ed25519-dalek = "2.2"
 globset = "0.4"
 hex = "0.4"
 ignore = "0.4"
+image = { version = "=0.25.9", default-features = false, features = ["png"] }
 libc = "0.2"
 rustix = { version = "1.0", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }

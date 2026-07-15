@@ -207,22 +207,31 @@ fn handle_connection(mut client: UnixStream, state: &ProxyState) -> Result<(), P
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalDecision {
     Deny,
+    DenySession,
+    DenyAlways,
     AllowOnce,
     AllowSession,
+    AllowAlways,
 }
 
 impl ApprovalDecision {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "DENY" => Some(Self::Deny),
+            "DENY_SESSION" => Some(Self::DenySession),
+            "DENY_ALWAYS" => Some(Self::DenyAlways),
             "ALLOW_ONCE" => Some(Self::AllowOnce),
             "ALLOW_SESSION" => Some(Self::AllowSession),
+            "ALLOW_ALWAYS" => Some(Self::AllowAlways),
             _ => None,
         }
     }
 
     fn is_allowed(self) -> bool {
-        matches!(self, Self::AllowOnce | Self::AllowSession)
+        matches!(
+            self,
+            Self::AllowOnce | Self::AllowSession | Self::AllowAlways
+        )
     }
 }
 
@@ -247,7 +256,8 @@ fn parse_approval_response(line: &str) -> Option<ApprovalResponse> {
 
 struct ApprovalBroker {
     prompt_lock: Mutex<()>,
-    session_hosts: Mutex<BTreeSet<(String, u16)>>,
+    allowed_session_hosts: Mutex<BTreeSet<(String, u16)>>,
+    denied_session_hosts: Mutex<BTreeSet<(String, u16)>>,
     responses: Mutex<mpsc::Receiver<ApprovalResponse>>,
     output: Mutex<Box<dyn Write + Send>>,
     next_id: AtomicU64,
@@ -278,7 +288,8 @@ impl ApprovalBroker {
         });
         Self {
             prompt_lock: Mutex::new(()),
-            session_hosts: Mutex::new(BTreeSet::new()),
+            allowed_session_hosts: Mutex::new(BTreeSet::new()),
+            denied_session_hosts: Mutex::new(BTreeSet::new()),
             responses: Mutex::new(receiver),
             output: Mutex::new(Box::new(output)),
             next_id: AtomicU64::new(1),
@@ -286,14 +297,20 @@ impl ApprovalBroker {
     }
 
     fn request(&self, host: &str, port: u16) -> Result<ApprovalDecision, ProxyError> {
-        if self.session_contains(host, port)? {
+        if self.denied_session_contains(host, port)? {
+            return Ok(ApprovalDecision::DenySession);
+        }
+        if self.allowed_session_contains(host, port)? {
             return Ok(ApprovalDecision::AllowSession);
         }
         let _prompt = self
             .prompt_lock
             .lock()
             .map_err(|_| ProxyError::ApprovalUnavailable)?;
-        if self.session_contains(host, port)? {
+        if self.denied_session_contains(host, port)? {
+            return Ok(ApprovalDecision::DenySession);
+        }
+        if self.allowed_session_contains(host, port)? {
             return Ok(ApprovalDecision::AllowSession);
         }
 
@@ -327,8 +344,19 @@ impl ApprovalBroker {
                 }
             }
         };
-        if decision == ApprovalDecision::AllowSession {
-            self.session_hosts
+        if matches!(
+            decision,
+            ApprovalDecision::AllowSession | ApprovalDecision::AllowAlways
+        ) {
+            self.allowed_session_hosts
+                .lock()
+                .map_err(|_| ProxyError::ApprovalUnavailable)?
+                .insert((host.to_owned(), port));
+        } else if matches!(
+            decision,
+            ApprovalDecision::DenySession | ApprovalDecision::DenyAlways
+        ) {
+            self.denied_session_hosts
                 .lock()
                 .map_err(|_| ProxyError::ApprovalUnavailable)?
                 .insert((host.to_owned(), port));
@@ -336,9 +364,17 @@ impl ApprovalBroker {
         Ok(decision)
     }
 
-    fn session_contains(&self, host: &str, port: u16) -> Result<bool, ProxyError> {
+    fn allowed_session_contains(&self, host: &str, port: u16) -> Result<bool, ProxyError> {
         Ok(self
-            .session_hosts
+            .allowed_session_hosts
+            .lock()
+            .map_err(|_| ProxyError::ApprovalUnavailable)?
+            .contains(&(host.to_owned(), port)))
+    }
+
+    fn denied_session_contains(&self, host: &str, port: u16) -> Result<bool, ProxyError> {
+        Ok(self
+            .denied_session_hosts
             .lock()
             .map_err(|_| ProxyError::ApprovalUnavailable)?
             .contains(&(host.to_owned(), port)))
@@ -825,13 +861,20 @@ mod tests {
     #[test]
     fn approval_protocol_rejects_ambiguous_or_unknown_decisions() {
         assert_eq!(
-            parse_approval_response("DECISION\t7\tALLOW_SESSION\n"),
+            parse_approval_response("DECISION\t7\tALLOW_ALWAYS\n"),
             Some(ApprovalResponse {
                 id: 7,
-                decision: ApprovalDecision::AllowSession,
+                decision: ApprovalDecision::AllowAlways,
             })
         );
-        assert!(parse_approval_response("DECISION\t7\tALLOW_ALWAYS").is_none());
+        assert_eq!(
+            parse_approval_response("DECISION\t8\tDENY_ALWAYS"),
+            Some(ApprovalResponse {
+                id: 8,
+                decision: ApprovalDecision::DenyAlways,
+            })
+        );
+        assert!(parse_approval_response("DECISION\t7\tALLOW_FOREVER").is_none());
         assert!(parse_approval_response("DECISION\t7\tDENY\textra").is_none());
         assert!(parse_approval_response("REQUEST\t7\tDENY").is_none());
     }
@@ -873,6 +916,28 @@ mod tests {
         );
         let mut unexpected = [0_u8; 1];
         assert!(host.read(&mut unexpected).is_err());
+    }
+
+    #[test]
+    fn remembered_denial_is_cached_for_the_exact_host() {
+        let (mut host, proxy) = UnixStream::pair().unwrap();
+        let broker = Arc::new(ApprovalBroker::with_io(proxy.try_clone().unwrap(), proxy));
+        let request_broker = Arc::clone(&broker);
+        let request =
+            thread::spawn(move || request_broker.request("metrics.example", 443).unwrap());
+
+        let mut line = String::new();
+        BufReader::new(host.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "REQUEST\t1\tmetrics.example\t443\n");
+        host.write_all(b"DECISION\t1\tDENY_ALWAYS\n").unwrap();
+        assert_eq!(request.join().unwrap(), ApprovalDecision::DenyAlways);
+
+        assert_eq!(
+            broker.request("metrics.example", 443).unwrap(),
+            ApprovalDecision::DenySession
+        );
     }
 
     #[test]

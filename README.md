@@ -61,23 +61,40 @@ Pass Grok arguments after `--`, for example:
     guard grok -- --model grok-build
     guard grok -- -p "review this repository"
     guard grok --scrollback
+    guard grok --continue
+    guard grok --resume 019f6389-2b2e-7b62-a650-2ff38c4b926e
 
 `guard grok` is a thin application adapter over the vendor-neutral staging and runner core. It
 always selects controlled egress to `cli-chat-proxy.grok.com`, disables Grok web search and memory,
 keeps Grok's normal UI in inline terminal mode, and runs `grok login` as an isolated preflight
 inside the disposable synthetic home. Unknown HTTPS destinations trigger a trusted host-native
-approval dialog with deny, allow-once, and allow-for-session choices; `--no-egress-prompts` keeps
-the original fixed allowlist for automation or stricter sessions. If the normal TUI captures
-terminal selection, the optional `--scrollback` flag selects Grok's experimental native-scrollback
-renderer; that renderer makes ordinary selection possible but uses a visibly different
-pinned-region layout. The host refresh token and `~/.grok/auth.json` are never copied into the
-workspace or Lima guest.
+approval dialog with deny, allow-once, and allow-for-session choices. The dialog can remember an
+exact-host allow or deny for later Guard sessions; `guard approvals` lists those choices, while
+`guard approvals --forget HOST` and `guard approvals --clear` remove them. `--no-egress-prompts`
+keeps the original fixed allowlist for automation or stricter sessions. Guard suppresses Grok's
+terminal mouse-reporting modes, so normal drag selection and terminal copy work in the regular TUI;
+keyboard interaction remains unchanged. The optional `--scrollback` flag still selects Grok's
+experimental native-scrollback renderer, which uses a visibly different pinned-region layout. The
+host refresh token and `~/.grok/auth.json` are never copied into the workspace or Lima guest.
+
+On macOS, pressing `Ctrl+V` in an interactive Guard session explicitly imports one image from the
+native clipboard. Guard decodes and re-encodes it as PNG under strict size and pixel limits, places
+it in a per-run read-only `sandbox-guard-inputs` inbox, and pastes an `@` file reference into the
+CLI. Guard never polls the clipboard. The inbox is removed before change export or Grok session
+publication and disappears when the run ends. Normal terminal `Cmd+V` text paste is unchanged.
 
 Guard reads only the current short-lived OAuth access token from an owner-only, singly linked
 host auth file. When it is stale, Guard first asks the host Grok CLI to perform a silent refresh in
 its built-in `strict` profile from an empty private working directory. If browser login is needed,
 Guard prints the normal Grok login flow. The resulting access token travels through Guard's
 private environment file; only the environment-variable names appear in the audit.
+
+Grok conversation state is handled separately from credentials. Guard exposes only a private,
+Guard-owned staged copy of `/home/guard/.grok/sessions`, validates the returned tree with the same
+descriptor-safe policy layer, and atomically publishes a snapshot keyed to the canonical source
+directory. It never mounts the host `~/.grok` directory. Use `--continue` for the latest stored
+conversation or `--resume SESSION_ID` for a specific one. Sessions created before this feature, or
+outside Guard, are not imported automatically.
 
 An access token is a credential intentionally given to the confined Grok process. Relaunch
 `guard grok` after a long-running session reaches the token's expiry; live refresh brokerage is
@@ -154,10 +171,14 @@ For Grok installed as `/opt/sandbox-guard/tools/grok`, the final command becomes
 
 For `guard run`, Guard automatically requests a Lima PTY when both host standard input and output
 are terminals, so interactive prompts, typing, and paste work without changing the isolation
-policy. Interactive runs receive a fixed `TERM=xterm-256color` so line editing and bracketed paste
-work without forwarding host terminal environment. Automation, pipelines, setup commands, and
-`guard test` keep TTY allocation disabled. Bubblewrap still creates a new session to prevent
-terminal injection into host processes.
+policy. Guard owns a narrow host-side PTY broker for interactive runs: it synchronizes window size,
+intercepts only raw `Ctrl+V` for explicit clipboard-image import, blocks host-sensitive OSC
+clipboard controls and opaque terminal-multiplexer passthrough from the untrusted tool, and
+suppresses terminal mouse reporting so host selection and copy remain available. Interactive runs
+receive a fixed
+`TERM=xterm-256color` so line editing and bracketed paste work without forwarding host terminal
+environment. Automation, pipelines, setup commands, and `guard test` keep TTY allocation disabled.
+Bubblewrap still creates a new session to prevent terminal injection into host processes.
 
 Before every run, the backend starts Lima with `--mount-none`, inspects guest mounts, and refuses
 known 9p, VirtioFS, and SSHFS host shares. It copies only the sanitized workspace and a private
@@ -197,12 +218,18 @@ destinations—not URLs, headers, or credentials—are written to the run audit.
 
 `--ask-egress` carries approval requests over a private protocol pipe from the trusted proxy to a
 host-native dialog. The untrusted tool never receives approval input. A grant is always for the
-exact requested hostname on port 443 and is either one CONNECT or the current Guard session; there
-is no permanent grant. Dialog cancellation, timeout, malformed protocol, missing native UI, and
+exact requested hostname on port 443 and can cover one CONNECT, the current Guard session, or
+future sessions when the user explicitly remembers the choice. Remembered allow and deny choices
+live in an owner-only Guard data file outside every staged or sandbox-writable tree. Dialog
+cancellation, timeout, malformed protocol, missing native UI, persistence failure, and
 noninteractive execution all fail closed. Native prompts are serialized and capped at 16 per run
 to bound prompt flooding. Approval decisions are recorded separately in the audit. On macOS Guard
 uses the system dialog service. On Linux it uses `zenity` when available; otherwise the request is
 denied so the tool cannot impersonate a trusted prompt in the shared terminal.
+
+Because TLS remains end-to-end, the dialog can show and enforce the CONNECT hostname and port but
+cannot show the full URL, HTTP method, headers, or body. Guard states that limitation in the prompt
+instead of pretending to inspect encrypted request details.
 
 Proxy handshakes have wall-clock deadlines, established tunnels have idle timeouts, and both the
 trusted proxy and sandbox relay cap concurrent connections.
