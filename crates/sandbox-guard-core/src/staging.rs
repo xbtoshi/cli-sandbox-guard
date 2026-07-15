@@ -919,7 +919,8 @@ mod tests {
         let stage = Stage::build(options).unwrap();
         let destination = staging.path().join("published");
 
-        assert_eq!(stage.publish_workspace(&destination).unwrap(), destination);
+        let published = stage.publish_workspace(&destination).unwrap();
+        assert_eq!(published, fs::canonicalize(&destination).unwrap());
         assert_eq!(fs::read(destination.join("summary.json")).unwrap(), b"{}\n");
     }
 
