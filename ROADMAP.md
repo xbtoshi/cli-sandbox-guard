@@ -63,8 +63,8 @@ We will not adopt these weaker postures:
 
 ## Phase 0: publishable v0.3 alpha
 
-- [ ] Bump the release candidate version and create a signed Git tag.
-- [ ] Publish checksummed macOS ARM64 and Linux x86-64/ARM64 binaries.
+- [x] Set the release candidate version and create a signed Git tag.
+- [x] Publish checksummed macOS ARM64 and Linux x86-64/ARM64 binaries.
 - [x] Verify that release artifacts contain the exact binaries tested in CI.
 - [x] Add installation, upgrade, rollback, and removal instructions.
 - [x] Run and record live Bubblewrap and Lima hostile-fixture tests against the release artifacts.
