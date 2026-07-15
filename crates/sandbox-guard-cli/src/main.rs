@@ -86,6 +86,10 @@ struct RunArgs {
     #[arg(long = "allow-host", value_name = "HOST")]
     allow_hosts: Vec<String>,
 
+    /// Ask through a trusted native dialog before allowing a new HTTPS host for this session.
+    #[arg(long)]
+    ask_egress: bool,
+
     /// Forward an environment variable by name. Values are never written to the audit log.
     #[arg(long = "forward-env", value_name = "NAME")]
     forward_env: Vec<String>,
@@ -352,6 +356,9 @@ fn run_command_with(
             "--network unrestricted exposes services reachable from the backend network; repeat with --allow-unrestricted-network to acknowledge this residual risk"
         );
     }
+    if args.ask_egress && network != NetworkMode::Controlled {
+        bail!("--ask-egress requires --network controlled");
+    }
     if args.dry_run && args.export_changes.is_some() {
         bail!("--export-changes cannot be combined with --dry-run");
     }
@@ -392,6 +399,12 @@ fn run_command_with(
     )?;
     let backend: BackendKind = args.backend.into();
     let resolved_backend = backend.resolve()?;
+    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    if args.ask_egress && !interactive {
+        eprintln!(
+            "warning: interactive egress approval is unavailable without a terminal; unknown destinations remain denied"
+        );
+    }
     let request = RunRequest {
         workspace: stage.workspace().to_path_buf(),
         run_id: stage.manifest().run_id.to_string(),
@@ -401,9 +414,10 @@ fn run_command_with(
             tool_root: args.tool_root,
         },
         preflight,
-        interactive: io::stdin().is_terminal() && io::stdout().is_terminal(),
+        interactive,
         network,
         allowed_egress_hosts: args.allow_hosts.clone(),
+        interactive_egress_approval: args.ask_egress && interactive,
         forwarded_env,
         resource_limits,
         cgroup_mode: args.cgroup.into(),
@@ -629,6 +643,7 @@ fn test_command(args: TestArgs) -> Result<i32> {
         interactive: false,
         network: NetworkMode::Denied,
         allowed_egress_hosts: vec![],
+        interactive_egress_approval: false,
         forwarded_env: vec![],
         resource_limits: ResourceLimits::default(),
         cgroup_mode: if args.require_cgroup {
@@ -677,6 +692,7 @@ fn test_command(args: TestArgs) -> Result<i32> {
         interactive: false,
         network: NetworkMode::Denied,
         allowed_egress_hosts: Vec::new(),
+        interactive_egress_approval: false,
         forwarded_env: Vec::new(),
         resource_limits: request.resource_limits,
         cgroup_mode: request.cgroup_mode,
@@ -704,6 +720,7 @@ fn test_command(args: TestArgs) -> Result<i32> {
         interactive: false,
         network: NetworkMode::Controlled,
         allowed_egress_hosts: vec!["allowed.example.invalid".to_owned()],
+        interactive_egress_approval: false,
         forwarded_env: vec![],
         resource_limits: request.resource_limits,
         cgroup_mode: request.cgroup_mode,
@@ -918,8 +935,12 @@ fn persist_run_audit(
         tool: tool.to_string_lossy().into_owned(),
         forwarded_environment_names: environment_names.to_vec(),
         allowed_egress_hosts: request.allowed_egress_hosts.clone(),
+        interactive_egress_approval: request.interactive_egress_approval,
         egress_audit: outcome
             .map(|outcome| outcome.egress_audit.clone())
+            .unwrap_or_default(),
+        egress_approvals: outcome
+            .map(|outcome| outcome.egress_approvals.clone())
             .unwrap_or_default(),
         resource_limits: ResourceLimitRecord {
             memory_bytes: limits.memory_bytes,

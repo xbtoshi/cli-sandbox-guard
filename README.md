@@ -65,10 +65,13 @@ Pass Grok arguments after `--`, for example:
 `guard grok` is a thin application adapter over the vendor-neutral staging and runner core. It
 always selects controlled egress to `cli-chat-proxy.grok.com`, disables Grok web search and memory,
 keeps Grok's normal UI in inline terminal mode, and runs `grok login` as an isolated preflight
-inside the disposable synthetic home. If the normal TUI captures terminal selection, the optional
-`--scrollback` flag selects Grok's experimental native-scrollback renderer; that renderer makes
-ordinary selection possible but uses a visibly different pinned-region layout. The host refresh
-token and `~/.grok/auth.json` are never copied into the workspace or Lima guest.
+inside the disposable synthetic home. Unknown HTTPS destinations trigger a trusted host-native
+approval dialog with deny, allow-once, and allow-for-session choices; `--no-egress-prompts` keeps
+the original fixed allowlist for automation or stricter sessions. If the normal TUI captures
+terminal selection, the optional `--scrollback` flag selects Grok's experimental native-scrollback
+renderer; that renderer makes ordinary selection possible but uses a visibly different
+pinned-region layout. The host refresh token and `~/.grok/auth.json` are never copied into the
+workspace or Lima guest.
 
 Guard reads only the current short-lived OAuth access token from an owner-only, singly linked
 host auth file. When it is stale, Guard first asks the host Grok CLI to perform a silent refresh in
@@ -178,11 +181,28 @@ proxy:
       --forward-env OPENAI_API_KEY \
       -- my-ai-cli
 
+Interactive sessions can ask Guard to approve an otherwise denied HTTPS hostname without stopping
+the tool or editing policy:
+
+    guard run --network controlled \
+      --allow-host api.openai.com \
+      --ask-egress \
+      -- my-ai-cli
+
 `--allow-host` accepts an exact hostname or a `*.subdomain.example` suffix. The proxy permits only
 HTTP CONNECT to port 443, resolves outside the sandbox, rejects loopback/private/link-local/
 metadata/documentation/transition addresses, connects to the validated IP, and requires the first
 TLS ClientHello record to contain SNI exactly matching the CONNECT hostname. Successful
 destinations—not URLs, headers, or credentials—are written to the run audit.
+
+`--ask-egress` carries approval requests over a private protocol pipe from the trusted proxy to a
+host-native dialog. The untrusted tool never receives approval input. A grant is always for the
+exact requested hostname on port 443 and is either one CONNECT or the current Guard session; there
+is no permanent grant. Dialog cancellation, timeout, malformed protocol, missing native UI, and
+noninteractive execution all fail closed. Native prompts are serialized and capped at 16 per run
+to bound prompt flooding. Approval decisions are recorded separately in the audit. On macOS Guard
+uses the system dialog service. On Linux it uses `zenity` when available; otherwise the request is
+denied so the tool cannot impersonate a trusted prompt in the shared terminal.
 
 Proxy handshakes have wall-clock deadlines, established tunnels have idle timeouts, and both the
 trusted proxy and sandbox relay cap concurrent connections.

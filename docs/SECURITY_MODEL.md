@@ -25,6 +25,8 @@ The current trusted computing base is:
 - Bubblewrap and the system runtime files mounted into the sandbox;
 - systemd and cgroup v2 when cgroup enforcement is selected;
 - the trusted controlled-egress proxy running outside the tool's network namespace;
+- the host-side native approval controller and its private proxy protocol when interactive egress
+  approval is enabled;
 - on macOS, Lima, its hypervisor, SSH/rsync transport, and the dedicated Linux guest.
 
 The `guard grok` adapter additionally trusts the host Grok authentication subcommand only while
@@ -76,12 +78,20 @@ explicitly for one run.
   connected through a filesystem UNIX socket to the trusted proxy outside that network namespace.
 - Only CONNECT to configured port 443 is accepted.
 - Hostnames are normalized and must match an exact or explicit wildcard-suffix rule.
+- Optional interactive grants cross a private stdio pipe owned by the trusted proxy transport, not
+  the tool terminal. The host revalidates an exact normalized hostname and port 443 before showing
+  a native dialog. Grants are one CONNECT or one Guard session and never add wildcard rules.
+- Cancellation, timeout, malformed protocol, missing native UI, and noninteractive execution deny
+  the request. Linux requires `zenity`; Guard does not accept approval input through the untrusted
+  tool's shared terminal. Prompts are serialized and capped at 16 per run; excess requests deny
+  without another prompt.
 - DNS resolution occurs in the trusted namespace. Loopback, private, carrier-grade NAT,
   link-local, metadata, documentation, multicast, transition, and other selected non-public ranges
   are discarded. The proxy connects directly to the validated resolved address.
 - The first TLS record must be a ClientHello whose SNI exactly equals the CONNECT hostname before
   any client bytes are sent upstream.
-- The audit contains only a timestamp and successful destination hostname/port.
+- The destination audit contains only a timestamp and successful hostname/port. A separate approval
+  audit records hostname/port and deny, allow-once, or allow-session—not URLs or payloads.
 - Handshakes have wall-clock deadlines, tunnels have idle timeouts, and concurrent proxy/relay
   connections are bounded.
 
@@ -101,8 +111,10 @@ every intentionally forwarded credential to an allowlisted service.
 - The guest receives only the short-lived access token through the existing private environment
   transport. A preflight hydrates the disposable synthetic home through Grok's documented external
   auth-provider interface before the main Grok process starts.
-- Egress is fixed to controlled HTTPS access for `cli-chat-proxy.grok.com`; the adapter does not
-  accept additional destinations or unrestricted networking.
+- Egress starts with controlled HTTPS access for `cli-chat-proxy.grok.com`. Interactive runs may
+  grant an exact additional hostname once or for that Guard session through the trusted native
+  approval controller; `--no-egress-prompts` restores the fixed allowlist. The adapter never offers
+  unrestricted networking or permanent grants.
 
 ## Resource and syscall controls
 
@@ -163,6 +175,9 @@ from this store and does not automatically re-verify them before every run.
 - Controlled egress supports proxy-aware HTTPS clients only. It requires a single-record initial
   ClientHello with SNI, does not perform TLS interception or certificate verification for the
   client, and cannot restrict URL paths or tenants behind an allowed shared endpoint.
+- Interactive approval identifies the requested hostname and port, not the executable or HTTP
+  path responsible for the request. The tool can choose misleading hostnames and can send any data
+  it can access after approval; users must approve only destinations they expected.
 - Unrestricted mode exposes the selected host or Lima-guest network namespace, including loopback,
   private/LAN networks, cloud metadata, and Linux abstract UNIX sockets. Abstract sockets are not
   covered by filesystem isolation and may provide a code-execution path in that namespace.

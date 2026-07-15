@@ -76,7 +76,11 @@ pub struct RunRecord {
     pub tool: String,
     pub forwarded_environment_names: Vec<String>,
     pub allowed_egress_hosts: Vec<String>,
+    #[serde(default)]
+    pub interactive_egress_approval: bool,
     pub egress_audit: Vec<String>,
+    #[serde(default)]
+    pub egress_approvals: Vec<String>,
     pub resource_limits: ResourceLimitRecord,
     pub cgroup_enforced: bool,
     pub seccomp_enforced: bool,

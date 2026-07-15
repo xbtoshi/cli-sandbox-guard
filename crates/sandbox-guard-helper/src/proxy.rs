@@ -1,11 +1,12 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -16,6 +17,10 @@ const MAX_TLS_RECORD_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_APPROVAL_PROMPTS: u64 = 16;
+// Native dialogs give up after 60 seconds. Leave transport headroom so the explicit denial can
+// still reach the proxy instead of becoming a stale response for a later request.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -24,6 +29,7 @@ pub struct ProxyConfig {
     pub allow_hosts: Vec<String>,
     pub allow_port: u16,
     pub connect_timeout: Duration,
+    pub approval_stdio: bool,
 }
 
 pub fn run_proxy(config: ProxyConfig) -> Result<(), ProxyError> {
@@ -81,6 +87,7 @@ pub fn run_proxy(config: ProxyConfig) -> Result<(), ProxyError> {
         allowlist,
         allow_port: config.allow_port,
         connect_timeout: config.connect_timeout,
+        approval: config.approval_stdio.then(ApprovalBroker::stdio),
         audit: Mutex::new(audit),
         active_connections: AtomicUsize::new(0),
     });
@@ -117,6 +124,7 @@ struct ProxyState {
     allowlist: Vec<AllowedHost>,
     allow_port: u16,
     connect_timeout: Duration,
+    approval: Option<ApprovalBroker>,
     audit: Mutex<File>,
     active_connections: AtomicUsize,
 }
@@ -146,7 +154,19 @@ fn handle_connection(mut client: UnixStream, state: &ProxyState) -> Result<(), P
         return Err(ProxyError::InvalidRequest);
     }
     let (host, port) = parse_authority(authority)?;
-    if port != state.allow_port || !state.allowlist.iter().any(|entry| entry.matches(&host)) {
+    if port != state.allow_port {
+        reject(&mut client, "destination denied")?;
+        return Err(ProxyError::DestinationDenied { host, port });
+    }
+    let allowlisted = state.allowlist.iter().any(|entry| entry.matches(&host));
+    let approved = if allowlisted {
+        true
+    } else if let Some(approval) = &state.approval {
+        approval.request(&host, port)?.is_allowed()
+    } else {
+        false
+    };
+    if !approved {
         reject(&mut client, "destination denied")?;
         return Err(ProxyError::DestinationDenied { host, port });
     }
@@ -182,6 +202,147 @@ fn handle_connection(mut client: UnixStream, state: &ProxyState) -> Result<(), P
     record_destination(&state.audit, &sni, port)?;
     tunnel(client, upstream)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDecision {
+    Deny,
+    AllowOnce,
+    AllowSession,
+}
+
+impl ApprovalDecision {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "DENY" => Some(Self::Deny),
+            "ALLOW_ONCE" => Some(Self::AllowOnce),
+            "ALLOW_SESSION" => Some(Self::AllowSession),
+            _ => None,
+        }
+    }
+
+    fn is_allowed(self) -> bool {
+        matches!(self, Self::AllowOnce | Self::AllowSession)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApprovalResponse {
+    id: u64,
+    decision: ApprovalDecision,
+}
+
+fn parse_approval_response(line: &str) -> Option<ApprovalResponse> {
+    let mut fields = line.trim_end_matches(['\r', '\n']).split('\t');
+    if fields.next()? != "DECISION" {
+        return None;
+    }
+    let id = fields.next()?.parse().ok()?;
+    let decision = ApprovalDecision::parse(fields.next()?)?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(ApprovalResponse { id, decision })
+}
+
+struct ApprovalBroker {
+    prompt_lock: Mutex<()>,
+    session_hosts: Mutex<BTreeSet<(String, u16)>>,
+    responses: Mutex<mpsc::Receiver<ApprovalResponse>>,
+    output: Mutex<Box<dyn Write + Send>>,
+    next_id: AtomicU64,
+}
+
+impl ApprovalBroker {
+    fn stdio() -> Self {
+        Self::with_io(io::stdin(), io::stdout())
+    }
+
+    fn with_io<R, W>(input: R, output: W) -> Self
+    where
+        R: Read + Send + 'static,
+        W: Write + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel(64);
+        thread::spawn(move || {
+            for line in BufReader::new(input).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if let Some(response) = parse_approval_response(&line)
+                    && sender.send(response).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            prompt_lock: Mutex::new(()),
+            session_hosts: Mutex::new(BTreeSet::new()),
+            responses: Mutex::new(receiver),
+            output: Mutex::new(Box::new(output)),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn request(&self, host: &str, port: u16) -> Result<ApprovalDecision, ProxyError> {
+        if self.session_contains(host, port)? {
+            return Ok(ApprovalDecision::AllowSession);
+        }
+        let _prompt = self
+            .prompt_lock
+            .lock()
+            .map_err(|_| ProxyError::ApprovalUnavailable)?;
+        if self.session_contains(host, port)? {
+            return Ok(ApprovalDecision::AllowSession);
+        }
+
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if id > MAX_APPROVAL_PROMPTS {
+            return Ok(ApprovalDecision::Deny);
+        }
+        {
+            let mut output = self
+                .output
+                .lock()
+                .map_err(|_| ProxyError::ApprovalUnavailable)?;
+            writeln!(output, "REQUEST\t{id}\t{host}\t{port}").map_err(ProxyError::Connection)?;
+            output.flush().map_err(ProxyError::Connection)?;
+        }
+
+        let deadline = Instant::now() + APPROVAL_TIMEOUT;
+        let receiver = self
+            .responses
+            .lock()
+            .map_err(|_| ProxyError::ApprovalUnavailable)?;
+        let decision = loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break ApprovalDecision::Deny;
+            };
+            match receiver.recv_timeout(remaining) {
+                Ok(response) if response.id == id => break response.decision,
+                Ok(_) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                    break ApprovalDecision::Deny;
+                }
+            }
+        };
+        if decision == ApprovalDecision::AllowSession {
+            self.session_hosts
+                .lock()
+                .map_err(|_| ProxyError::ApprovalUnavailable)?
+                .insert((host.to_owned(), port));
+        }
+        Ok(decision)
+    }
+
+    fn session_contains(&self, host: &str, port: u16) -> Result<bool, ProxyError> {
+        Ok(self
+            .session_hosts
+            .lock()
+            .map_err(|_| ProxyError::ApprovalUnavailable)?
+            .contains(&(host.to_owned(), port)))
+    }
 }
 
 fn read_http_header(stream: &mut UnixStream) -> Result<Vec<u8>, ProxyError> {
@@ -598,12 +759,16 @@ pub enum ProxyError {
     Connection(io::Error),
     #[error("proxy audit lock was poisoned")]
     AuditPoisoned,
+    #[error("interactive egress approval channel is unavailable")]
+    ApprovalUnavailable,
     #[error("proxy relay thread panicked")]
     RelayPanicked,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader};
+
     use super::*;
 
     #[test]
@@ -655,6 +820,59 @@ mod tests {
         assert!(parse_authority("api.example.com").is_err());
         assert!(parse_authority("api.example.com:443:80").is_err());
         assert!(parse_authority("api.example.com%0d:443").is_err());
+    }
+
+    #[test]
+    fn approval_protocol_rejects_ambiguous_or_unknown_decisions() {
+        assert_eq!(
+            parse_approval_response("DECISION\t7\tALLOW_SESSION\n"),
+            Some(ApprovalResponse {
+                id: 7,
+                decision: ApprovalDecision::AllowSession,
+            })
+        );
+        assert!(parse_approval_response("DECISION\t7\tALLOW_ALWAYS").is_none());
+        assert!(parse_approval_response("DECISION\t7\tDENY\textra").is_none());
+        assert!(parse_approval_response("REQUEST\t7\tDENY").is_none());
+    }
+
+    #[test]
+    fn session_approval_is_applied_once_then_cached_for_the_exact_host() {
+        let (mut host, proxy) = UnixStream::pair().unwrap();
+        let broker = Arc::new(ApprovalBroker::with_io(proxy.try_clone().unwrap(), proxy));
+        let request_broker = Arc::clone(&broker);
+        let request = thread::spawn(move || request_broker.request("docs.rs", 443).unwrap());
+
+        let mut line = String::new();
+        BufReader::new(host.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "REQUEST\t1\tdocs.rs\t443\n");
+        host.write_all(b"DECISION\t1\tALLOW_SESSION\n").unwrap();
+        assert_eq!(request.join().unwrap(), ApprovalDecision::AllowSession);
+
+        assert_eq!(
+            broker.request("docs.rs", 443).unwrap(),
+            ApprovalDecision::AllowSession
+        );
+    }
+
+    #[test]
+    fn approval_prompt_budget_fails_closed_without_emitting_another_request() {
+        let (mut host, proxy) = UnixStream::pair().unwrap();
+        host.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let broker = ApprovalBroker::with_io(proxy.try_clone().unwrap(), proxy);
+        broker
+            .next_id
+            .store(MAX_APPROVAL_PROMPTS + 1, Ordering::Relaxed);
+
+        assert_eq!(
+            broker.request("docs.rs", 443).unwrap(),
+            ApprovalDecision::Deny
+        );
+        let mut unexpected = [0_u8; 1];
+        assert!(host.read(&mut unexpected).is_err());
     }
 
     #[test]

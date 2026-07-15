@@ -39,6 +39,8 @@ struct ProxyArgs {
     allow_port: u16,
     #[arg(long, default_value_t = 30)]
     connect_timeout_seconds: u64,
+    #[arg(long)]
+    approval_stdio: bool,
 }
 
 #[derive(Debug, Args)]
@@ -118,6 +120,7 @@ fn execute(cli: Cli) -> Result<i32> {
                 allow_hosts: args.allow_hosts,
                 allow_port: args.allow_port,
                 connect_timeout: Duration::from_secs(args.connect_timeout_seconds),
+                approval_stdio: args.approval_stdio,
             })?;
             Ok(0)
         }

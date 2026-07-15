@@ -97,6 +97,10 @@ pub(super) struct GrokArgs {
     #[arg(long)]
     scrollback: bool,
 
+    /// Keep egress fixed to Grok's API host without native prompts for additional HTTPS hosts.
+    #[arg(long)]
+    no_egress_prompts: bool,
+
     /// Additional Grok arguments. Place them after the double dash.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     grok_args: Vec<OsString>,
@@ -128,6 +132,7 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
         network: NetworkArg::Controlled,
         allow_unrestricted_network: false,
         allow_hosts: vec![GROK_PROXY_HOST.to_owned()],
+        ask_egress: !args.no_egress_prompts,
         forward_env: Vec::new(),
         tool_root: None,
         lima_instance: args.lima_instance,

@@ -8,6 +8,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::approval::ApprovalController;
 use crate::linux::{
     cgroup_probe_args, guest_bwrap_args, guest_helper_path, network_warnings, wrap_guest_cgroup,
     write_environment_file,
@@ -115,7 +116,7 @@ impl MacosLimaRunner {
                 verify_retrieval_canary(request, &canary)
             });
         let egress_audit = read_guest_egress_audit(&limactl, request, &guest_root);
-        stop_proxy(&mut proxy);
+        let egress_approvals = stop_proxy(&mut proxy);
         let cleanup_result = cleanup_guest(&limactl, request, &guest_root);
         retrieve_result?;
         cleanup_result?;
@@ -127,6 +128,7 @@ impl MacosLimaRunner {
             cgroup_enforced: use_cgroup,
             seccomp_enforced: true,
             egress_audit,
+            egress_approvals,
         })
     }
 }
@@ -423,21 +425,42 @@ fn start_guest_proxy(
         args.push(OsString::from("--allow-host"));
         args.push(host.into());
     }
+    if request.interactive_egress_approval {
+        args.push(OsString::from("--approval-stdio"));
+    }
     let mut command = Command::new(limactl);
     command
         .args(args)
-        // The long-lived proxy transport runs beside the interactive sandbox command. It must
-        // never compete with that command for bytes from the host terminal.
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
         // Lima launches an SSH child. A private process group lets Drop terminate both processes
         // if a run exits normally, errors, or is interrupted.
         .process_group(0);
-    let child = command.spawn().map_err(|source| RunnerError::Execute {
+    if request.interactive_egress_approval {
+        // This private pipe carries only the trusted helper's approval protocol. It never shares
+        // terminal input with the untrusted interactive command.
+        command.stdin(Stdio::piped()).stdout(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null()).stdout(Stdio::null());
+    }
+    let mut child = command.spawn().map_err(|source| RunnerError::Execute {
         program: limactl.to_path_buf(),
         source,
     })?;
-    let mut proxy = GuestProxyProcess { child };
+    let approval = if request.interactive_egress_approval {
+        let requests = child.stdout.take().ok_or_else(|| {
+            RunnerError::SetupFailed("Lima approval request pipe was not created".to_owned())
+        })?;
+        let responses = child.stdin.take().ok_or_else(|| {
+            RunnerError::SetupFailed("Lima approval response pipe was not created".to_owned())
+        })?;
+        Some(ApprovalController::start(requests, responses))
+    } else {
+        None
+    };
+    let mut proxy = GuestProxyProcess {
+        child,
+        approval,
+        stopped: false,
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(status) = proxy
@@ -492,10 +515,16 @@ fn start_guest_proxy(
 
 struct GuestProxyProcess {
     child: Child,
+    approval: Option<ApprovalController>,
+    stopped: bool,
 }
 
-impl Drop for GuestProxyProcess {
-    fn drop(&mut self) {
+impl GuestProxyProcess {
+    fn stop(&mut self) -> Vec<String> {
+        if self.stopped {
+            return Vec::new();
+        }
+        self.stopped = true;
         let process_group = -(self.child.id() as i32);
         // SAFETY: the child was spawned as the leader of its own process group. Killing the group
         // prevents Lima's SSH transport from surviving after the limactl parent is reaped.
@@ -503,11 +532,24 @@ impl Drop for GuestProxyProcess {
             libc::kill(process_group, libc::SIGKILL);
         }
         let _ = self.child.wait();
+        self.approval
+            .take()
+            .map(ApprovalController::finish)
+            .unwrap_or_default()
     }
 }
 
-fn stop_proxy(proxy: &mut Option<GuestProxyProcess>) {
-    drop(proxy.take());
+impl Drop for GuestProxyProcess {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn stop_proxy(proxy: &mut Option<GuestProxyProcess>) -> Vec<String> {
+    proxy
+        .as_mut()
+        .map(GuestProxyProcess::stop)
+        .unwrap_or_default()
 }
 
 fn resolve_guest_cgroup(
@@ -676,6 +718,7 @@ mod tests {
             interactive: false,
             network: NetworkMode::Denied,
             allowed_egress_hosts: Vec::new(),
+            interactive_egress_approval: false,
             forwarded_env: Vec::new(),
             resource_limits: ResourceLimits::default(),
             cgroup_mode: CgroupMode::BestEffort,

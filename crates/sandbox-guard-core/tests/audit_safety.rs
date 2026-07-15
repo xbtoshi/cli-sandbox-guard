@@ -26,7 +26,9 @@ fn persisted_run_audit_never_contains_a_forwarded_secret_value() {
             .map(|(name, _)| name.clone())
             .collect(),
         allowed_egress_hosts: vec![],
+        interactive_egress_approval: false,
         egress_audit: vec![],
+        egress_approvals: vec![],
         resource_limits: ResourceLimitRecord {
             memory_bytes: 1024,
             max_file_bytes: 1024,

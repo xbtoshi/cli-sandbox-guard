@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use sandbox_guard_helper::EnvironmentEntry;
 use tempfile::{Builder as TempBuilder, TempDir};
 
+use crate::approval::ApprovalController;
 use crate::{
     BackendKind, CgroupMode, CommandPlan, NetworkMode, RunOutcome, RunRequest, RunnerError,
     path_is_within,
@@ -75,11 +76,12 @@ impl LinuxBwrapRunner {
         let helper = resolve_host_helper(request)?;
         let workspace = canonical_workspace(request)?;
         let runtime = RuntimeDirectory::new(&workspace, &request.forwarded_env)?;
-        let proxy = if request.network == NetworkMode::Controlled {
+        let mut proxy = if request.network == NetworkMode::Controlled {
             Some(ProxyProcess::start(
                 &helper,
                 &runtime,
                 &request.allowed_egress_hosts,
+                request.interactive_egress_approval,
             )?)
         } else {
             None
@@ -94,7 +96,7 @@ impl LinuxBwrapRunner {
                 program: plan.program.clone(),
                 source,
             })?;
-        drop(proxy);
+        let egress_approvals = proxy.as_mut().map(ProxyProcess::stop).unwrap_or_default();
         let egress_audit = fs::read_to_string(&runtime.audit_log)
             .unwrap_or_default()
             .lines()
@@ -107,6 +109,7 @@ impl LinuxBwrapRunner {
             cgroup_enforced: use_cgroup,
             seccomp_enforced: true,
             egress_audit,
+            egress_approvals,
         })
     }
 }
@@ -187,6 +190,8 @@ pub(crate) fn write_environment_file(
 
 struct ProxyProcess {
     child: Child,
+    approval: Option<ApprovalController>,
+    stopped: bool,
 }
 
 impl ProxyProcess {
@@ -194,6 +199,7 @@ impl ProxyProcess {
         helper: &Path,
         runtime: &RuntimeDirectory,
         allowed_hosts: &[String],
+        interactive_approval: bool,
     ) -> Result<Self, RunnerError> {
         let mut command = Command::new(helper);
         command
@@ -201,8 +207,15 @@ impl ProxyProcess {
             .arg("--socket")
             .arg(&runtime.socket)
             .arg("--audit-log")
-            .arg(&runtime.audit_log)
-            .stdout(Stdio::null());
+            .arg(&runtime.audit_log);
+        if interactive_approval {
+            command
+                .arg("--approval-stdio")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+        } else {
+            command.stdin(Stdio::null()).stdout(Stdio::null());
+        }
         for host in allowed_hosts {
             command.arg("--allow-host").arg(host);
         }
@@ -210,12 +223,32 @@ impl ProxyProcess {
             program: helper.to_path_buf(),
             source,
         })?;
+        let approval = if interactive_approval {
+            let requests = child.stdout.take().ok_or_else(|| {
+                RunnerError::SetupFailed("egress approval request pipe was not created".to_owned())
+            })?;
+            let responses = child.stdin.take().ok_or_else(|| {
+                RunnerError::SetupFailed("egress approval response pipe was not created".to_owned())
+            })?;
+            Some(ApprovalController::start(requests, responses))
+        } else {
+            None
+        };
+        let mut proxy = Self {
+            child,
+            approval,
+            stopped: false,
+        };
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(status) = child.try_wait().map_err(|source| RunnerError::Execute {
-                program: helper.to_path_buf(),
-                source,
-            })? {
+            if let Some(status) = proxy
+                .child
+                .try_wait()
+                .map_err(|source| RunnerError::Execute {
+                    program: helper.to_path_buf(),
+                    source,
+                })?
+            {
                 return Err(RunnerError::HelperFailed(format!(
                     "egress proxy exited with {status}"
                 )));
@@ -232,22 +265,32 @@ impl ProxyProcess {
                 break;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
                 return Err(RunnerError::HelperFailed(
                     "egress proxy did not become ready".to_owned(),
                 ));
             }
             thread::sleep(Duration::from_millis(10));
         }
-        Ok(Self { child })
+        Ok(proxy)
+    }
+
+    fn stop(&mut self) -> Vec<String> {
+        if self.stopped {
+            return Vec::new();
+        }
+        self.stopped = true;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.approval
+            .take()
+            .map(ApprovalController::finish)
+            .unwrap_or_default()
     }
 }
 
 impl Drop for ProxyProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.stop();
     }
 }
 
@@ -745,6 +788,7 @@ mod tests {
             } else {
                 vec![]
             },
+            interactive_egress_approval: false,
             forwarded_env: vec![("GROK_TOKEN".to_owned(), "secret".to_owned())],
             resource_limits: crate::ResourceLimits::default(),
             cgroup_mode: CgroupMode::BestEffort,

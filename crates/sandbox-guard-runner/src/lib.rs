@@ -3,6 +3,7 @@
 //! Both backends run against a disposable staged workspace. Network access is denied by default;
 //! controlled proxy egress or deliberately noisy unrestricted networking is recorded in audit.
 
+mod approval;
 mod linux;
 mod macos;
 
@@ -91,6 +92,8 @@ pub struct RunRequest {
     pub interactive: bool,
     pub network: NetworkMode,
     pub allowed_egress_hosts: Vec<String>,
+    /// Ask through a trusted host-native dialog for exact HTTPS destinations not pre-allowed.
+    pub interactive_egress_approval: bool,
     pub forwarded_env: Vec<(String, String)>,
     pub resource_limits: ResourceLimits,
     pub cgroup_mode: CgroupMode,
@@ -107,6 +110,7 @@ pub struct RunOutcome {
     pub cgroup_enforced: bool,
     pub seccomp_enforced: bool,
     pub egress_audit: Vec<String>,
+    pub egress_approvals: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +218,11 @@ fn validate_request(request: &RunRequest) -> Result<(), RunnerError> {
             return Err(RunnerError::EgressHostsWithoutControlledMode);
         }
         _ => {}
+    }
+    if request.interactive_egress_approval
+        && (request.network != NetworkMode::Controlled || !request.interactive)
+    {
+        return Err(RunnerError::InvalidInteractiveEgressApproval);
     }
     for (name, _) in &request.forwarded_env {
         validate_forwarded_environment_name(name)?;
@@ -329,6 +338,8 @@ pub enum RunnerError {
     ControlledEgressWithoutHosts,
     #[error("--allow-host is valid only with controlled network mode")]
     EgressHostsWithoutControlledMode,
+    #[error("interactive egress approval requires an interactive controlled-network run")]
+    InvalidInteractiveEgressApproval,
     #[error("required cgroup v2 delegation through systemd-run is unavailable")]
     CgroupUnavailable,
     #[error("runtime helper failed before the sandbox started: {0}")]
@@ -368,6 +379,7 @@ mod tests {
             interactive: false,
             network: NetworkMode::Denied,
             allowed_egress_hosts: vec![],
+            interactive_egress_approval: false,
             forwarded_env: vec![],
             resource_limits: ResourceLimits::default(),
             cgroup_mode: CgroupMode::BestEffort,
@@ -412,6 +424,22 @@ mod tests {
             ("OPENAI_API_KEY".to_owned(), "secret".to_owned()),
             ("GROK_TOKEN".to_owned(), "secret".to_owned()),
         ];
+        validate_request(&request).unwrap();
+    }
+
+    #[test]
+    fn interactive_egress_approval_requires_an_interactive_controlled_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut request = request(workspace.path());
+        request.interactive_egress_approval = true;
+        assert!(matches!(
+            validate_request(&request),
+            Err(RunnerError::InvalidInteractiveEgressApproval)
+        ));
+
+        request.interactive = true;
+        request.network = NetworkMode::Controlled;
+        request.allowed_egress_hosts = vec!["api.example.com".to_owned()];
         validate_request(&request).unwrap();
     }
 
