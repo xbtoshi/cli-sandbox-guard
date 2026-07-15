@@ -19,12 +19,7 @@ const GROK_PROXY_HOST: &str = "cli-chat-proxy.grok.com";
 const GROK_SESSION_TOKEN: &str = "GROK_SESSION_TOKEN";
 const GROK_AUTH_PROVIDER_COMMAND: &str = "GROK_AUTH_PROVIDER_COMMAND";
 const AUTH_PROVIDER_COMMAND: &str = "printf '%s\\n' \"$GROK_SESSION_TOKEN\"";
-const SAFE_GROK_ARGUMENTS: &[&str] = &[
-    "--disable-web-search",
-    "--no-memory",
-    "--minimal",
-    "--no-alt-screen",
-];
+const SAFE_GROK_ARGUMENTS: &[&str] = &["--disable-web-search", "--no-memory", "--no-alt-screen"];
 const MINIMUM_TOKEN_VALIDITY_MINUTES: i64 = 10;
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -98,6 +93,10 @@ pub(super) struct GrokArgs {
     #[arg(long)]
     reauthenticate: bool,
 
+    /// Use Grok's experimental native-scrollback renderer for ordinary terminal selection.
+    #[arg(long)]
+    scrollback: bool,
+
     /// Additional Grok arguments. Place them after the double dash.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     grok_args: Vec<OsString>,
@@ -119,9 +118,7 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
             .format("%Y-%m-%d %H:%M:%S %z")
     );
 
-    let mut tool = vec![OsString::from("grok")];
-    tool.extend(SAFE_GROK_ARGUMENTS.iter().map(OsString::from));
-    tool.extend(args.grok_args);
+    let tool = grok_tool_arguments(args.scrollback, args.grok_args);
 
     let run_args = RunArgs {
         source: args.source,
@@ -160,6 +157,16 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
         args: vec![OsString::from("login")],
     };
     run_command_with(run_args, environment, Some(preflight))
+}
+
+fn grok_tool_arguments(scrollback: bool, grok_args: Vec<OsString>) -> Vec<OsString> {
+    let mut tool = vec![OsString::from("grok")];
+    tool.extend(SAFE_GROK_ARGUMENTS.iter().map(OsString::from));
+    if scrollback {
+        tool.push(OsString::from("--minimal"));
+    }
+    tool.extend(grok_args);
+    tool
 }
 
 struct GrokCredential {
@@ -433,8 +440,12 @@ mod tests {
     }
 
     #[test]
-    fn safe_defaults_use_native_scrollback_for_selection() {
-        assert!(SAFE_GROK_ARGUMENTS.contains(&"--minimal"));
+    fn normal_ui_is_default_and_native_scrollback_is_opt_in() {
+        let normal = grok_tool_arguments(false, Vec::new());
+        let scrollback = grok_tool_arguments(true, Vec::new());
+
+        assert!(!normal.contains(&OsString::from("--minimal")));
+        assert!(scrollback.contains(&OsString::from("--minimal")));
         assert!(SAFE_GROK_ARGUMENTS.contains(&"--no-alt-screen"));
     }
 }
