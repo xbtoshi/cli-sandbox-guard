@@ -711,14 +711,17 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guard"
-version = "0.2.0-alpha.1"
+version = "0.3.0-alpha.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "directories",
+ "libc",
  "sandbox-guard-core",
  "sandbox-guard-helper",
  "sandbox-guard-runner",
+ "serde",
  "serde_json",
  "tempfile",
  "uuid",
@@ -727,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guard-core"
-version = "0.2.0-alpha.1"
+version = "0.3.0-alpha.1"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -748,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guard-helper"
-version = "0.2.0-alpha.1"
+version = "0.3.0-alpha.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -761,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-guard-runner"
-version = "0.2.0-alpha.1"
+version = "0.3.0-alpha.1"
 dependencies = [
  "libc",
  "sandbox-guard-helper",

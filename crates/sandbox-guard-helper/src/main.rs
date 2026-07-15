@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use sandbox_guard_helper::{
     ControlledProxyProbeConfig, ProbeConfig, ProxyConfig, ResourceLimits, SuperviseConfig,
-    run_controlled_proxy_probe, run_probe, run_proxy, supervise, verify_current_cgroup,
+    SupervisedCommand, run_controlled_proxy_probe, run_probe, run_proxy, supervise,
+    verify_current_cgroup,
 };
 
 #[derive(Debug, Parser)]
@@ -58,6 +59,10 @@ struct SuperviseArgs {
     max_processes: u64,
     #[arg(long, default_value_t = 200)]
     cpu_percent: u64,
+    #[arg(long)]
+    preflight_command: Option<OsString>,
+    #[arg(long = "preflight-arg", allow_hyphen_values = true)]
+    preflight_args: Vec<OsString>,
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<OsString>,
 }
@@ -117,6 +122,9 @@ fn execute(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Supervise(args) => {
+            if args.preflight_command.is_none() && !args.preflight_args.is_empty() {
+                bail!("--preflight-arg requires --preflight-command");
+            }
             let (command, command_args) = args
                 .command
                 .split_first()
@@ -133,6 +141,10 @@ fn execute(cli: Cli) -> Result<i32> {
                 environment_file: args.environment,
                 proxy_socket: args.proxy_socket,
                 limits,
+                preflight: args.preflight_command.map(|command| SupervisedCommand {
+                    command,
+                    args: args.preflight_args,
+                }),
                 command: command.clone(),
                 args: command_args.to_vec(),
             })?;

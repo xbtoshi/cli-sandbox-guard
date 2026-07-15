@@ -75,10 +75,20 @@ pub struct ToolSpec {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProcessSpec {
+    pub command: OsString,
+    pub args: Vec<OsString>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunRequest {
     pub workspace: PathBuf,
     pub run_id: String,
     pub tool: ToolSpec,
+    /// Optional setup command executed under the same isolation and limits before the tool.
+    pub preflight: Option<ProcessSpec>,
+    /// Allocate an interactive terminal for backends whose transport requires an explicit PTY.
+    pub interactive: bool,
     pub network: NetworkMode,
     pub allowed_egress_hosts: Vec<String>,
     pub forwarded_env: Vec<(String, String)>,
@@ -146,6 +156,13 @@ fn validate_request(request: &RunRequest) -> Result<(), RunnerError> {
     }
     if request.tool.command.is_empty() {
         return Err(RunnerError::EmptyToolCommand);
+    }
+    if request
+        .preflight
+        .as_ref()
+        .is_some_and(|preflight| preflight.command.is_empty())
+    {
+        return Err(RunnerError::EmptyPreflightCommand);
     }
     if uuid::Uuid::parse_str(&request.run_id)
         .ok()
@@ -280,6 +297,8 @@ pub enum RunnerError {
     WorkspaceMissing(PathBuf),
     #[error("tool command cannot be empty")]
     EmptyToolCommand,
+    #[error("preflight command cannot be empty")]
+    EmptyPreflightCommand,
     #[error("run ID must be a canonical UUID: {0:?}")]
     InvalidRunId(String),
     #[error("invalid Lima instance name: {0:?}")]
@@ -345,6 +364,8 @@ mod tests {
                 args: vec![],
                 tool_root: None,
             },
+            preflight: None,
+            interactive: false,
             network: NetworkMode::Denied,
             allowed_egress_hosts: vec![],
             forwarded_env: vec![],
@@ -431,6 +452,20 @@ mod tests {
         assert!(matches!(
             validate_request(&request),
             Err(RunnerError::InvalidResourceLimits)
+        ));
+    }
+
+    #[test]
+    fn empty_preflight_command_fails_before_backend_setup() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut request = request(workspace.path());
+        request.preflight = Some(ProcessSpec {
+            command: OsString::new(),
+            args: Vec::new(),
+        });
+        assert!(matches!(
+            validate_request(&request),
+            Err(RunnerError::EmptyPreflightCommand)
         ));
     }
 

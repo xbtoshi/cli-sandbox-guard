@@ -1,6 +1,6 @@
 # Security policy
 
-Sandbox Guard is currently a version 0.2 alpha prototype. No version is declared production-ready.
+Sandbox Guard is currently a version 0.3 alpha prototype. No version is declared production-ready.
 
 Please use GitHub private vulnerability reporting for suspected vulnerabilities. Include:
 

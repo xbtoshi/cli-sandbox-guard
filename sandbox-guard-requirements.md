@@ -1,6 +1,6 @@
 # AI-CLI Sandbox Guard — Requirements & Blockers
 
-**Status**: version 0.2 alpha as of 2026-07-15. The shared Rust layer now implements fail-closed
+**Status**: version 0.3 alpha as of 2026-07-15. The shared Rust layer now implements fail-closed
 staging, isolated execution, controlled HTTPS egress, credential-file delivery, focused seccomp,
 resource controls, reviewable change export, and offline signature-verified tool installation. It
 is not yet a production security boundary; the open items below remain release gates.
@@ -10,6 +10,10 @@ is not yet a production security boundary; the open items below remain release g
 ## Goal
 
 Prevent AI coding CLIs (grok, codex, opencode) from reading sensitive files (`.env*`, `.dev.vars*`, `id_rsa*`, `~/.ssh/`, `~/.aws/credentials`, `credentials.json`, user-editable denylist) — even when those tools auto-upload the workspace to their vendor cloud.
+
+The built-in policy additionally covers portable private-key, wallet, cloud/CLI credential-store,
+GnuPG, password-store, Keychain, netrc, and package-manager credential patterns. Enforcement rules
+are source-relative and contain no host-specific absolute paths.
 
 ## Current implementation scope
 
@@ -153,9 +157,11 @@ label in place:
 - **Wrapper binary**: root-owned in `/usr/local/libexec/sensitive-guard/bin/`, verifies own SHA256 against `/etc/sensitive-guard/wrapper.sha256` on startup
 - **Privileged installer**: separate root-only binary that handles updates; verifies signer identity + pinned key fingerprints from `/etc/sensitive-guard/keys/`
 - **Egress proxy**: minimal HTTP(S) forward proxy running in host netns, allow-listed by destination hostname
-- **Current CLI surface**: `guard run <tool> [args]`, `guard tool install|verify`, `guard doctor`,
-  `guard test`, `guard policy`, `guard gc`. A constrained network updater remains a target, not a
-  current command.
+- **Current CLI surface**: `guard grok`, `guard run <tool> [args]`,
+  `guard tool install|verify`, `guard doctor`, `guard test`, `guard policy`, `guard gc`. The Grok
+  adapter composes the shared runner with fixed controlled egress, private short-lived OAuth
+  delivery, and an isolated login preflight. A constrained network updater and live credential
+  refresh broker remain targets, not current commands.
 
 ## Rollout
 

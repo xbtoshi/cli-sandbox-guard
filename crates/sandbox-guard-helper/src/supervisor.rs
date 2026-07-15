@@ -8,7 +8,9 @@ use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+#[cfg(target_os = "linux")]
+use std::process::Command;
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -20,12 +22,21 @@ use thiserror::Error;
 use crate::{EnvironmentEntry, PROXY_ENVIRONMENT, ResourceLimits};
 
 const MAX_CONCURRENT_RELAYS: usize = 64;
+#[cfg(any(target_os = "linux", test))]
+const SAFE_BASE_ENVIRONMENT: &[&str] = &["HOME", "PATH", "LANG", "TERM"];
+
+#[derive(Debug, Clone)]
+pub struct SupervisedCommand {
+    pub command: OsString,
+    pub args: Vec<OsString>,
+}
 
 #[derive(Debug, Clone)]
 pub struct SuperviseConfig {
     pub environment_file: PathBuf,
     pub proxy_socket: Option<PathBuf>,
     pub limits: ResourceLimits,
+    pub preflight: Option<SupervisedCommand>,
     pub command: OsString,
     pub args: Vec<OsString>,
 }
@@ -40,14 +51,46 @@ pub fn supervise(config: SuperviseConfig) -> Result<ExitStatus, SupervisorError>
         None
     };
 
-    let mut command = Command::new(&config.command);
-    command.args(&config.args).env_clear();
-    for name in ["HOME", "PATH", "LANG"] {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(preflight) = &config.preflight {
+            let status =
+                run_supervised_command(preflight, &environment, relay.as_ref(), config.limits)?;
+            if !status.success() {
+                drop(relay);
+                return Ok(status);
+            }
+        }
+        let command = SupervisedCommand {
+            command: config.command,
+            args: config.args,
+        };
+        let status = run_supervised_command(&command, &environment, relay.as_ref(), config.limits)?;
+        drop(relay);
+        Ok(status)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (environment, relay, config);
+        Err(SupervisorError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_supervised_command(
+    spec: &SupervisedCommand,
+    environment: &[EnvironmentEntry],
+    relay: Option<&Relay>,
+    limits: ResourceLimits,
+) -> Result<ExitStatus, SupervisorError> {
+    let mut command = Command::new(&spec.command);
+    command.args(&spec.args).env_clear();
+    for name in SAFE_BASE_ENVIRONMENT {
         if let Some(value) = env::var_os(name) {
             command.env(name, value);
         }
     }
-    if let Some(relay) = &relay {
+    if let Some(relay) = relay {
         let proxy = format!("http://127.0.0.1:{}", relay.port);
         for name in PROXY_ENVIRONMENT {
             command.env(name, &proxy);
@@ -55,26 +98,13 @@ pub fn supervise(config: SuperviseConfig) -> Result<ExitStatus, SupervisorError>
         command.env("NO_PROXY", "").env("no_proxy", "");
     }
     for entry in environment {
-        command.env(entry.name, entry.value);
+        command.env(&entry.name, &entry.value);
     }
-
-    #[cfg(target_os = "linux")]
-    {
-        configure_linux_child(&mut command, config.limits);
-        let status = command
-            .status()
-            .map_err(|source| SupervisorError::Execute {
-                command: config.command,
-                source,
-            })?;
-        drop(relay);
-        Ok(status)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (command, relay, config.limits);
-        Err(SupervisorError::UnsupportedPlatform)
-    }
+    configure_linux_child(&mut command, limits);
+    command.status().map_err(|source| SupervisorError::Execute {
+        command: spec.command.clone(),
+        source,
+    })
 }
 
 fn read_environment(path: &PathBuf) -> Result<Vec<EnvironmentEntry>, SupervisorError> {
@@ -140,6 +170,7 @@ fn safe_environment_name(name: &str) -> bool {
 }
 
 struct Relay {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     port: u16,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -609,6 +640,7 @@ mod tests {
             assert!(!safe_environment_name(name));
         }
         assert!(safe_environment_name("OPENAI_API_KEY"));
+        assert!(SAFE_BASE_ENVIRONMENT.contains(&"TERM"));
     }
 
     #[test]
@@ -626,5 +658,28 @@ mod tests {
         .unwrap();
         let entries = read_environment(&path).unwrap();
         assert_eq!(entries[0].value, "not-in-argv");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_preflight_prevents_the_main_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let environment = directory.path().join("environment.json");
+        fs::write(&environment, b"[]").unwrap();
+        let marker = directory.path().join("main-ran");
+        let status = supervise(SuperviseConfig {
+            environment_file: environment,
+            proxy_socket: None,
+            limits: ResourceLimits::default(),
+            preflight: Some(SupervisedCommand {
+                command: OsString::from("/bin/false"),
+                args: Vec::new(),
+            }),
+            command: OsString::from("/usr/bin/touch"),
+            args: vec![marker.as_os_str().to_owned()],
+        })
+        .unwrap();
+        assert!(!status.success());
+        assert!(!marker.exists());
     }
 }

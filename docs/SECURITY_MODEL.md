@@ -27,6 +27,11 @@ The current trusted computing base is:
 - the trusted controlled-egress proxy running outside the tool's network namespace;
 - on macOS, Lima, its hypervisor, SSH/rsync transport, and the dedicated Linux guest.
 
+The `guard grok` adapter additionally trusts the host Grok authentication subcommand only while
+it is confined by Grok's built-in `strict` profile to an empty private working directory and its
+own configuration state. Guard does not run an agent in that host-side authentication process.
+The vendor-neutral staging and execution path does not otherwise depend on Grok-specific state.
+
 On macOS, the dedicated guest must contain no host filesystem mounts or durable credentials. It is
 part of the trusted computing base. Vendor credentials should be short-lived and forwarded
 explicitly for one run.
@@ -56,6 +61,9 @@ explicitly for one run.
   JAVA, and LUA are rejected.
 - Forwarded credential values travel in a singly created mode-`0600` file inside a mode-`0700`
   runtime directory. They are not command arguments and are structurally absent from run audits.
+- An optional preflight command runs under the same cleared environment, namespaces, resource
+  scope, seccomp setup, and controlled-egress policy as the main tool. A non-zero preflight status
+  prevents the main tool from starting.
 - The trusted supervisor is non-dumpable, gives the child no new privileges, sets a restrictive
   umask and rlimits, then installs seccomp in the untrusted child before `exec`.
 - Capabilities are dropped and PID, IPC, UTS, user, and cgroup namespaces are separated.
@@ -80,6 +88,21 @@ explicitly for one run.
 These controls constrain destinations, not information flow to an allowed destination. The proxy
 does not inspect HTTP paths or encrypted payloads. A malicious tool can send all staged content and
 every intentionally forwarded credential to an allowlisted service.
+
+## Grok adapter invariants
+
+- `guard grok` accepts only an owner-owned, owner-private, singly linked regular
+  `~/.grok/auth.json` no larger than 1 MiB and extracts only the newest unexpired OIDC access token.
+- The host auth file, refresh token, Grok configuration, logs, and home directory are never staged
+  or mounted into the sandbox.
+- An expired credential is refreshed by a non-agent host Grok command using the built-in `strict`
+  profile and an empty mode-`0700` working directory. Browser login is used only when silent
+  refresh is unavailable.
+- The guest receives only the short-lived access token through the existing private environment
+  transport. A preflight hydrates the disposable synthetic home through Grok's documented external
+  auth-provider interface before the main Grok process starts.
+- Egress is fixed to controlled HTTPS access for `cli-chat-proxy.grok.com`; the adapter does not
+  accept additional destinations or unrestricted networking.
 
 ## Resource and syscall controls
 
@@ -129,7 +152,7 @@ process-memory syscall, compares every configured rlimit, and exercises controll
 This protects the offline install operation only. The current runner does not require tools to come
 from this store and does not automatically re-verify them before every run.
 
-## Explicit limitations in version 0.2 alpha
+## Explicit limitations in version 0.3 alpha
 
 - The seccomp policy is a focused deny profile, not a maintained OCI allowlist. Compatibility and
   coverage still require testing against each real vendor CLI and its subprocesses.
@@ -162,6 +185,9 @@ from this store and does not automatically re-verify them before every run.
 - Kernel, hypervisor, Bubblewrap, Git, Lima, systemd, and trusted-helper vulnerabilities are outside
   the promised boundary.
 - A credential intentionally forwarded to a malicious tool can be stolen or misused by that tool.
+- `guard grok` does not yet provide live refresh brokerage. A session that outlives its short-lived
+  access token must exit and relaunch so Guard can obtain a fresh token. The access token is
+  intentionally visible to Grok and its child processes, though the refresh token is not.
 
 These limitations are release gates, not hidden assumptions. The
 [requirements register](../sandbox-guard-requirements.md) tracks historical blockers and remaining

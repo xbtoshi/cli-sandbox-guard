@@ -337,6 +337,11 @@ fn build_bwrap_args(
         push(&mut args, name);
         push(&mut args, value);
     }
+    if request.interactive {
+        push(&mut args, "--setenv");
+        push(&mut args, "TERM");
+        push(&mut args, "xterm-256color");
+    }
     args.extend(supervisor_args(
         request,
         helper_guest,
@@ -433,6 +438,11 @@ pub(crate) fn guest_bwrap_args(
         push(&mut args, name);
         push(&mut args, value);
     }
+    if request.interactive {
+        push(&mut args, "--setenv");
+        push(&mut args, "TERM");
+        push(&mut args, "xterm-256color");
+    }
     args.extend(supervisor_args(
         request,
         helper,
@@ -469,6 +479,18 @@ fn supervisor_args(
     ] {
         push(&mut args, name);
         args.push(value.to_string().into());
+    }
+    if let Some(preflight) = &request.preflight {
+        push(&mut args, "--preflight-command");
+        args.push(if preflight.command == request.tool.command {
+            tool_command.clone()
+        } else {
+            preflight.command.clone()
+        });
+        for argument in &preflight.args {
+            push(&mut args, "--preflight-arg");
+            args.push(argument.clone());
+        }
     }
     push(&mut args, "--");
     args.push(tool_command);
@@ -704,7 +726,7 @@ pub(crate) fn network_warnings(mode: NetworkMode, boundary: &str) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ToolSpec;
+    use crate::{ProcessSpec, ToolSpec};
 
     fn request(workspace: &Path, network: NetworkMode) -> RunRequest {
         RunRequest {
@@ -715,6 +737,8 @@ mod tests {
                 args: vec![OsString::from("--version")],
                 tool_root: None,
             },
+            preflight: None,
+            interactive: false,
             network,
             allowed_egress_hosts: if network == NetworkMode::Controlled {
                 vec!["api.example.com".to_owned()]
@@ -751,6 +775,29 @@ mod tests {
     }
 
     #[test]
+    fn interactive_guest_plan_sets_only_a_fixed_safe_terminal_type() {
+        let workspace = Path::new("/tmp/guard-test/workspace");
+        let mut request = request(workspace, NetworkMode::Denied);
+        request.interactive = true;
+        let args = guest_bwrap_args(
+            &request,
+            workspace,
+            Path::new("/tmp/guard-test"),
+            Path::new("/usr/local/bin/guard-helper"),
+        );
+        let strings: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            strings
+                .windows(3)
+                .any(|window| { window == ["--setenv", "TERM", "xterm-256color"] })
+        );
+    }
+
+    #[test]
     fn controlled_mode_keeps_network_namespace_and_uses_proxy_socket() {
         let workspace = Path::new("/tmp/guard-test/workspace");
         let args = guest_bwrap_args(
@@ -763,6 +810,36 @@ mod tests {
         assert!(strings.iter().any(|arg| arg == "--unshare-net"));
         assert!(strings.iter().any(|arg| arg == "--proxy-socket"));
         assert!(strings.iter().any(|arg| arg == GUEST_PROXY_SOCKET));
+    }
+
+    #[test]
+    fn supervisor_plan_encodes_a_preflight_without_a_shell() {
+        let workspace = Path::new("/tmp/guard-test/workspace");
+        let mut request = request(workspace, NetworkMode::Denied);
+        request.preflight = Some(ProcessSpec {
+            command: OsString::from("grok"),
+            args: vec![OsString::from("login")],
+        });
+        let args = guest_bwrap_args(
+            &request,
+            workspace,
+            Path::new("/tmp/guard-test/runtime"),
+            Path::new("/usr/local/bin/guard-helper"),
+        );
+        let strings: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            strings
+                .windows(2)
+                .any(|window| { window == ["--preflight-command", "grok"] })
+        );
+        assert!(
+            strings
+                .windows(2)
+                .any(|window| { window == ["--preflight-arg", "login"] })
+        );
     }
 
     #[test]

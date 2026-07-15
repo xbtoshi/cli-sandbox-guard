@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -34,7 +35,7 @@ impl MacosLimaRunner {
             wrap_guest_cgroup(request, bwrap_args)
         };
         let mut args = vec![
-            OsString::from("--tty=false"),
+            OsString::from(lima_main_tty_arg(request)),
             OsString::from("shell"),
             OsString::from(&request.lima_instance),
             OsString::from("--"),
@@ -94,7 +95,7 @@ impl MacosLimaRunner {
             command
         };
         let mut shell_args = vec![
-            OsString::from("--tty=false"),
+            OsString::from(lima_main_tty_arg(request)),
             OsString::from("shell"),
             OsString::from(&request.lima_instance),
             OsString::from("--"),
@@ -307,6 +308,7 @@ fn prepare_guest_root(
     request: &RunRequest,
     guest_root: &Path,
 ) -> Result<(), RunnerError> {
+    let workspace = guest_root.join("workspace");
     run_checked(
         limactl,
         shell_command(
@@ -315,10 +317,12 @@ fn prepare_guest_root(
                 OsString::from("mkdir"),
                 OsString::from("-m"),
                 OsString::from("700"),
+                OsString::from("--"),
                 guest_root.into(),
+                workspace.into_os_string(),
             ],
         ),
-        "create private Lima guest runtime",
+        "create private Lima guest runtime and workspace",
     )?;
     Ok(())
 }
@@ -328,7 +332,7 @@ fn copy_workspace_and_environment(
     request: &RunRequest,
     guest_root: &Path,
 ) -> Result<(), RunnerError> {
-    let copy_target = format!("{}:{}", request.lima_instance, guest_root.display());
+    let copy_target = guest_workspace_copy_target(request, guest_root);
     run_checked(
         limactl,
         [
@@ -403,7 +407,7 @@ fn start_guest_proxy(
     request: &RunRequest,
     guest_root: &Path,
     helper: &Path,
-) -> Result<Child, RunnerError> {
+) -> Result<GuestProxyProcess, RunnerError> {
     let mut args = shell_command(
         request,
         [
@@ -419,20 +423,31 @@ fn start_guest_proxy(
         args.push(OsString::from("--allow-host"));
         args.push(host.into());
     }
-    let mut child = Command::new(limactl)
+    let mut command = Command::new(limactl);
+    command
         .args(args)
+        // The long-lived proxy transport runs beside the interactive sandbox command. It must
+        // never compete with that command for bytes from the host terminal.
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .spawn()
-        .map_err(|source| RunnerError::Execute {
-            program: limactl.to_path_buf(),
-            source,
-        })?;
+        // Lima launches an SSH child. A private process group lets Drop terminate both processes
+        // if a run exits normally, errors, or is interrupted.
+        .process_group(0);
+    let child = command.spawn().map_err(|source| RunnerError::Execute {
+        program: limactl.to_path_buf(),
+        source,
+    })?;
+    let mut proxy = GuestProxyProcess { child };
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(status) = child.try_wait().map_err(|source| RunnerError::Execute {
-            program: limactl.to_path_buf(),
-            source,
-        })? {
+        if let Some(status) = proxy
+            .child
+            .try_wait()
+            .map_err(|source| RunnerError::Execute {
+                program: limactl.to_path_buf(),
+                source,
+            })?
+        {
             return Err(RunnerError::HelperFailed(format!(
                 "Lima egress proxy exited with {status}"
             )));
@@ -464,11 +479,9 @@ fn start_guest_proxy(
             .status()
             .is_ok_and(|status| status.success());
         if socket_ready && audit_ready {
-            return Ok(child);
+            return Ok(proxy);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             return Err(RunnerError::HelperFailed(
                 "Lima egress proxy did not become ready".to_owned(),
             ));
@@ -477,12 +490,24 @@ fn start_guest_proxy(
     }
 }
 
-fn stop_proxy(proxy: &mut Option<Child>) {
-    if let Some(child) = proxy {
-        let _ = child.kill();
-        let _ = child.wait();
+struct GuestProxyProcess {
+    child: Child,
+}
+
+impl Drop for GuestProxyProcess {
+    fn drop(&mut self) {
+        let process_group = -(self.child.id() as i32);
+        // SAFETY: the child was spawned as the leader of its own process group. Killing the group
+        // prevents Lima's SSH transport from surviving after the limactl parent is reaped.
+        unsafe {
+            libc::kill(process_group, libc::SIGKILL);
+        }
+        let _ = self.child.wait();
     }
-    *proxy = None;
+}
+
+fn stop_proxy(proxy: &mut Option<GuestProxyProcess>) {
+    drop(proxy.take());
 }
 
 fn resolve_guest_cgroup(
@@ -583,6 +608,14 @@ where
     args
 }
 
+fn lima_main_tty_arg(request: &RunRequest) -> &'static str {
+    if request.interactive {
+        "--tty=true"
+    } else {
+        "--tty=false"
+    }
+}
+
 fn run_checked<I>(program: &Path, args: I, context: &'static str) -> Result<Output, RunnerError>
 where
     I: IntoIterator<Item = OsString>,
@@ -615,4 +648,61 @@ fn guest_root(request: &RunRequest) -> PathBuf {
 
 fn guest_workspace(request: &RunRequest) -> PathBuf {
     guest_root(request).join("workspace")
+}
+
+fn guest_workspace_copy_target(request: &RunRequest, guest_root: &Path) -> String {
+    format!(
+        "{}:{}",
+        request.lima_instance,
+        guest_root.join("workspace").display()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ResourceLimits, ToolSpec};
+
+    fn request() -> RunRequest {
+        RunRequest {
+            workspace: PathBuf::from("/host/stage/workspace"),
+            run_id: "00000000-0000-4000-8000-000000000000".to_owned(),
+            tool: ToolSpec {
+                command: OsString::from("/usr/bin/tool"),
+                args: Vec::new(),
+                tool_root: None,
+            },
+            preflight: None,
+            interactive: false,
+            network: NetworkMode::Denied,
+            allowed_egress_hosts: Vec::new(),
+            forwarded_env: Vec::new(),
+            resource_limits: ResourceLimits::default(),
+            cgroup_mode: CgroupMode::BestEffort,
+            helper_path: None,
+            lima_instance: "sandbox-guard".to_owned(),
+        }
+    }
+
+    #[test]
+    fn recursive_copy_target_is_the_workspace_consumed_by_bubblewrap() {
+        let request = request();
+        let root = guest_root(&request);
+        let workspace = guest_workspace(&request);
+
+        assert_eq!(workspace, root.join("workspace"));
+        assert_eq!(
+            guest_workspace_copy_target(&request, &root),
+            format!("sandbox-guard:{}", workspace.display())
+        );
+    }
+
+    #[test]
+    fn main_lima_transport_allocates_a_tty_only_for_interactive_runs() {
+        let mut request = request();
+        assert_eq!(lima_main_tty_arg(&request), "--tty=false");
+
+        request.interactive = true;
+        assert_eq!(lima_main_tty_arg(&request), "--tty=true");
+    }
 }

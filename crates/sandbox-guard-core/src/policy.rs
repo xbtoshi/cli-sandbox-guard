@@ -24,6 +24,24 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     "**/.env*",
     ".dev.vars*",
     "**/.dev.vars*",
+    "secrets.env",
+    "**/secrets.env",
+    "credentials.env",
+    "**/credentials.env",
+    "*.pem",
+    "**/*.pem",
+    "*.key",
+    "**/*.key",
+    "*.p12",
+    "**/*.p12",
+    "*.pfx",
+    "**/*.pfx",
+    "*.jks",
+    "**/*.jks",
+    "*.keystore",
+    "**/*.keystore",
+    "*.kdbx",
+    "**/*.kdbx",
     "id_rsa*",
     "**/id_rsa*",
     "id_ed25519*",
@@ -32,6 +50,14 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     "**/id_ecdsa*",
     "id_dsa*",
     "**/id_dsa*",
+    "*.keys",
+    "**/*.keys",
+    "agent_mainnet",
+    "**/agent_mainnet",
+    "agent_stagenet",
+    "**/agent_stagenet",
+    "monero-wallet-rpc.log",
+    "**/monero-wallet-rpc.log",
     "credentials.json",
     "**/credentials.json",
     ".ssh",
@@ -40,6 +66,52 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     "**/.ssh/**",
     ".aws/credentials",
     "**/.aws/credentials",
+    ".aws/config",
+    "**/.aws/config",
+    ".config/gcloud",
+    ".config/gcloud/**",
+    "**/.config/gcloud",
+    "**/.config/gcloud/**",
+    ".config/gh/hosts.yml",
+    "**/.config/gh/hosts.yml",
+    ".docker/config.json",
+    "**/.docker/config.json",
+    ".kube/config",
+    "**/.kube/config",
+    "service-account*.json",
+    "**/service-account*.json",
+    "firebase-adminsdk*.json",
+    "**/firebase-adminsdk*.json",
+    "*-firebase-adminsdk-*.json",
+    "**/*-firebase-adminsdk-*.json",
+    ".grok/auth.json",
+    "**/.grok/auth.json",
+    ".grok/auth.json.lock",
+    "**/.grok/auth.json.lock",
+    ".gnupg",
+    ".gnupg/**",
+    "**/.gnupg",
+    "**/.gnupg/**",
+    ".password-store",
+    ".password-store/**",
+    "**/.password-store",
+    "**/.password-store/**",
+    "Library/Keychains",
+    "Library/Keychains/**",
+    "**/Library/Keychains",
+    "**/Library/Keychains/**",
+    ".netrc",
+    "**/.netrc",
+    "netrc",
+    "**/netrc",
+    ".npmrc",
+    "**/.npmrc",
+    ".pypirc",
+    "**/.pypirc",
+    ".cargo/credentials",
+    "**/.cargo/credentials",
+    ".cargo/credentials.toml",
+    "**/.cargo/credentials.toml",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -240,6 +312,67 @@ mod tests {
             );
         }
         assert!(policy.denied_by(Path::new("src/environment.rs")).is_none());
+    }
+
+    #[test]
+    fn builtins_cover_portable_privacy_jail_paths() {
+        let policy = CompiledPolicy::builtin().unwrap();
+        for path in [
+            "secrets.env",
+            "config/credentials.env",
+            "config/.envrc",
+            "certs/server.pem",
+            "certs/server.key",
+            "signing/release.p12",
+            "signing/release.pfx",
+            "signing/release.jks",
+            "signing/release.keystore",
+            "vault/passwords.kdbx",
+            "wallets/mainnet.keys",
+            "wallets/agent_mainnet",
+            "wallets/agent_stagenet",
+            "wallets/monero-wallet-rpc.log",
+            "home/.aws/config",
+            "home/.config/gcloud/application_default_credentials.json",
+            "home/.config/gh/hosts.yml",
+            "home/.docker/config.json",
+            "home/.kube/config",
+            "deploy/service-account-production.json",
+            "deploy/firebase-adminsdk-production.json",
+            "deploy/app-firebase-adminsdk-prod.json",
+            "home/.grok/auth.json",
+            "home/.grok/auth.json.lock",
+            "home/.gnupg/private-keys-v1.d/key",
+            "home/.password-store/example.gpg",
+            "home/Library/Keychains/login.keychain-db",
+            "home/.netrc",
+            "home/netrc",
+            "home/.npmrc",
+            "home/.pypirc",
+            "home/.cargo/credentials",
+            "home/.cargo/credentials.toml",
+        ] {
+            assert!(
+                policy.denied_by_path_or_ancestor(Path::new(path)).is_some(),
+                "{path} was unexpectedly allowed"
+            );
+        }
+
+        for path in [
+            ".grok/sandbox.toml",
+            "src/environment.rs",
+            "certs/README.md",
+        ] {
+            assert!(
+                policy.denied_by_path_or_ancestor(Path::new(path)).is_none(),
+                "{path} was unexpectedly denied"
+            );
+        }
+
+        assert!(
+            BUILTIN_DENY_RULES.iter().all(|rule| !rule.starts_with('/')),
+            "built-in policy must contain only source-relative rules"
+        );
     }
 
     #[test]

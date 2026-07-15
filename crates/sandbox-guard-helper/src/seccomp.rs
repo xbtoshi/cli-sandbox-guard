@@ -2,6 +2,7 @@ use std::io;
 
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
+#[cfg(target_arch = "x86_64")]
 const BPF_JMP_JGE_K: u16 = 0x35;
 const BPF_ALU_AND_K: u16 = 0x54;
 const BPF_RET_K: u16 = 0x06;
@@ -13,6 +14,7 @@ const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 const SECCOMP_DATA_NR: u32 = 0;
 const SECCOMP_DATA_ARCH: u32 = 4;
 const SECCOMP_DATA_ARG0_LOW: u32 = 16;
+#[cfg(target_arch = "x86_64")]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 #[cfg(target_arch = "x86_64")]

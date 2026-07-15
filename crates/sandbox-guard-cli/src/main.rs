@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{self, IsTerminal};
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -16,9 +17,12 @@ use sandbox_guard_core::{
 };
 use sandbox_guard_helper::ProbeReport;
 use sandbox_guard_runner::{
-    BackendKind, CgroupMode, NetworkMode, ResourceLimits, RunOutcome, RunRequest, ToolSpec, plan,
-    run as run_isolated,
+    BackendKind, CgroupMode, NetworkMode, ProcessSpec, ResourceLimits, RunOutcome, RunRequest,
+    ToolSpec, plan, run as run_isolated,
 };
+
+mod grok;
+use grok::GrokArgs;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +38,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run Grok with private OAuth delivery and safe network defaults.
+    Grok(GrokArgs),
     /// Stage and run an untrusted tool. Changes are discarded unless explicitly exported.
     Run(RunArgs),
     /// Create a persistent sanitized workspace without running a tool.
@@ -320,6 +326,7 @@ fn main() -> ExitCode {
 
 fn execute(cli: Cli) -> Result<i32> {
     match cli.command {
+        Command::Grok(args) => grok::run(args),
         Command::Run(args) => run_command(args),
         Command::Stage(args) => stage_command(args),
         Command::Policy(args) => policy_command(args),
@@ -331,6 +338,14 @@ fn execute(cli: Cli) -> Result<i32> {
 }
 
 fn run_command(args: RunArgs) -> Result<i32> {
+    run_command_with(args, Vec::new(), None)
+}
+
+fn run_command_with(
+    args: RunArgs,
+    injected_environment: Vec<(String, String)>,
+    preflight: Option<ProcessSpec>,
+) -> Result<i32> {
     let network: NetworkMode = args.network.into();
     if network == NetworkMode::Unrestricted && !args.allow_unrestricted_network {
         bail!(
@@ -355,7 +370,18 @@ fn run_command(args: RunArgs) -> Result<i32> {
         .tool
         .split_first()
         .ok_or_else(|| anyhow!("tool command cannot be empty"))?;
-    let forwarded_env = collect_forwarded_environment(&args.forward_env)?;
+    let mut forwarded_env = collect_forwarded_environment(&args.forward_env)?;
+    let mut forwarded_environment_names = args.forward_env.clone();
+    for (name, value) in injected_environment {
+        if forwarded_environment_names
+            .iter()
+            .any(|existing| existing == &name)
+        {
+            bail!("environment variable {name:?} was supplied more than once");
+        }
+        forwarded_environment_names.push(name.clone());
+        forwarded_env.push((name, value));
+    }
     let resource_limits = resource_limits(
         args.memory_mib,
         args.max_file_mib,
@@ -374,6 +400,8 @@ fn run_command(args: RunArgs) -> Result<i32> {
             args: tool_args.to_vec(),
             tool_root: args.tool_root,
         },
+        preflight,
+        interactive: io::stdin().is_terminal() && io::stdout().is_terminal(),
         network,
         allowed_egress_hosts: args.allow_hosts.clone(),
         forwarded_env,
@@ -396,7 +424,7 @@ fn run_command(args: RunArgs) -> Result<i32> {
             resolved_backend,
             network,
             command,
-            &args.forward_env,
+            &forwarded_environment_names,
             &request,
             None,
             None,
@@ -422,7 +450,7 @@ fn run_command(args: RunArgs) -> Result<i32> {
                 outcome.backend,
                 network,
                 command,
-                &args.forward_env,
+                &forwarded_environment_names,
                 &request,
                 Some(&outcome),
                 exit_code,
@@ -446,7 +474,7 @@ fn run_command(args: RunArgs) -> Result<i32> {
                 resolved_backend,
                 network,
                 command,
-                &args.forward_env,
+                &forwarded_environment_names,
                 &request,
                 None,
                 None,
@@ -594,6 +622,11 @@ fn test_command(args: TestArgs) -> Result<i32> {
             ],
             tool_root: None,
         },
+        preflight: Some(ProcessSpec {
+            command: OsString::from("/bin/true"),
+            args: Vec::new(),
+        }),
+        interactive: false,
         network: NetworkMode::Denied,
         allowed_egress_hosts: vec![],
         forwarded_env: vec![],
@@ -628,6 +661,33 @@ fn test_command(args: TestArgs) -> Result<i32> {
         );
     }
 
+    let preflight_marker = stage.workspace().join("preflight-main-ran");
+    let failed_preflight_request = RunRequest {
+        workspace: stage.workspace().to_path_buf(),
+        run_id: uuid::Uuid::new_v4().to_string(),
+        tool: ToolSpec {
+            command: OsString::from("/usr/bin/touch"),
+            args: vec![OsString::from("/workspace/preflight-main-ran")],
+            tool_root: None,
+        },
+        preflight: Some(ProcessSpec {
+            command: OsString::from("/bin/false"),
+            args: Vec::new(),
+        }),
+        interactive: false,
+        network: NetworkMode::Denied,
+        allowed_egress_hosts: Vec::new(),
+        forwarded_env: Vec::new(),
+        resource_limits: request.resource_limits,
+        cgroup_mode: request.cgroup_mode,
+        helper_path: request.helper_path.clone(),
+        lima_instance: request.lima_instance.clone(),
+    };
+    let failed_preflight_outcome = run_isolated(&failed_preflight_request, backend)?;
+    if failed_preflight_outcome.status.success() || preflight_marker.exists() {
+        bail!("failed preflight did not prevent the main tool from running");
+    }
+
     let controlled_request = RunRequest {
         workspace: stage.workspace().to_path_buf(),
         run_id: uuid::Uuid::new_v4().to_string(),
@@ -640,6 +700,8 @@ fn test_command(args: TestArgs) -> Result<i32> {
             ],
             tool_root: None,
         },
+        preflight: None,
+        interactive: false,
         network: NetworkMode::Controlled,
         allowed_egress_hosts: vec!["allowed.example.invalid".to_owned()],
         forwarded_env: vec![],
@@ -668,6 +730,7 @@ fn test_command(args: TestArgs) -> Result<i32> {
     println!("seccomp namespace and process-memory denial: ok");
     println!("seccomp thread compatibility: ok");
     println!("trusted supervisor memory: protected");
+    println!("trusted preflight sequencing: ok");
     println!("rlimits: ok");
     println!(
         "cgroup v2: {}",

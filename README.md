@@ -4,7 +4,7 @@ Sandbox Guard is an experimental, vendor-neutral boundary for AI coding CLIs. It
 untrusted tool a sanitized, disposable repository instead of the real host workspace.
 
 > [!WARNING]
-> Version 0.2 is an alpha security prototype, not a production sandbox. It now has controlled
+> Version 0.3 is an alpha security prototype, not a production sandbox. It now has controlled
 > HTTPS egress, a focused seccomp deny profile, resource controls, reviewable change export, and
 > offline signature-verified tool installation. Important release blockers remain. Read the
 > [security model](docs/SECURITY_MODEL.md) before using it.
@@ -49,6 +49,33 @@ change export creates a separate review bundle; Guard never applies changes to t
   validated by the trusted staging layer.
 - Offline Ed25519 verification against a pinned signer fingerprint before atomic tool install.
 - Hostile denied-network and controlled-proxy probes through the real backend with `guard test`.
+
+## One-command Grok workflow
+
+After the backend and a Linux Grok binary are provisioned, the normal interactive workflow is:
+
+    guard grok
+
+Pass Grok arguments after `--`, for example:
+
+    guard grok -- --model grok-build
+    guard grok -- -p "review this repository"
+
+`guard grok` is a thin application adapter over the vendor-neutral staging and runner core. It
+always selects controlled egress to `cli-chat-proxy.grok.com`, disables Grok web search and memory,
+uses inline terminal rendering, and runs `grok login` as an isolated preflight inside the
+disposable synthetic home. The host refresh token and `~/.grok/auth.json` are never copied into
+the workspace or Lima guest.
+
+Guard reads only the current short-lived OAuth access token from an owner-only, singly linked
+host auth file. When it is stale, Guard first asks the host Grok CLI to perform a silent refresh in
+its built-in `strict` profile from an empty private working directory. If browser login is needed,
+Guard prints the normal Grok login flow. The resulting access token travels through Guard's
+private environment file; only the environment-variable names appear in the audit.
+
+An access token is a credential intentionally given to the confined Grok process. Relaunch
+`guard grok` after a long-running session reaches the token's expiry; live refresh brokerage is
+not yet implemented.
 
 ## Build and self-test
 
@@ -114,6 +141,17 @@ mounts. Then run:
     guard doctor --backend macos-lima
     guard test --backend macos-lima
     guard run --backend macos-lima -- my-ai-cli
+
+For Grok installed as `/opt/sandbox-guard/tools/grok`, the final command becomes simply:
+
+    guard grok
+
+For `guard run`, Guard automatically requests a Lima PTY when both host standard input and output
+are terminals, so interactive prompts, typing, and paste work without changing the isolation
+policy. Interactive runs receive a fixed `TERM=xterm-256color` so line editing and bracketed paste
+work without forwarding host terminal environment. Automation, pipelines, setup commands, and
+`guard test` keep TTY allocation disabled. Bubblewrap still creates a new session to prevent
+terminal injection into host processes.
 
 Before every run, the backend starts Lima with `--mount-none`, inspects guest mounts, and refuses
 known 9p, VirtioFS, and SSHFS host shares. It copies only the sanitized workspace and a private
@@ -211,17 +249,20 @@ is never overwritten. Recheck an installation with:
     guard tool verify --root /path/to/vendor-cli/1.2.3 \
       --signer-sha256 <64-hex-character-fingerprint>
 
-This is an offline verification foundation. Version 0.2 does not download updates, manage a
+This is an offline verification foundation. Version 0.3 does not download updates, manage a
 root-owned key policy, install a canonical root-owned wrapper, or automatically re-verify a tool
 when `guard run` selects it.
 
 ## Policy and development status
 
-The built-in policy rejects `.env` files, `.dev.vars`, private keys, credential files, `.ssh`, AWS
-credentials, original `.git`, CCB session metadata, links, special files, mount crossings, and
-multiply linked files. See [policy.example.toml](policy.example.toml) for additive rules and lower
-resource ceilings. Filename rules cannot detect secret bytes copied into a distinct regular file
-under an innocent name.
+The built-in policy rejects `.env` and credential environment files; private-key, keystore, and
+wallet formats; SSH, AWS, GCloud, GitHub CLI, Docker, Kubernetes, Grok-auth, GnuPG, password-store,
+Keychain, netrc, npm, PyPI, and Cargo credential paths; original `.git`; CCB session metadata;
+links; special files; mount crossings; and multiply linked files. The rules are portable paths
+relative to the selected source—Guard never imports host-specific absolute paths. See
+[policy.example.toml](policy.example.toml) for additive rules and lower resource ceilings.
+Filename rules cannot detect secret bytes copied into a distinct regular file under an innocent
+name.
 
 The complete blocker register, closed items, and remaining fixture gaps are in
 [sandbox-guard-requirements.md](sandbox-guard-requirements.md). Unsupported security properties
