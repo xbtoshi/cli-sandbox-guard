@@ -155,12 +155,25 @@ equivalent manual command is:
 
     limactl create --name=sandbox-guard --mount-none template:default
 
+Start the stopped instance through Guard's second explicit lifecycle action:
+
+    guard setup --start-instance --backend macos-lima
+
+The command accepts only a present, declared-mountless instance with status
+`Stopped`, requires the typed phrase `START LIMA INSTANCE sandbox-guard` (or
+`--yes`), and invokes exactly
+`limactl --tty=false start --mount-none sandbox-guard`. It then requires the
+instance to report `Running` and rejects any live 9p, virtiofs, sshfs, or
+reverse-sshfs host-sharing mount. It never stops, reconfigures, or deletes a VM;
+if a post-start check fails, inspect the running instance manually. The
+equivalent manual command is:
+
+    limactl --tty=false start --mount-none sandbox-guard
+
 Everything else about guest provisioning **remains a manual, trusted operation
 in v0.3**: everything you place inside the guest becomes part of the trusted
-computing base. Start the instance and install the packages, still with host
-mounts disabled and never containing credentials or host mounts:
+computing base. Install the packages without adding credentials or host mounts:
 
-    limactl start --mount-none sandbox-guard
     limactl shell sandbox-guard sudo apt-get update
     limactl shell sandbox-guard sudo apt-get install -y bubblewrap git ca-certificates rsync util-linux
 

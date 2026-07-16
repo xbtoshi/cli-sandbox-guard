@@ -143,9 +143,19 @@ reported for manual inspection rather than auto-deleted. Creation requires an
 interactive typed confirmation (`CREATE LIMA INSTANCE <instance>`) or `--yes` for
 non-interactive hosts; `--create-instance --json` requires `--yes` so machine
 output is never mixed with a prompt. `--create-instance` conflicts with `--check`,
-and the newly created instance is still stopped and unprovisioned, so setup will
-report that guest checks were deferred. Guest packages, the helper, and the
-selected vendor tool all remain separate manual provisioning steps.
+and the newly created instance remains stopped.
+
+`guard setup --start-instance` is the separate, explicit startup action. It
+accepts only an existing instance whose configuration declares no host mounts,
+requires the typed phrase `START LIMA INSTANCE <instance>` (or `--yes`), and runs
+exactly `limactl --tty=false start --mount-none <instance>`. Guard then requires
+the instance to report `Running` and checks the live mount table for host-sharing
+filesystems. It never stops, reconfigures, or deletes a VM; a failed post-check
+leaves the running instance for manual inspection. An already-running mountless
+instance is left unchanged and still passes through the normal readiness checks.
+The start action conflicts with `--check` and `--create-instance`, and JSON mode
+requires `--yes`. Guest packages, the helper, and the selected vendor tool all
+remain separate manual provisioning steps.
 
 `guard uninstall` is the matching non-mutating removal plan. Confirmed state
 removal requires `--remove` and the exact terminal phrase (or explicit
