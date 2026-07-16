@@ -132,6 +132,11 @@ private directories and prints manual commands for missing external
 dependencies. `guard setup --check --json` performs no repairs and emits the
 versioned readiness report.
 
+`guard uninstall` is the matching non-mutating removal plan. Confirmed state
+removal requires `--remove` and the exact terminal phrase (or explicit
+`--remove --yes` automation); binaries, Lima, vendor state, and locked active
+runs are never silently removed.
+
 ## Build and self-test
 
 Rust 1.85 or newer is required.

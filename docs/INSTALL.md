@@ -195,10 +195,19 @@ version.
 ## Removal
 
 Run `guard uninstall` first to inspect the exact Guard-owned data and
-configuration roots plus the manual binary/VM steps. In this increment the
-command is deliberately planning-only: it never deletes anything. Add
-`--json` for its versioned machine-readable report. The manual checklist
-remains authoritative until confirmed deletion support lands.
+configuration roots plus the manual binary/VM steps. The default is always a
+non-mutating dry run; add `--json` for its versioned machine-readable report.
+To remove only the validated Guard-owned data/configuration roots, run
+`guard uninstall --remove` and type the exact confirmation phrase on a TTY.
+For explicit non-interactive automation use
+`guard uninstall --remove --yes`; `--remove` without `--yes` never deletes in
+a non-interactive or JSON invocation. Unsafe ownership, symlink, mode, active
+stage, or active egress-decision-lock checks abort before any root is renamed.
+Stop Guard sessions before removal. Guard detects active stages under its
+default staging base, but it cannot discover sessions launched with a custom
+`--staging-base`; those sessions must be stopped explicitly.
+Installed binaries, Lima, vendor state, and stale stages remain separate
+manual/Guard-GC steps and are never swept into state-root deletion.
 
 1. Optionally clean leftover stages first: `guard gc`.
 2. Delete the binaries: `guard` and `guard-helper` from your install

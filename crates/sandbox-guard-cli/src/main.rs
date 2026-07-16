@@ -243,6 +243,14 @@ struct SetupArgs {
 
 #[derive(Debug, Args)]
 struct UninstallArgs {
+    /// Remove the validated Guard-owned roots after explicit confirmation.
+    #[arg(long)]
+    remove: bool,
+
+    /// Confirm removal non-interactively. Requires --remove.
+    #[arg(long, requires = "remove")]
+    yes: bool,
+
     /// Emit the versioned machine-readable removal plan.
     #[arg(long)]
     json: bool,
