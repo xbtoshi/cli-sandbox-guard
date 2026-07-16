@@ -153,6 +153,12 @@ linted files as executable.
 The remaining seccomp compatibility field is descriptive and CI-cross-pinned to the fixed helper
 filter; neither built-in nor linted profiles can modify runtime syscall enforcement.
 
+`guard profile effective grok` previews the built-in after validating the optional owner-only
+`profile-overlays.toml` at Guard's fixed configuration directory; `profile explain` reports the
+same overlay provenance. The file cannot name commands, paths, credentials, mounts, or new hosts,
+and there is deliberately no project-relative or `--overlay PATH` input. This inspection increment
+does not yet apply the previewed tightening to `guard grok` runs.
+
 ## Build and self-test
 
 Rust 1.85 or newer is required.
