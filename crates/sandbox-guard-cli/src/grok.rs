@@ -13,7 +13,7 @@ use clap::Args;
 use directories::{BaseDirs, ProjectDirs};
 use sandbox_guard_core::{
     ArgumentMatch, CompiledPolicy, CredentialProfile, EgressMode, SessionProfile, Stage,
-    StageOptions, ToolLaunchProfile, UserPolicy, VendorProfile, builtin_grok_profile,
+    StageOptions, ToolLaunchProfile, UserPolicy, VendorProfile,
 };
 use sandbox_guard_runner::{BackendKind, InteractiveUx, ProcessSpec};
 use serde::Deserialize;
@@ -123,10 +123,11 @@ pub(super) struct GrokArgs {
 }
 
 pub(super) fn run(args: GrokArgs) -> Result<i32> {
-    let profile = builtin_grok_profile();
+    let profile = super::profile::load_effective_builtin_profile("grok")
+        .context("load effective Grok profile")?;
     profile
         .validate()
-        .context("compiled Grok profile failed validation")?;
+        .context("effective Grok profile failed validation")?;
     validate_profile_ui_request(&profile, args.scrollback)?;
     let resolved_backend = BackendKind::from(args.backend).resolve()?;
     let base_dirs = BaseDirs::new().context("could not determine the user home directory")?;
@@ -822,6 +823,7 @@ fn run_host_grok_auth_command<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sandbox_guard_core::{ProfileOverlay, apply_profile_overlay, builtin_grok_profile};
     use std::cell::Cell;
     use std::os::unix::ffi::OsStringExt;
 
@@ -1037,6 +1039,38 @@ mod tests {
         assert!(profile.terminal.native_scrollback_opt_in);
         assert!(profile.clipboard.image_import);
         assert!(profile.seccomp.clone3_enosys_shim_expected);
+    }
+
+    #[test]
+    fn owner_overlay_tightening_reaches_every_runtime_projection() {
+        let base = profile();
+        let overlay = ProfileOverlay {
+            interactive_approval: Some(false),
+            clipboard_image_import: Some(false),
+            mouse_reporting_default: Some(false),
+            native_scrollback_opt_in: Some(false),
+            max_session_total_bytes: Some(1024),
+            max_session_files: Some(10),
+            ..ProfileOverlay::default()
+        };
+        let effective = apply_profile_overlay(&base, &overlay).unwrap();
+
+        assert!(matches!(
+            profile_network(&effective),
+            NetworkArg::Controlled
+        ));
+        assert_eq!(
+            profile_egress_hosts(&effective),
+            ["cli-chat-proxy.grok.com"]
+        );
+        assert!(!effective.egress.interactive_approval_default);
+        assert!(validate_profile_ui_request(&effective, true).is_err());
+        let ux = profile_interactive_ux(&effective);
+        assert!(!ux.clipboard_image_import);
+        assert!(!ux.mouse_reporting_default);
+        let sessions = effective.sessions.unwrap();
+        assert_eq!(sessions.max_total_bytes, 1024);
+        assert_eq!(sessions.max_files, 10);
     }
 
     #[test]

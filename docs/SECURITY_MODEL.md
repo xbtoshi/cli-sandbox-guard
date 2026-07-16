@@ -140,6 +140,20 @@ every intentionally forwarded credential to an allowlisted service.
 
 ## Grok adapter invariants
 
+- The adapter derives its runtime profile from the compiled built-in plus an optional owner-only
+  `profile-overlays.toml` at Guard's fixed configuration directory. The file is opened without
+  following links, bounded to 64 KiB, and required to be a singly linked owner-private regular
+  file beneath an owner-validated configuration path. Repository files and CLI arguments cannot
+  select or replace it.
+- The overlay schema can only remove an existing egress rule, narrow a subdomain rule to its exact
+  host, turn optional approval/clipboard/terminal capabilities off, or reduce positive session
+  quotas. Commands, arguments, credentials, paths, mounts, session layout, seccomp expectations,
+  and new hosts are not representable. The merged profile is revalidated before use.
+- A missing overlay preserves the compiled profile exactly. Any present file that is unsafe,
+  malformed, unknown-versioned, or attempts to widen the built-in boundary aborts `guard grok`
+  before authentication, staging, or backend setup; Guard never warns and continues with the
+  wider base profile. External documents accepted by `profile lint` remain inspection-only and
+  cannot enter this runtime path.
 - `guard grok` accepts only an owner-owned, owner-private, singly linked regular
   `~/.grok/auth.json` no larger than 1 MiB and extracts only the newest unexpired OIDC access token.
 - The host auth file, refresh token, Grok configuration, logs, and home directory are never staged

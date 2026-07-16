@@ -89,7 +89,7 @@ We will not adopt these weaker postures:
 - [x] Define a versioned, deny-unknown-fields Rust schema for trusted vendor profiles.
 - [x] Move Grok-specific binary paths, egress hosts, credential handling, session paths, clipboard
   behavior, runtime mounts, and seccomp compatibility into a built-in Grok profile.
-- [ ] Permit owner-controlled policy to tighten a profile, never widen a built-in boundary.
+- [x] Permit owner-controlled policy to tighten a profile, never widen a built-in boundary.
 - [x] Add `guard profile list`, `guard profile show`, `guard profile lint`, and
   `guard profile explain`.
 - [ ] Require signed profiles before supporting third-party distribution.

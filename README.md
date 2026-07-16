@@ -155,9 +155,27 @@ filter; neither built-in nor linted profiles can modify runtime syscall enforcem
 
 `guard profile effective grok` previews the built-in after validating the optional owner-only
 `profile-overlays.toml` at Guard's fixed configuration directory; `profile explain` reports the
-same overlay provenance. The file cannot name commands, paths, credentials, mounts, or new hosts,
-and there is deliberately no project-relative or `--overlay PATH` input. This inspection increment
-does not yet apply the previewed tightening to `guard grok` runs.
+same overlay provenance. `guard grok` loads that same effective profile before authentication,
+staging, or backend setup. A present invalid overlay aborts the run rather than silently falling
+back to the wider built-in profile. The file cannot name commands, paths, credentials, mounts, or
+new hosts, and there is deliberately no project-relative or `--overlay PATH` input. It can only
+remove configured egress reach, disable optional approval/clipboard/terminal behavior, or lower
+managed-session quotas.
+
+For example, an owner can place this private file at the path shown by
+`guard profile effective grok`:
+
+```toml
+schema_version = 1
+
+[profiles.grok]
+interactive_approval = false
+clipboard_image_import = false
+mouse_reporting_default = false
+native_scrollback_opt_in = false
+max_session_total_bytes = 104857600
+max_session_files = 1000
+```
 
 ## Build and self-test
 

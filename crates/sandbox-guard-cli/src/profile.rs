@@ -250,6 +250,14 @@ fn effective_profile_report(name: &str) -> Result<ProfileEffectiveReport> {
     effective_profile_report_from(name, &path, document.as_ref())
 }
 
+/// Load one compiled profile plus the optional fixed-location owner tightening.
+///
+/// Runtime callers deliberately receive only the validated effective profile. Inspection-only
+/// provenance remains private to this module, and no caller can select an alternate overlay path.
+pub(super) fn load_effective_builtin_profile(name: &str) -> Result<VendorProfile> {
+    Ok(effective_profile_report(name)?.profile)
+}
+
 fn effective_profile_report_from(
     name: &str,
     overlay_path: &Path,
