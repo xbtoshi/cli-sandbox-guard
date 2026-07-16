@@ -30,6 +30,10 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     "**/.sandbox-guard-rollback-*",
     ".env*",
     "**/.env*",
+    // `.env*` only covers dotfiles; `*.env` catches `prod.env`, `local.env`, `staging.env`, which
+    // are dotenv files under a different spelling and never source code.
+    "*.env",
+    "**/*.env",
     ".dev.vars*",
     "**/.dev.vars*",
     "secrets.env",
@@ -88,6 +92,10 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     "**/.kube/config",
     "service-account*.json",
     "**/service-account*.json",
+    // Case-insensitive matching folds `serviceAccount.json`, but not across the hyphen boundary;
+    // the unhyphenated GCP service-account key filename needs its own rule.
+    "serviceaccount*.json",
+    "**/serviceaccount*.json",
     "firebase-adminsdk*.json",
     "**/firebase-adminsdk*.json",
     "*-firebase-adminsdk-*.json",
@@ -120,6 +128,24 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     "**/.cargo/credentials",
     ".cargo/credentials.toml",
     "**/.cargo/credentials.toml",
+    // Yarn Berry stores registry auth tokens (`npmAuthToken`) directly in `.yarnrc.yml`.
+    ".yarnrc.yml",
+    "**/.yarnrc.yml",
+    // Exported kubeconfigs carry cluster certificates and bearer tokens. `.kube/config` is already
+    // denied above; these cover the common standalone spellings.
+    "kubeconfig",
+    "**/kubeconfig",
+    "*.kubeconfig",
+    "**/*.kubeconfig",
+    // Terraform state is generated, never source, and routinely embeds provider secrets in plain
+    // text. (`*.tfvars` is intentionally left to owner policy; see the policy tests.)
+    "*.tfstate",
+    "**/*.tfstate",
+    "*.tfstate.backup",
+    "**/*.tfstate.backup",
+    // Cryptocurrency wallet database.
+    "wallet.dat",
+    "**/wallet.dat",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -391,6 +417,76 @@ mod tests {
             BUILTIN_DENY_RULES.iter().all(|rule| !rule.starts_with('/')),
             "built-in policy must contain only source-relative rules"
         );
+    }
+
+    #[test]
+    fn builtins_cover_alpha4_live_probe_filename_candidates() {
+        // Candidates surfaced by the 2026-07-16 live probe that are now high-confidence built-in
+        // denies. These are matched by the real CompiledPolicy globset, not an approximation.
+        let policy = CompiledPolicy::builtin().unwrap();
+        for path in [
+            // `*.env` beyond the leading-dot forms.
+            "prod.env",
+            "config/local.env",
+            "deploy/staging.env",
+            // Unhyphenated / camelCase GCP service-account keys (case-insensitive).
+            "serviceaccount.json",
+            "deploy/serviceAccount.json",
+            "infra/serviceaccount-prod.json",
+            // Yarn Berry auth tokens.
+            ".yarnrc.yml",
+            "frontend/.yarnrc.yml",
+            // Kubeconfigs.
+            "kubeconfig",
+            "clusters/kubeconfig",
+            "home/prod.kubeconfig",
+            // Terraform state.
+            "terraform.tfstate",
+            "infra/terraform.tfstate",
+            "infra/terraform.tfstate.backup",
+            // Wallet database.
+            "wallet.dat",
+            "wallets/wallet.dat",
+        ] {
+            assert!(
+                policy.denied_by_path_or_ancestor(Path::new(path)).is_some(),
+                "{path} was unexpectedly allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn builtins_do_not_over_block_ordinary_source_or_owner_policy_candidates() {
+        // The new rules must not block ordinary source that merely shares a suggestive stem, and
+        // several ambiguous live-probe candidates are deliberately left to owner policy: `*.tfvars`
+        // (often committed non-secret variable/example files), generic `secrets.*`/`api_keys.json`/
+        // `token(s).*` (plausible schemas, fixtures, or client-public data), `application.yml`/
+        // `application.properties` (ordinary framework config), `google-services.json` (client
+        // config), and DB dumps like `dump.sql` (frequently ordinary fixtures). Documented in the
+        // live probe report and SECURITY_MODEL; kept out of the immutable built-in list on purpose.
+        let policy = CompiledPolicy::builtin().unwrap();
+        for path in [
+            "src/environment.rs",
+            "src/secrets.rs",
+            "src/token.rs",
+            "src/kubeconfig.rs",
+            "config/settings.rs",
+            "docs/env.md",
+            "terraform.tfvars",
+            "prod.tfvars",
+            "config/secrets.yaml",
+            "api_keys.json",
+            "tokens.json",
+            "application.yml",
+            "application.properties",
+            "google-services.json",
+            "db/dump.sql",
+        ] {
+            assert!(
+                policy.denied_by_path_or_ancestor(Path::new(path)).is_none(),
+                "{path} was unexpectedly denied"
+            );
+        }
     }
 
     #[test]
