@@ -63,12 +63,14 @@ explicitly for one run.
 - The clean-environment guarantee includes the visible launcher process. Bubblewrap's `--clearenv`
   scrubs only the executed child, but bwrap itself stays alive as pid 1 inside the sandbox pid
   namespace and its `/proc/1/environ` is readable by the confined tool. The runner therefore
-  interposes a fixed-argv `env -i` boundary immediately before bwrap on every route (Linux host and
-  Lima guest, interactive and noninteractive, cgroup-enforced and best-effort). On the host the
-  launcher inherits an empty environment; on the Lima guest it inherits only a single fixed,
-  non-secret `PATH` used to locate bwrap. The `env -i` boundary is placed *after* the `systemd-run`
-  scope so cgroup delegation to the user manager still works. The hostile backend probe reads
-  `/proc/1/environ` and fails closed if any inherited host variable survives.
+  interposes a fixed-argv `/usr/bin/env -i` boundary immediately before bwrap on every route (Linux
+  host and Lima guest, interactive and noninteractive, cgroup-enforced and best-effort). Both
+  executables at this boundary are fixed absolute paths (`/usr/bin/env`, and `/usr/bin/bwrap` in the
+  guest / the runner's resolved absolute `bwrap` on the host), so no PATH-selected binary can run
+  before the environment is cleared. The launcher inherits a fully empty environment on both
+  backends; the bwrap child still receives its own `PATH`/`HOME`/`LANG` through `--setenv`. The
+  boundary is placed *after* the `systemd-run` scope so cgroup delegation to the user manager still
+  works. The hostile backend probe reads `/proc/1/environ` and fails closed unless it is empty.
 - Loader, runtime injection, Git configuration, proxy override, `PATH`, and `HOME` variables cannot
   be forwarded. Entire known-dangerous families such as GIT, LD, DYLD, NODE, PYTHON, PERL, RUBY,
   JAVA, and LUA are rejected.
@@ -310,9 +312,10 @@ from this store and does not automatically re-verify them before every run.
   on direct Linux and a disposable guest `/dev/shm` tmpfs path under Lima — plus the fixed guest
   mount targets. This is accepted low-severity metadata, not a filesystem escape: the paths are not
   openable from inside the sandbox and carry no credentials. Hiding them would require either
-  bwrap's `--args` file-descriptor form, which cannot survive the `systemd-run`/`limactl` transport
-  boundary, or moving bwrap out of pid 1, which would weaken the `--die-with-parent` reaping and
-  signal model. Neither trade is justified to conceal non-sensitive metadata.
+  bwrap's `--args` file-descriptor form, which cannot be carried unchanged through the current
+  `systemd-run`/`limactl` transports, or moving bwrap out of pid 1, which would require redesign and
+  re-validation of the `--die-with-parent` reaping and signal model. Neither trade is justified to
+  conceal non-sensitive metadata.
 - Kernel, hypervisor, Bubblewrap, Git, Lima, systemd, and trusted-helper vulnerabilities are outside
   the promised boundary.
 - A credential intentionally forwarded to a malicious tool can be stolen or misused by that tool.

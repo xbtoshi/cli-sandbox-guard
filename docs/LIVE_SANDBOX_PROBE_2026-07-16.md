@@ -18,6 +18,20 @@ tests; Finding 3 is a documented intentional residual.
 
 ---
 
+## Remediation in alpha.4
+
+- **Finding 1** (launcher session-environment leak): **fixed** — bwrap is invoked behind a fixed
+  `/usr/bin/env -i` boundary on every backend and mode, leaving pid 1 with an empty environment; a
+  hostile-probe check now reads `/proc/1/environ` and fails closed unless it is empty.
+- **Finding 2** (staging pathnames in `/proc/1/cmdline`): **accepted and documented** as
+  low-severity metadata.
+- **Finding 3** (access token + allowlisted HTTPS): **intentional residual risk**, already in the
+  security model.
+- **Finding 4** (secret-filename gaps): selected high-confidence candidates are now **denied** by
+  the real `CompiledPolicy` globset with native tests; ambiguous candidates remain owner-policy-only.
+
+---
+
 ## Scope and honesty statement
 
 This report records what **actually happened** when the untrusted tool process tried to escape or
@@ -121,7 +135,7 @@ session, it is labelled **not retained** rather than asserted.
 | Attempt | Observed result |
 |---------|-----------------|
 | Read `/proc/<pid>/environ|cmdline|maps|status` for visible PIDs | Mixed; see Findings 1–2 |
-| Read `/proc/1/environ` (bwrap) | **Readable** → host session env leak (Finding 1) |
+| Read `/proc/1/environ` (bwrap) | **Readable** → launcher session-environment leak; guest metadata observed (Finding 1) |
 | Read `/proc/1/cmdline` (bwrap) | **Readable** → staging pathnames (Finding 2) |
 | Read `guard-helper` (pid 2) environ & mem | **Permission denied** (supervisor is non-dumpable) |
 | Read `/run/sandbox-guard/environment.json` | **Readable** (mode 600, by design — Finding 3) |
@@ -132,11 +146,12 @@ session, it is labelled **not retained** rather than asserted.
 Attempted `create` under `/tmp`, `/home/guard`, `/home/guard/.grok`, `/etc`, `/usr`,
 `/run/sandbox-guard`, and the sandbox root (`/workspace/..`).
 
-- Writes to **read-only** mounts (`/usr`, `/run/sandbox-guard`) and the tmpfs sandbox root:
-  **denied / read-only**.
-- Writes that **succeeded** landed **only** in the sandbox's **disposable tmpfs** (`/tmp`, the
-  synthetic `/etc` tmpfs) and the **synthetic home** `/home/guard`. None of these are host paths;
-  all are destroyed when the run ends.
+- Writes to read-only binds (`/usr`, `/run/sandbox-guard`) were **denied**.
+- Writes that **succeeded** were confined to **private tmpfs** (`/tmp`, the synthetic `/etc` tmpfs)
+  or **synthetic home** paths (`/home/guard`). None of these are host paths; all are destroyed when
+  the run ends.
+- The precise result of the `/workspace/..` root-path attempt was **not retained** and is not
+  asserted here.
 - `/home/guard/.grok/sessions` is a **narrow rw bind** of Guard-owned session state. A write there
   (`POISON_TEST`, see cleanup) persists only inside that Guard-owned staged copy, which Guard
   re-validates with the descriptor-safe policy layer and atomically publishes as a session snapshot
@@ -160,38 +175,42 @@ all failed as intended.
 
 ---
 
-## Finding 1 — Host session environment leak via bwrap `/proc/1/environ` (demonstrated) — **fixed in alpha.4**
+## Finding 1 — Launcher session-environment leak via bwrap `/proc/1/environ` (demonstrated under Lima) — **fixed in alpha.4**
 
 ### What was done
 
 Listed PIDs in the sandbox pid namespace. Pid 1 is `bwrap`. Opened `/proc/1/environ` successfully as
 the same UID.
 
-### What was readable (redacted)
+### What was observed (redacted) — Lima guest metadata
 
-The environ dump exposed the **launcher's inherited guest login-session environment**, including
-(redacted): `HOME=/home/<redacted>`, `USER`/`LOGNAME=<redacted>`, `PWD`, the guest-side
+The environ dump exposed the launcher's inherited **guest login-session environment**, which under
+this Lima run is guest metadata, including (redacted): `HOME=/home/<redacted>`,
+`USER`/`LOGNAME=<redacted>`, `PWD`, the guest-side
 `https_proxy`/`HTTPS_PROXY`/`HTTP_PROXY=http://<redacted-ip>:<redacted-port>`,
 `XDG_RUNTIME_DIR=/run/user/<redacted>`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_TTY`, the full guest login
-`PATH`, a systemd `INVOCATION_ID`, and `_=/usr/bin/systemd-run`.
+`PATH`, a systemd `INVOCATION_ID`, and `_=/usr/bin/systemd-run`. This is what was **live-observed**.
 
-### Why it matters
+### Why it matters (Lima observed; direct-Linux inferred)
 
 Bubblewrap's `--clearenv` clears the environment for the **executed child**, not for the **bwrap
 process itself**, which remains visible as pid 1 inside the sandbox pid namespace with a
-tool-readable `/proc/1/environ`. Under Lima these values are **guest identity/metadata** and were
-**not** mountable from inside — identity disclosure, not a host file open. On the **direct-Linux
-backend** the same mechanism would expose the **host** shell's session environment, which can contain
-real secrets. It contradicts the operational expectation that the untrusted side sees only a cleaned
-environment.
+tool-readable `/proc/1/environ`. Under Lima the leaked values are **guest identity/metadata**, were
+**not** mountable from inside, and are what this probe actually observed — identity disclosure, not a
+host file open.
+
+On the **direct-Linux backend** the same code path would instead expose the **host** shell's session
+environment, which can contain real secrets. That host-secret impact is **derived from the launch
+code path, not separately observed** in this Lima session. In both cases it contradicts the
+operational expectation that the untrusted side sees only a cleaned environment.
 
 ### Remediation
 
-Fixed in alpha.4: the runner interposes a fixed-argv `env -i` clean-environment boundary immediately
-before bwrap on every route (Linux host and Lima guest; interactive and noninteractive;
-cgroup-enforced and best-effort). On the host bwrap inherits an empty environment; on the guest it
-inherits only a single fixed, non-secret `PATH`. The hostile backend probe now reads `/proc/1/environ`
-and fails closed if any inherited host variable survives.
+Fixed in alpha.4: the runner interposes a fixed-argv `/usr/bin/env -i` clean-environment boundary
+immediately before bwrap on every route (Linux host and Lima guest; interactive and noninteractive;
+cgroup-enforced and best-effort), using fixed absolute executables so no PATH-selected binary runs at
+the boundary. bwrap inherits a fully **empty** environment on both backends. The hostile backend
+probe now reads `/proc/1/environ` and fails closed unless it is empty.
 
 ---
 
@@ -216,10 +235,10 @@ path was **not openable** from inside (private tmpfs) and carries no credentials
 ### Disposition
 
 Accepted as **low-severity metadata**. Eliminating it would require either bwrap's `--args`
-file-descriptor form (which cannot survive the `systemd-run`/`limactl shell` transport boundary) or
-moving bwrap out of pid 1 (which would weaken the `--die-with-parent` reaping and signal model).
-Neither trade is justified to conceal non-sensitive metadata. Documented in `docs/SECURITY_MODEL.md`
-under "Explicit limitations".
+file-descriptor form (which cannot be carried unchanged through the current `systemd-run`/`limactl
+shell` transports) or moving bwrap out of pid 1 (which would require redesign and re-validation of
+the `--die-with-parent` reaping and signal model). Neither trade is justified to conceal
+non-sensitive metadata. Documented in `docs/SECURITY_MODEL.md` under "Explicit limitations".
 
 ---
 
@@ -282,9 +301,12 @@ was denied), `google-services.json`, `terraform.tfvars`, `terraform.tfstate`, `.
 ### alpha.4 follow-up (confirmed through real native tests)
 
 The candidates were re-checked against the **real `CompiledPolicy` globset** in native Rust tests
-(`crates/sandbox-guard-core/src/policy.rs`). High-confidence, non-source filenames are now immutable
+(`crates/sandbox-guard-core/src/policy.rs`). Selected high-confidence candidates are now immutable
 built-in denies with tests: `*.env` (non-dotfile dotenv spellings), `serviceaccount*.json`,
 `.yarnrc.yml`, `kubeconfig` / `*.kubeconfig`, `*.tfstate` / `*.tfstate.backup`, and `wallet.dat`.
+Most are credential/state files that are never source; `.yarnrc.yml` is an exception — it is
+commonly committed config, blocked because it can embed registry tokens, with the acknowledged
+tradeoff that a token-free `.yarnrc.yml` is excluded from staging too.
 
 Ambiguous candidates that are frequently ordinary files are **deliberately left to owner policy**
 rather than blocked globally, with the rationale recorded in the policy tests: `*.tfvars`, generic
@@ -328,7 +350,7 @@ third-party hosts was performed.
 
 | # | Finding | Demonstrated? | Host FS escape? | Severity | alpha.4 status |
 |---|---------|---------------|-----------------|----------|----------------|
-| 1 | Host session env readable on bwrap `/proc/1/environ` | Yes | No | Medium (info leak) | **Fixed** |
+| 1 | Launcher session env readable on bwrap `/proc/1/environ` | Yes (Lima metadata) | No | Medium under Lima; potentially High on direct Linux when secrets were inherited | **Fixed** |
 | 2 | Staging pathnames in bwrap `/proc/1/cmdline` | Yes | No | Low (metadata) | **Accepted, documented** |
 | 3 | Access token + allowlisted HTTPS usable by tool | Yes | No | High for confidentiality *within model* | **Intentional residual** |
 | 4 | Secret-filename candidate gaps (rule approximation) | Approximation | N/A | Medium if such files exist | **Candidates converted + native tests** |

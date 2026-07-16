@@ -31,7 +31,8 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     ".env*",
     "**/.env*",
     // `.env*` only covers dotfiles; `*.env` catches `prod.env`, `local.env`, `staging.env`, which
-    // are dotenv files under a different spelling and never source code.
+    // are almost always dotenv environment files. A rare non-secret `*.env` (e.g. a template) may
+    // be excluded too; owner policy can carve out specific paths if needed.
     "*.env",
     "**/*.env",
     ".dev.vars*",
@@ -128,7 +129,10 @@ pub const BUILTIN_DENY_RULES: &[&str] = &[
     "**/.cargo/credentials",
     ".cargo/credentials.toml",
     "**/.cargo/credentials.toml",
-    // Yarn Berry stores registry auth tokens (`npmAuthToken`) directly in `.yarnrc.yml`.
+    // `.yarnrc.yml` is commonly committed Yarn Berry config, but it can embed registry auth tokens
+    // (`npmAuthToken`/`npmAuthIdent`), so it is denied as a privacy default. Acknowledged tradeoff:
+    // a token-free `.yarnrc.yml` is excluded from staging too; owner policy cannot re-add built-ins,
+    // so projects that must stage it would need to rename or relocate the file.
     ".yarnrc.yml",
     "**/.yarnrc.yml",
     // Exported kubeconfigs carry cluster certificates and bearer tokens. `.kube/config` is already
