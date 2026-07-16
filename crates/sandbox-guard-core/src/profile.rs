@@ -252,6 +252,21 @@ impl VendorProfile {
             ] {
                 validate_single_component(field, value)?;
             }
+            if sessions.workspace_key == sessions.index_file
+                || sessions.workspace_key == sessions.prompt_history_file
+                || sessions.index_file == sessions.prompt_history_file
+            {
+                return invalid(
+                    "sessions",
+                    "workspace, index, and prompt-history names must be distinct",
+                );
+            }
+            if uuid::Uuid::parse_str(&sessions.prompt_history_file).is_ok() {
+                return invalid(
+                    "sessions.prompt_history_file",
+                    "prompt-history name must not be a session UUID",
+                );
+            }
             if sessions.max_total_bytes == 0 || sessions.max_total_bytes > 8 * 1024 * 1024 * 1024 {
                 return invalid(
                     "sessions.max_total_bytes",
@@ -551,6 +566,48 @@ mod tests {
         let mut profile = builtin_grok_profile();
         profile.sessions.as_mut().unwrap().max_files = 0;
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn session_layout_names_are_distinct_and_cannot_reserve_a_session_uuid() {
+        for (left, right) in [
+            ("workspace_key", "index_file"),
+            ("workspace_key", "prompt_history_file"),
+            ("index_file", "prompt_history_file"),
+        ] {
+            let mut profile = builtin_grok_profile();
+            let sessions = profile.sessions.as_mut().unwrap();
+            let duplicate = match left {
+                "workspace_key" => sessions.workspace_key.clone(),
+                "index_file" => sessions.index_file.clone(),
+                _ => unreachable!(),
+            };
+            match right {
+                "index_file" => sessions.index_file = duplicate,
+                "prompt_history_file" => sessions.prompt_history_file = duplicate,
+                _ => unreachable!(),
+            }
+            assert!(
+                matches!(
+                    profile.validate(),
+                    Err(ProfileError::InvalidField {
+                        field: "sessions",
+                        ..
+                    })
+                ),
+                "duplicate session names {left} and {right} were accepted"
+            );
+        }
+
+        let mut profile = builtin_grok_profile();
+        profile.sessions.as_mut().unwrap().prompt_history_file = uuid::Uuid::nil().to_string();
+        assert!(matches!(
+            profile.validate(),
+            Err(ProfileError::InvalidField {
+                field: "sessions.prompt_history_file",
+                ..
+            })
+        ));
     }
 
     fn insert_unknown(value: &mut toml::Value, path: &[&str]) {
