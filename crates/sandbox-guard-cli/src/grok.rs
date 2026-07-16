@@ -11,7 +11,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local, TimeDelta, Utc};
 use clap::Args;
 use directories::{BaseDirs, ProjectDirs};
-use sandbox_guard_core::{CompiledPolicy, Stage, StageOptions, UserPolicy};
+use sandbox_guard_core::{
+    ArgumentMatch, CompiledPolicy, CredentialProfile, EgressMode, Stage, StageOptions,
+    ToolLaunchProfile, UserPolicy, VendorProfile, builtin_grok_profile,
+};
 use sandbox_guard_runner::ProcessSpec;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -19,13 +22,6 @@ use uuid::Uuid;
 
 use super::{BackendArg, CgroupArg, NetworkArg, PersistentRunState, RunArgs, run_command_with};
 
-const GROK_PROXY_HOST: &str = "cli-chat-proxy.grok.com";
-const GROK_SESSION_TOKEN: &str = "GROK_SESSION_TOKEN";
-const GROK_AUTH_PROVIDER_COMMAND: &str = "GROK_AUTH_PROVIDER_COMMAND";
-const AUTH_PROVIDER_COMMAND: &str = "printf '%s\\n' \"$GROK_SESSION_TOKEN\"";
-const SAFE_GROK_ARGUMENTS: &[&str] = &["--disable-web-search", "--no-memory", "--no-alt-screen"];
-const MINIMUM_TOKEN_VALIDITY_MINUTES: i64 = 10;
-const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 const GROK_SESSION_CWD: &str = "%2Fworkspace";
 const GROK_SESSION_INDEX: &str = "session_search.sqlite";
 const GROK_PROMPT_HISTORY: &str = "prompt_history.jsonl";
@@ -133,13 +129,30 @@ pub(super) struct GrokArgs {
 }
 
 pub(super) fn run(args: GrokArgs) -> Result<i32> {
+    let profile = builtin_grok_profile();
+    profile
+        .validate()
+        .context("compiled Grok profile failed validation")?;
     let base_dirs = BaseDirs::new().context("could not determine the user home directory")?;
-    let auth_path = base_dirs.home_dir().join(".grok/auth.json");
+    let auth_path = base_dirs
+        .home_dir()
+        .join(&profile.credentials.host_auth_file);
     let host_grok = resolve_host_grok(args.host_grok.as_deref(), base_dirs.home_dir())?;
     let now = Utc::now();
-    let credential = ensure_grok_credential_with(&auth_path, now, args.reauthenticate, || {
-        refresh_host_grok_auth(&host_grok, &auth_path, args.reauthenticate)
-    })?;
+    let credential = ensure_grok_credential_with(
+        &profile.credentials,
+        &auth_path,
+        now,
+        args.reauthenticate,
+        || {
+            refresh_host_grok_auth(
+                &profile.credentials,
+                &host_grok,
+                &auth_path,
+                args.reauthenticate,
+            )
+        },
+    )?;
     println!(
         "grok authentication: short-lived access valid until {}",
         credential
@@ -148,9 +161,10 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
             .format("%Y-%m-%d %H:%M:%S %z")
     );
 
-    reject_passthrough_session_controls(&args.grok_args)?;
+    reject_passthrough_session_controls(&profile.tool, &args.grok_args)?;
     let session_state = GrokSessionState::prepare(&args.source, args.resume)?;
     let tool = grok_tool_arguments(
+        &profile.tool,
         args.scrollback,
         args.resume,
         args.continue_session,
@@ -162,10 +176,10 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
         policy: args.policy,
         staging_base: args.staging_base,
         backend: args.backend,
-        network: NetworkArg::Controlled,
+        network: profile_network(&profile),
         allow_unrestricted_network: false,
-        allow_hosts: vec![GROK_PROXY_HOST.to_owned()],
-        ask_egress: !args.no_egress_prompts,
+        allow_hosts: profile_egress_hosts(&profile),
+        ask_egress: profile.egress.interactive_approval_default && !args.no_egress_prompts,
         forward_env: Vec::new(),
         tool_root: None,
         lima_instance: args.lima_instance,
@@ -184,35 +198,27 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
         keep_stage: args.keep_stage,
         tool,
     };
-    let environment = vec![
-        (GROK_SESSION_TOKEN.to_owned(), credential.access_token),
-        (
-            GROK_AUTH_PROVIDER_COMMAND.to_owned(),
-            AUTH_PROVIDER_COMMAND.to_owned(),
-        ),
-    ];
-    let preflight = ProcessSpec {
-        command: OsString::from("grok"),
-        args: vec![OsString::from("login")],
-    };
+    let environment = profile_environment(&profile, credential.access_token);
+    let preflight = profile_preflight(&profile);
     run_command_with(
         run_args,
         environment,
-        Some(preflight),
+        preflight,
         Some(Box::new(session_state)),
     )
 }
 
 fn grok_tool_arguments(
+    profile: &ToolLaunchProfile,
     scrollback: bool,
     resume: Option<Uuid>,
     continue_session: bool,
     grok_args: Vec<OsString>,
 ) -> Vec<OsString> {
-    let mut tool = vec![OsString::from("grok")];
-    tool.extend(SAFE_GROK_ARGUMENTS.iter().map(OsString::from));
+    let mut tool = vec![OsString::from(&profile.command)];
+    tool.extend(profile.forced_arguments.iter().map(OsString::from));
     if scrollback {
-        tool.push(OsString::from("--minimal"));
+        tool.extend(profile.scrollback_arguments.iter().map(OsString::from));
     }
     if let Some(session_id) = resume {
         tool.push(OsString::from("--resume"));
@@ -224,11 +230,19 @@ fn grok_tool_arguments(
     tool
 }
 
-fn reject_passthrough_session_controls(arguments: &[OsString]) -> Result<()> {
+fn reject_passthrough_session_controls(
+    profile: &ToolLaunchProfile,
+    arguments: &[OsString],
+) -> Result<()> {
     for argument in arguments {
         let value = argument.to_string_lossy();
-        if matches!(value.as_ref(), "--resume" | "-r" | "--continue" | "-c")
-            || value.starts_with("--resume=")
+        if profile
+            .forbidden_passthrough
+            .iter()
+            .any(|rule| match rule.kind {
+                ArgumentMatch::Exact => value == rule.value,
+                ArgumentMatch::Prefix => value.starts_with(&rule.value),
+            })
         {
             bail!(
                 "pass session controls directly to Guard (`guard grok --resume ID` or `guard grok --continue`) so the private session snapshot can be restored first"
@@ -236,6 +250,48 @@ fn reject_passthrough_session_controls(arguments: &[OsString]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn profile_egress_hosts(profile: &VendorProfile) -> Vec<String> {
+    profile
+        .egress
+        .allowed_https_hosts
+        .iter()
+        .map(|host| {
+            if host.include_subdomains {
+                format!("*.{}", host.hostname)
+            } else {
+                host.hostname.clone()
+            }
+        })
+        .collect()
+}
+
+fn profile_network(profile: &VendorProfile) -> NetworkArg {
+    match profile.egress.mode {
+        EgressMode::ControlledHttps => NetworkArg::Controlled,
+    }
+}
+
+fn profile_environment(profile: &VendorProfile, access_token: String) -> Vec<(String, String)> {
+    vec![
+        (profile.credentials.value_environment.clone(), access_token),
+        (
+            profile.credentials.provider_command_environment.clone(),
+            profile.credentials.provider_command.clone(),
+        ),
+    ]
+}
+
+fn profile_preflight(profile: &VendorProfile) -> Option<ProcessSpec> {
+    profile
+        .tool
+        .preflight
+        .as_ref()
+        .map(|preflight| ProcessSpec {
+            command: OsString::from(&preflight.command),
+            args: preflight.arguments.iter().map(OsString::from).collect(),
+        })
 }
 
 struct GrokSessionState {
@@ -534,6 +590,7 @@ struct GrokAuthEntry {
 }
 
 fn ensure_grok_credential_with<F>(
+    profile: &CredentialProfile,
     auth_path: &Path,
     now: DateTime<Utc>,
     force_refresh: bool,
@@ -542,8 +599,8 @@ fn ensure_grok_credential_with<F>(
 where
     F: FnOnce() -> Result<()>,
 {
-    let current = load_optional_grok_credential(auth_path)?;
-    let minimum_expiry = now + TimeDelta::minutes(MINIMUM_TOKEN_VALIDITY_MINUTES);
+    let current = load_optional_grok_credential(auth_path, profile.max_auth_file_bytes)?;
+    let minimum_expiry = now + profile_minimum_validity(profile)?;
     if !force_refresh
         && let Some(credential) = current
         && credential.expires_at > minimum_expiry
@@ -561,7 +618,7 @@ where
         );
     }
     refresh()?;
-    let refreshed = load_grok_credential(auth_path)
+    let refreshed = load_grok_credential(auth_path, profile.max_auth_file_bytes)
         .context("host Grok login completed but no usable OAuth credential was written")?;
     if refreshed.expires_at <= minimum_expiry {
         bail!(
@@ -572,9 +629,18 @@ where
     Ok(refreshed)
 }
 
-fn load_optional_grok_credential(path: &Path) -> Result<Option<GrokCredential>> {
+fn profile_minimum_validity(profile: &CredentialProfile) -> Result<TimeDelta> {
+    let minutes = i64::try_from(profile.minimum_validity_minutes)
+        .context("profile credential validity does not fit the runtime duration")?;
+    Ok(TimeDelta::minutes(minutes))
+}
+
+fn load_optional_grok_credential(
+    path: &Path,
+    max_auth_file_bytes: u64,
+) -> Result<Option<GrokCredential>> {
     match fs::symlink_metadata(path) {
-        Ok(_) => load_grok_credential(path).map(Some),
+        Ok(_) => load_grok_credential(path, max_auth_file_bytes).map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => {
             Err(error).with_context(|| format!("inspect Grok auth file {}", path.display()))
@@ -582,8 +648,8 @@ fn load_optional_grok_credential(path: &Path) -> Result<Option<GrokCredential>> 
     }
 }
 
-fn load_grok_credential(path: &Path) -> Result<GrokCredential> {
-    let bytes = read_private_auth_file(path)?;
+fn load_grok_credential(path: &Path, max_auth_file_bytes: u64) -> Result<GrokCredential> {
+    let bytes = read_private_auth_file(path, max_auth_file_bytes)?;
     let entries: BTreeMap<String, GrokAuthEntry> = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse Grok auth file {}", path.display()))?;
     entries
@@ -603,7 +669,7 @@ fn load_grok_credential(path: &Path) -> Result<GrokCredential> {
         .ok_or_else(|| anyhow!("{} contains no usable OIDC access token", path.display()))
 }
 
-fn read_private_auth_file(path: &Path) -> Result<Vec<u8>> {
+fn read_private_auth_file(path: &Path, max_auth_file_bytes: u64) -> Result<Vec<u8>> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -618,12 +684,12 @@ fn read_private_auth_file(path: &Path) -> Result<Vec<u8>> {
         || metadata.nlink() != 1
         || metadata.uid() != current_uid
         || metadata.mode() & 0o077 != 0
-        || metadata.len() > MAX_AUTH_FILE_BYTES
+        || metadata.len() > max_auth_file_bytes
     {
         bail!(
             "refusing unsafe Grok auth file {}: require an owner-only, singly linked regular file no larger than {} bytes",
             path.display(),
-            MAX_AUTH_FILE_BYTES
+            max_auth_file_bytes
         );
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
@@ -658,14 +724,18 @@ fn resolve_host_grok(explicit: Option<&Path>, home: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn refresh_host_grok_auth(host_grok: &Path, auth_path: &Path, force_login: bool) -> Result<()> {
+fn refresh_host_grok_auth(
+    profile: &CredentialProfile,
+    host_grok: &Path,
+    auth_path: &Path,
+    force_login: bool,
+) -> Result<()> {
     if !force_login && auth_path.is_file() {
-        let status = run_host_grok_auth_command(host_grok, ["models"])?;
+        let status = run_host_grok_auth_command(profile, host_grok, ["models"])?;
+        let minimum_expiry = Utc::now() + profile_minimum_validity(profile)?;
         if status.success()
-            && load_optional_grok_credential(auth_path)?.is_some_and(|credential| {
-                credential.expires_at
-                    > Utc::now() + TimeDelta::minutes(MINIMUM_TOKEN_VALIDITY_MINUTES)
-            })
+            && load_optional_grok_credential(auth_path, profile.max_auth_file_bytes)?
+                .is_some_and(|credential| credential.expires_at > minimum_expiry)
         {
             return Ok(());
         }
@@ -676,7 +746,7 @@ fn refresh_host_grok_auth(host_grok: &Path, auth_path: &Path, force_login: bool)
             "Grok OAuth login requires an interactive terminal; run `guard grok` once interactively"
         );
     }
-    let status = run_host_grok_auth_command(host_grok, ["login", "--oauth"])?;
+    let status = run_host_grok_auth_command(profile, host_grok, ["login", "--oauth"])?;
     if !status.success() {
         bail!("strict host Grok login exited with {status}");
     }
@@ -684,6 +754,7 @@ fn refresh_host_grok_auth(host_grok: &Path, auth_path: &Path, force_login: bool)
 }
 
 fn run_host_grok_auth_command<const N: usize>(
+    profile: &CredentialProfile,
     host_grok: &Path,
     arguments: [&str; N],
 ) -> Result<std::process::ExitStatus> {
@@ -693,21 +764,20 @@ fn run_host_grok_auth_command<const N: usize>(
         .context("create private empty workspace for host Grok login")?;
     fs::set_permissions(empty_workspace.path(), fs::Permissions::from_mode(0o700))
         .context("secure private empty workspace for host Grok login")?;
-    let status = Command::new(host_grok)
+    let mut command = Command::new(host_grok);
+    command
         .args(["--sandbox", "strict"])
         .args(arguments)
-        .current_dir(empty_workspace.path())
-        .env_remove("XAI_API_KEY")
-        .env_remove(GROK_SESSION_TOKEN)
-        .env_remove(GROK_AUTH_PROVIDER_COMMAND)
-        .env_remove("GROK_SANDBOX")
-        .status()
-        .with_context(|| {
-            format!(
-                "execute confined host Grok auth command {}",
-                host_grok.display()
-            )
-        })?;
+        .current_dir(empty_workspace.path());
+    for name in &profile.scrubbed_host_environment {
+        command.env_remove(name);
+    }
+    let status = command.status().with_context(|| {
+        format!(
+            "execute confined host Grok auth command {}",
+            host_grok.display()
+        )
+    })?;
     Ok(status)
 }
 
@@ -715,6 +785,7 @@ fn run_host_grok_auth_command<const N: usize>(
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::os::unix::ffi::OsStringExt;
 
     fn write_auth(path: &Path, token: &str, expires_at: DateTime<Utc>) {
         let document = serde_json::json!({
@@ -728,6 +799,12 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
+    fn profile() -> VendorProfile {
+        let profile = builtin_grok_profile();
+        profile.validate().unwrap();
+        profile
+    }
+
     #[test]
     fn fresh_private_oauth_token_does_not_trigger_login() {
         let directory = tempfile::tempdir().unwrap();
@@ -737,11 +814,13 @@ mod tests {
             .with_timezone(&Utc);
         write_auth(&auth, "test-access-token", now + TimeDelta::hours(6));
         let called = Cell::new(false);
-        let credential = ensure_grok_credential_with(&auth, now, false, || {
-            called.set(true);
-            Ok(())
-        })
-        .unwrap();
+        let profile = profile();
+        let credential =
+            ensure_grok_credential_with(&profile.credentials, &auth, now, false, || {
+                called.set(true);
+                Ok(())
+            })
+            .unwrap();
         assert!(!called.get());
         assert_eq!(credential.access_token, "test-access-token");
     }
@@ -754,11 +833,13 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         write_auth(&auth, "expired", now - TimeDelta::minutes(1));
-        let credential = ensure_grok_credential_with(&auth, now, false, || {
-            write_auth(&auth, "refreshed", now + TimeDelta::hours(6));
-            Ok(())
-        })
-        .unwrap();
+        let profile = profile();
+        let credential =
+            ensure_grok_credential_with(&profile.credentials, &auth, now, false, || {
+                write_auth(&auth, "refreshed", now + TimeDelta::hours(6));
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(credential.access_token, "refreshed");
     }
 
@@ -768,7 +849,7 @@ mod tests {
         let auth = directory.path().join("auth.json");
         write_auth(&auth, "secret", Utc::now() + TimeDelta::hours(6));
         fs::set_permissions(&auth, fs::Permissions::from_mode(0o640)).unwrap();
-        assert!(load_grok_credential(&auth).is_err());
+        assert!(load_grok_credential(&auth, profile().credentials.max_auth_file_bytes).is_err());
     }
 
     #[test]
@@ -778,32 +859,54 @@ mod tests {
         let link = directory.path().join("auth.json");
         write_auth(&target, "secret", Utc::now() + TimeDelta::hours(6));
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(load_grok_credential(&link).is_err());
+        assert!(load_grok_credential(&link, profile().credentials.max_auth_file_bytes).is_err());
     }
 
     #[test]
     fn auth_provider_command_references_only_the_private_environment_name() {
+        let profile = profile();
         assert_eq!(
-            AUTH_PROVIDER_COMMAND,
+            profile.credentials.provider_command,
             "printf '%s\\n' \"$GROK_SESSION_TOKEN\""
         );
-        assert!(!AUTH_PROVIDER_COMMAND.contains("test-access-token"));
+        assert!(
+            !profile
+                .credentials
+                .provider_command
+                .contains("test-access-token")
+        );
     }
 
     #[test]
     fn normal_ui_is_default_and_native_scrollback_is_opt_in() {
-        let normal = grok_tool_arguments(false, None, false, Vec::new());
-        let scrollback = grok_tool_arguments(true, None, false, Vec::new());
+        let profile = profile();
+        let normal = grok_tool_arguments(&profile.tool, false, None, false, Vec::new());
+        let scrollback = grok_tool_arguments(&profile.tool, true, None, false, Vec::new());
 
+        assert_eq!(
+            normal,
+            [
+                OsString::from("grok"),
+                OsString::from("--disable-web-search"),
+                OsString::from("--no-memory"),
+                OsString::from("--no-alt-screen"),
+            ]
+        );
         assert!(!normal.contains(&OsString::from("--minimal")));
         assert!(scrollback.contains(&OsString::from("--minimal")));
-        assert!(SAFE_GROK_ARGUMENTS.contains(&"--no-alt-screen"));
+        assert!(
+            profile
+                .tool
+                .forced_arguments
+                .contains(&"--no-alt-screen".to_owned())
+        );
     }
 
     #[test]
     fn grok_session_arguments_are_guard_owned() {
+        let profile = profile();
         let session = Uuid::new_v4();
-        let resumed = grok_tool_arguments(false, Some(session), false, Vec::new());
+        let resumed = grok_tool_arguments(&profile.tool, false, Some(session), false, Vec::new());
         assert!(resumed.windows(2).any(|values| {
             values
                 == [
@@ -811,87 +914,41 @@ mod tests {
                     OsString::from(session.to_string()),
                 ]
         }));
-        assert!(reject_passthrough_session_controls(&[OsString::from("--resume")]).is_err());
-        assert!(reject_passthrough_session_controls(&[OsString::from("--continue")]).is_err());
+        for argument in ["--resume", "-r", "--continue", "-c", "--resume=abc"] {
+            assert!(
+                reject_passthrough_session_controls(&profile.tool, &[OsString::from(argument)])
+                    .is_err(),
+                "session control {argument:?} was accepted"
+            );
+        }
+        assert!(
+            reject_passthrough_session_controls(
+                &profile.tool,
+                &[OsString::from_vec(b"--resume=\xff".to_vec())]
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn compiled_profile_matches_the_current_grok_boundary() {
-        let profile = sandbox_guard_core::builtin_grok_profile();
-        profile.validate().unwrap();
-
-        assert_eq!(profile.name, "grok");
-        assert_eq!(profile.tool.command, "grok");
+    fn runtime_projection_is_derived_from_the_validated_profile() {
+        let mut profile = profile();
+        assert!(matches!(profile_network(&profile), NetworkArg::Controlled));
+        assert_eq!(profile_egress_hosts(&profile), ["cli-chat-proxy.grok.com"]);
+        profile.egress.allowed_https_hosts[0].include_subdomains = true;
         assert_eq!(
-            profile.tool.guest_executable,
-            Path::new("/opt/sandbox-guard/tools/grok")
+            profile_egress_hosts(&profile),
+            ["*.cli-chat-proxy.grok.com"]
         );
-        assert_eq!(
-            profile.tool.forced_arguments,
-            SAFE_GROK_ARGUMENTS
-                .iter()
-                .map(|argument| (*argument).to_owned())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(profile.tool.scrollback_arguments, ["--minimal"]);
-        let preflight = profile.tool.preflight.as_ref().unwrap();
-        assert_eq!(preflight.command, "grok");
-        assert_eq!(preflight.arguments, ["login"]);
-        assert_eq!(
-            profile.tool.forbidden_passthrough,
-            [
-                sandbox_guard_core::ArgumentRule {
-                    kind: sandbox_guard_core::ArgumentMatch::Exact,
-                    value: "--resume".to_owned(),
-                },
-                sandbox_guard_core::ArgumentRule {
-                    kind: sandbox_guard_core::ArgumentMatch::Exact,
-                    value: "-r".to_owned(),
-                },
-                sandbox_guard_core::ArgumentRule {
-                    kind: sandbox_guard_core::ArgumentMatch::Exact,
-                    value: "--continue".to_owned(),
-                },
-                sandbox_guard_core::ArgumentRule {
-                    kind: sandbox_guard_core::ArgumentMatch::Exact,
-                    value: "-c".to_owned(),
-                },
-                sandbox_guard_core::ArgumentRule {
-                    kind: sandbox_guard_core::ArgumentMatch::Prefix,
-                    value: "--resume=".to_owned(),
-                },
-            ]
-        );
-        assert_eq!(
-            profile.egress.allowed_https_hosts[0].hostname,
-            GROK_PROXY_HOST
-        );
-        assert!(!profile.egress.allowed_https_hosts[0].include_subdomains);
-        assert!(profile.egress.interactive_approval_default);
-        assert_eq!(
-            profile.credentials.host_auth_file,
-            Path::new(".grok/auth.json")
-        );
-        assert_eq!(profile.credentials.value_environment, GROK_SESSION_TOKEN);
-        assert_eq!(
-            profile.credentials.provider_command_environment,
-            GROK_AUTH_PROVIDER_COMMAND
-        );
-        assert_eq!(profile.credentials.provider_command, AUTH_PROVIDER_COMMAND);
-        assert_eq!(
-            profile.credentials.minimum_validity_minutes,
-            MINIMUM_TOKEN_VALIDITY_MINUTES as u64
-        );
-        assert_eq!(profile.credentials.max_auth_file_bytes, MAX_AUTH_FILE_BYTES);
-        assert_eq!(
-            profile.credentials.scrubbed_host_environment,
-            [
-                "XAI_API_KEY",
-                GROK_SESSION_TOKEN,
-                GROK_AUTH_PROVIDER_COMMAND,
-                "GROK_SANDBOX"
-            ]
-        );
+        profile.egress.allowed_https_hosts[0].include_subdomains = false;
+        let environment = profile_environment(&profile, "test-access-token".to_owned());
+        assert_eq!(environment[0].0, "GROK_SESSION_TOKEN");
+        assert_eq!(environment[0].1, "test-access-token");
+        assert_eq!(environment[1].0, "GROK_AUTH_PROVIDER_COMMAND");
+        assert_eq!(environment[1].1, "printf '%s\\n' \"$GROK_SESSION_TOKEN\"");
+        let preflight = profile_preflight(&profile).unwrap();
+        assert_eq!(preflight.command, OsString::from("grok"));
+        assert_eq!(preflight.args, [OsString::from("login")]);
         let sessions = profile.sessions.unwrap();
         assert_eq!(
             sessions.guest_mount_path,

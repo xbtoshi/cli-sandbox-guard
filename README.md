@@ -144,7 +144,9 @@ but the lint-only result cannot be installed, trusted, or executed. v0.3 never
 uses owner- or project-supplied profiles for a run. Scripts should use `--json`
 rather than relying on the human-oriented output. `profile lint --json` emits
 JSON for a valid document; invalid input exits 1 and reports a sanitized error
-on standard error.
+on standard error. The Grok adapter currently consumes the compiled launch,
+egress, and credential sections; `profile explain grok` reports the exact
+partial-migration status without treating linted files as executable.
 
 ## Build and self-test
 

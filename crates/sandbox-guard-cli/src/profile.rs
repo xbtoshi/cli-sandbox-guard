@@ -10,7 +10,7 @@ use serde::Serialize;
 
 const PROFILE_LIST_SCHEMA_VERSION: u32 = 1;
 const PROFILE_LINT_SCHEMA_VERSION: u32 = 1;
-const PROFILE_EXPLAIN_SCHEMA_VERSION: u32 = 1;
+const PROFILE_EXPLAIN_SCHEMA_VERSION: u32 = 2;
 const MAX_LINT_PROFILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Args)]
@@ -97,7 +97,9 @@ struct ProfileExplainReport {
     schema: u32,
     profile_name: String,
     source: &'static str,
-    runtime_consumed: bool,
+    runtime_status: &'static str,
+    runtime_consumed_sections: Vec<&'static str>,
+    runtime_not_consumed_sections: Vec<&'static str>,
     sections: Vec<ProfileExplanation>,
 }
 
@@ -157,7 +159,7 @@ pub(super) fn profile_command(args: ProfileArgs) -> Result<i32> {
             } else {
                 println!("profile: {} ({})", report.profile_name, report.source);
                 println!(
-                    "runtime source: hardcoded adapter (compiled profile metadata is not consumed yet)"
+                    "runtime source: partial compiled-profile migration (session, terminal, clipboard, and seccomp metadata remain descriptive or hardcoded)"
                 );
                 for section in report.sections {
                     println!(
@@ -239,7 +241,21 @@ fn explain_report(profile: &VendorProfile) -> ProfileExplainReport {
         schema: PROFILE_EXPLAIN_SCHEMA_VERSION,
         profile_name: profile.name.clone(),
         source: "built-in",
-        runtime_consumed: false,
+        runtime_status: "partial",
+        runtime_consumed_sections: vec![
+            "tool.command_and_arguments",
+            "tool.preflight",
+            "tool.forbidden_passthrough",
+            "egress",
+            "credentials",
+        ],
+        runtime_not_consumed_sections: vec![
+            "tool.guest_executable",
+            "sessions",
+            "terminal",
+            "clipboard",
+            "seccomp",
+        ],
         sections: vec![
             explanation(
                 "tool.*",
@@ -432,13 +448,20 @@ mod tests {
     }
 
     #[test]
-    fn explanation_is_versioned_and_honest_about_runtime_reachability() {
+    fn explanation_is_versioned_and_honest_about_partial_runtime_reachability() {
         let profile = resolve_builtin_profile("grok").unwrap();
         let report = explain_report(&profile);
-        assert_eq!(report.schema, 1);
+        assert_eq!(report.schema, 2);
         assert_eq!(report.profile_name, "grok");
         assert_eq!(report.source, "built-in");
-        assert!(!report.runtime_consumed);
+        assert_eq!(report.runtime_status, "partial");
+        assert!(report.runtime_consumed_sections.contains(&"credentials"));
+        assert!(
+            report
+                .runtime_not_consumed_sections
+                .contains(&"tool.guest_executable")
+        );
+        assert!(report.runtime_not_consumed_sections.contains(&"sessions"));
         assert_eq!(report.sections.len(), 6);
         assert!(
             report
