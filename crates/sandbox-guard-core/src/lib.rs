@@ -10,6 +10,7 @@ mod gc;
 mod git;
 mod policy;
 mod profile;
+mod profile_store;
 mod signed_profile;
 mod staging;
 mod tool_store;
@@ -33,6 +34,12 @@ pub use profile::{
     ProfileError, ProfileOverlay, ProfileOverlayDocument, SeccompCompatibility, SessionProfile,
     TerminalProfile, ToolLaunchProfile, VENDOR_PROFILE_SCHEMA_VERSION, VendorProfile,
     apply_profile_overlay, builtin_grok_profile, builtin_vendor_profile,
+};
+pub use profile_store::{
+    InstalledProfile, MAX_INSTALLED_PROFILE_NAMES, MAX_INSTALLED_PROFILE_VERSIONS,
+    PROFILE_STORE_MANIFEST_SCHEMA_VERSION, ProfileInstallManifest, ProfileStoreError,
+    install_verified_profile, list_installed_profiles, remove_installed_profile,
+    verify_installed_profile,
 };
 pub use signed_profile::{
     MAX_SIGNED_PROFILE_BYTES, SIGNED_PROFILE_ENVELOPE_SCHEMA_VERSION, SignedProfileEnvelope,
