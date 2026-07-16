@@ -152,6 +152,9 @@ still allowing approved authenticated API calls.
 
 - [x] Keep `macos-lima` as the recommended hardened backend.
 - [ ] Evaluate an experimental `macos-native` Seatbelt backend for low-friction local use.
+  Prior-art source evaluation (Gemini CLI Seatbelt) with a hostile-fixture matrix and go/no-go
+  gate is recorded in [docs/MACOS_NATIVE_EVALUATION.md](docs/MACOS_NATIVE_EVALUATION.md);
+  implementation remains open and unapproved.
 - [ ] Clearly label native mode as a different assurance tier and test Apple Events, Launch
   Services, XPC, Mach services, Unix sockets, TCC, and trust-service escape paths.
 - [x] Never silently fall back from Lima to native mode.
