@@ -7,12 +7,16 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use directories::{BaseDirs, ProjectDirs};
 use sandbox_guard_core::{
-    BUILTIN_VENDOR_PROFILE_NAMES, ProfileOverlayDocument, VendorProfile, apply_profile_overlay,
-    builtin_vendor_profile,
+    BUILTIN_VENDOR_PROFILE_NAMES, InstalledProfile, ProfileOverlayDocument, VendorProfile,
+    apply_profile_overlay, builtin_vendor_profile, install_verified_profile,
+    list_installed_profiles, remove_installed_profile, verify_installed_profile,
 };
 use serde::Serialize;
 
-const PROFILE_LIST_SCHEMA_VERSION: u32 = 1;
+const PROFILE_LIST_SCHEMA_VERSION: u32 = 2;
+const PROFILE_INSTALLED_SCHEMA_VERSION: u32 = 1;
+const PROFILE_INSTALL_RECEIPT_SCHEMA_VERSION: u32 = 1;
+const PROFILE_REMOVE_SCHEMA_VERSION: u32 = 1;
 const PROFILE_LINT_SCHEMA_VERSION: u32 = 1;
 const PROFILE_EXPLAIN_SCHEMA_VERSION: u32 = 3;
 const PROFILE_EFFECTIVE_SCHEMA_VERSION: u32 = 1;
@@ -27,10 +31,14 @@ pub(super) struct ProfileArgs {
 
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
-    /// List compiled trusted vendor profiles.
+    /// List compiled built-in and installed signed vendor profiles.
     List(ProfileListArgs),
-    /// Show every field in one compiled trusted vendor profile.
+    /// Show a built-in profile, or an installed signed profile with --version.
     Show(ProfileShowArgs),
+    /// Verify a signed profile package and install it into the owner-private store.
+    Install(ProfileInstallArgs),
+    /// Remove exactly one installed signed profile name and version.
+    Remove(ProfileRemoveArgs),
     /// Parse and validate an external profile without trusting or enabling it.
     Lint(ProfileLintArgs),
     /// Explain how one compiled profile maps to Guard trust boundaries.
@@ -48,10 +56,51 @@ struct ProfileListArgs {
 
 #[derive(Debug, Args)]
 struct ProfileShowArgs {
-    /// Exact built-in profile name.
+    /// Exact profile name.
     name: String,
 
+    /// Exact installed distribution version. Selects the signed store instead of a built-in;
+    /// there is no latest-version fallback.
+    #[arg(long)]
+    version: Option<String>,
+
     /// Emit the profile as JSON instead of TOML.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProfileInstallArgs {
+    /// Signed profile package (the exact bytes that were signed).
+    #[arg(long)]
+    package: PathBuf,
+
+    /// Detached Ed25519 signature over the package bytes, in hexadecimal.
+    #[arg(long)]
+    signature: PathBuf,
+
+    /// Raw Ed25519 public key, in hexadecimal.
+    #[arg(long)]
+    public_key: PathBuf,
+
+    /// SHA-256 fingerprint of the raw public key, pinning the trusted signer.
+    #[arg(long)]
+    signer_sha256: String,
+
+    /// Emit a versioned machine-readable install receipt.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProfileRemoveArgs {
+    /// Installed profile name.
+    name: String,
+
+    /// Exact installed distribution version to remove.
+    version: String,
+
+    /// Emit a versioned machine-readable removal report.
     #[arg(long)]
     json: bool,
 }
@@ -90,6 +139,10 @@ struct ProfileEffectiveArgs {
 struct ProfileListReport {
     schema: u32,
     profiles: Vec<ProfileSummary>,
+    /// Sanitized reason the installed signed store could not be enumerated, if any. Built-in
+    /// entries are always listed regardless of installed-store health.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed_error: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -97,6 +150,52 @@ struct ProfileSummary {
     name: String,
     source: &'static str,
     profile_schema: u32,
+    /// Exact distribution version. Present only for installed signed profiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// SHA-256 fingerprint of the raw signer public key. Present only for installed profiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signer_fingerprint_sha256: Option<String>,
+    /// SHA-256 of the exact signed package bytes. Present only for installed profiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package_sha256: Option<String>,
+}
+
+/// A re-verified installed signed profile with provenance and its exact distribution version.
+/// The profile body is content-only; installing it never makes it runtime-effective.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct InstalledProfileReport {
+    schema: u32,
+    source: &'static str,
+    name: String,
+    version: String,
+    signer_fingerprint_sha256: String,
+    package_sha256: String,
+    package_bytes: u64,
+    installed_at: String,
+    manifest_schema: u32,
+    runtime_effective: bool,
+    profile: VendorProfile,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct ProfileInstallReceipt {
+    schema: u32,
+    source: &'static str,
+    name: String,
+    version: String,
+    signer_fingerprint_sha256: String,
+    package_sha256: String,
+    package_bytes: u64,
+    runtime_effective: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct ProfileRemoveReport {
+    schema: u32,
+    name: String,
+    version: String,
+    removed: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -149,24 +248,102 @@ struct LintedProfile(VendorProfile);
 pub(super) fn profile_command(args: ProfileArgs) -> Result<i32> {
     match args.command {
         ProfileCommand::List(args) => {
-            let report = profile_list_report()?;
+            let store = default_profile_store()?;
+            let report = profile_list_report(&store)?;
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                for profile in report.profiles {
-                    println!(
-                        "{}\t{}\tschema={}",
-                        profile.name, profile.source, profile.profile_schema
-                    );
+                for profile in &report.profiles {
+                    match (&profile.version, &profile.signer_fingerprint_sha256) {
+                        (Some(version), Some(signer)) => println!(
+                            "{}\t{}\tversion={}\tschema={}\tsigner={}",
+                            profile.name, profile.source, version, profile.profile_schema, signer
+                        ),
+                        _ => println!(
+                            "{}\t{}\tschema={}",
+                            profile.name, profile.source, profile.profile_schema
+                        ),
+                    }
                 }
+            }
+            if let Some(error) = &report.installed_error {
+                eprintln!("guard: could not list installed signed profiles: {error}");
+                return Ok(1);
             }
         }
         ProfileCommand::Show(args) => {
-            let profile = resolve_builtin_profile(&args.name)?;
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&profile)?);
+            if let Some(version) = args.version {
+                let store = default_profile_store()?;
+                let report = installed_profile_report(&store, &args.name, &version)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("name: {}", report.name);
+                    println!("version: {}", report.version);
+                    println!("source: {}", report.source);
+                    println!("signer sha256: {}", report.signer_fingerprint_sha256);
+                    println!("package sha256: {}", report.package_sha256);
+                    println!("installed at: {}", report.installed_at);
+                    println!("runtime effective: {}", report.runtime_effective);
+                    print!("{}", toml::to_string_pretty(&report.profile)?);
+                }
             } else {
-                print!("{}", toml::to_string_pretty(&profile)?);
+                let profile = resolve_builtin_profile(&args.name)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&profile)?);
+                } else {
+                    print!("{}", toml::to_string_pretty(&profile)?);
+                }
+            }
+        }
+        ProfileCommand::Install(args) => {
+            let store = default_profile_store()?;
+            let receipt = install_profile(
+                &store,
+                &args.package,
+                &args.signature,
+                &args.public_key,
+                &args.signer_sha256,
+            )?;
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            } else {
+                println!(
+                    "installed signed profile: {} {}",
+                    receipt.name, receipt.version
+                );
+                println!(
+                    "verified signer sha256: {}",
+                    receipt.signer_fingerprint_sha256
+                );
+                println!("package sha256: {}", receipt.package_sha256);
+                println!(
+                    "runtime effective: {} (installed profiles are content-only this milestone)",
+                    receipt.runtime_effective
+                );
+            }
+        }
+        ProfileCommand::Remove(args) => {
+            let store = default_profile_store()?;
+            let removed = remove_profile(&store, &args.name, &args.version)?;
+            let report = ProfileRemoveReport {
+                schema: PROFILE_REMOVE_SCHEMA_VERSION,
+                name: args.name.clone(),
+                version: args.version.clone(),
+                removed,
+            };
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if removed {
+                println!(
+                    "removed installed profile {} {}",
+                    report.name, report.version
+                );
+            } else {
+                println!(
+                    "no installed profile {} {} to remove",
+                    report.name, report.version
+                );
             }
         }
         ProfileCommand::Lint(args) => {
@@ -541,7 +718,10 @@ fn explanation(
     }
 }
 
-fn profile_list_report() -> Result<ProfileListReport> {
+/// Build the combined registry report. Built-in profiles are always listed; a corrupt or
+/// unreadable installed signed store never hides them, but is surfaced as a sanitized
+/// `installed_error` so the caller can fail closed on the installed portion.
+fn profile_list_report(store_root: &Path) -> Result<ProfileListReport> {
     let mut profiles = Vec::with_capacity(BUILTIN_VENDOR_PROFILE_NAMES.len());
     for name in BUILTIN_VENDOR_PROFILE_NAMES {
         let profile = resolve_builtin_profile(name)?;
@@ -549,12 +729,151 @@ fn profile_list_report() -> Result<ProfileListReport> {
             name: profile.name,
             source: "built-in",
             profile_schema: profile.schema_version,
+            version: None,
+            signer_fingerprint_sha256: None,
+            package_sha256: None,
         });
     }
+    let installed_error = match list_installed_profiles(store_root) {
+        Ok(installed) => {
+            for profile in installed {
+                profiles.push(installed_summary(&profile));
+            }
+            None
+        }
+        Err(error) => Some(sanitize_terminal(&error.to_string())),
+    };
     Ok(ProfileListReport {
         schema: PROFILE_LIST_SCHEMA_VERSION,
         profiles,
+        installed_error,
     })
+}
+
+fn installed_summary(installed: &InstalledProfile) -> ProfileSummary {
+    ProfileSummary {
+        name: installed.manifest.name.clone(),
+        source: "installed-signed",
+        profile_schema: installed.envelope.profile.schema_version,
+        version: Some(installed.manifest.profile_version.clone()),
+        signer_fingerprint_sha256: Some(installed.manifest.signer_fingerprint_sha256.clone()),
+        package_sha256: Some(installed.manifest.package_sha256.clone()),
+    }
+}
+
+fn default_profile_store() -> Result<PathBuf> {
+    let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
+        .ok_or_else(|| anyhow::anyhow!("could not determine the user data directory"))?;
+    Ok(project.data_local_dir().join("profiles"))
+}
+
+/// Verify and install one signed profile package into the fixed owner-private store.
+///
+/// The store root is derived internally; tests inject an alternate root, production always uses
+/// [`default_profile_store`]. All core errors are rendered terminal-safe because the package name,
+/// version, and manifest content originate from signer-controlled bytes.
+fn install_profile(
+    store_root: &Path,
+    package: &Path,
+    signature: &Path,
+    public_key: &Path,
+    signer_sha256: &str,
+) -> Result<ProfileInstallReceipt> {
+    let installed =
+        install_verified_profile(package, signature, public_key, signer_sha256, store_root)
+            .map_err(store_error)?;
+    Ok(ProfileInstallReceipt {
+        schema: PROFILE_INSTALL_RECEIPT_SCHEMA_VERSION,
+        source: "installed-signed",
+        name: installed.manifest.name,
+        version: installed.manifest.profile_version,
+        signer_fingerprint_sha256: installed.manifest.signer_fingerprint_sha256,
+        package_sha256: installed.manifest.package_sha256,
+        package_bytes: installed.manifest.package_bytes,
+        runtime_effective: false,
+    })
+}
+
+/// Re-verify and render exactly one installed signed profile selected by name and exact version.
+///
+/// The name and version are validated as store components before a path is constructed, then the
+/// core verification API re-checks bytes, signature, signer pin, manifest, and path identity.
+fn installed_profile_report(
+    store_root: &Path,
+    name: &str,
+    version: &str,
+) -> Result<InstalledProfileReport> {
+    validate_installed_component("profile name", name)?;
+    validate_installed_component("profile version", version)?;
+    let root = store_root.join(name).join(version);
+    match std::fs::symlink_metadata(&root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("no installed signed profile {name:?} version {version:?}");
+        }
+        Err(error) => {
+            return Err(error).context("inspect installed signed profile");
+        }
+    }
+    let installed = verify_installed_profile(&root).map_err(store_error)?;
+    // Defend against a component collision that resolves to a different installation than asked.
+    if installed.manifest.name != name || installed.manifest.profile_version != version {
+        bail!("installed profile identity did not match the requested name and version");
+    }
+    Ok(InstalledProfileReport {
+        schema: PROFILE_INSTALLED_SCHEMA_VERSION,
+        source: "installed-signed",
+        name: installed.manifest.name,
+        version: installed.manifest.profile_version,
+        signer_fingerprint_sha256: installed.manifest.signer_fingerprint_sha256,
+        package_sha256: installed.manifest.package_sha256,
+        package_bytes: installed.manifest.package_bytes,
+        installed_at: installed.manifest.installed_at.to_rfc3339(),
+        manifest_schema: installed.manifest.schema_version,
+        runtime_effective: false,
+        profile: installed.envelope.profile,
+    })
+}
+
+fn remove_profile(store_root: &Path, name: &str, version: &str) -> Result<bool> {
+    remove_installed_profile(store_root, name, version).map_err(store_error)
+}
+
+/// Convert a signer-influenced core error into a fully sanitized, source-free anyhow error so no
+/// raw control byte from an untrusted filename or TOML message can reach the terminal through the
+/// top-level `{error:#}` renderer.
+fn store_error(error: sandbox_guard_core::ProfileStoreError) -> anyhow::Error {
+    anyhow::anyhow!("{}", sanitize_terminal(&error.to_string()))
+}
+
+/// Escape control and non-ASCII characters so untrusted profile names, versions, filenames, and
+/// TOML parser messages cannot emit raw escape sequences, newlines, or bidirectional formatting
+/// characters to the terminal.
+fn sanitize_terminal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch.is_control() || !ch.is_ascii() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Reject a name or version before it is joined into a store path. This mirrors the core store
+/// component grammar (leading ASCII alphanumeric, then alphanumeric/`.`/`_`/`-`, max 64) so a
+/// traversal or dot-prefixed internal name can never form a lookup path.
+fn validate_installed_component(label: &str, value: &str) -> Result<()> {
+    let mut bytes = value.bytes();
+    let first = bytes.next();
+    if !first.is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || value.len() > 64
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("invalid {label} {:?}", sanitize_terminal(value));
+    }
+    Ok(())
 }
 
 fn resolve_builtin_profile(name: &str) -> Result<VendorProfile> {
@@ -585,20 +904,29 @@ mod tests {
     use crate::{Cli, Command};
 
     #[test]
-    fn profile_list_report_is_stable_and_compiled_only() {
-        let report = profile_list_report().unwrap();
-        assert_eq!(report.schema, 1);
+    fn profile_list_report_lists_builtins_first_and_tolerates_a_missing_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("profiles");
+        let report = profile_list_report(&store).unwrap();
+        assert_eq!(report.schema, 2);
         assert_eq!(
             report.profiles,
             [ProfileSummary {
                 name: "grok".to_owned(),
                 source: "built-in",
                 profile_schema: 1,
+                version: None,
+                signer_fingerprint_sha256: None,
+                package_sha256: None,
             }]
         );
+        assert!(report.installed_error.is_none());
         let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["schema"], 1);
+        assert_eq!(json["schema"], 2);
         assert_eq!(json["profiles"][0]["source"], "built-in");
+        // Provenance fields are omitted, not null, for built-ins.
+        assert!(json["profiles"][0].get("version").is_none());
+        assert!(json.get("installed_error").is_none());
     }
 
     #[test]
@@ -614,10 +942,33 @@ mod tests {
     }
 
     #[test]
-    fn clap_accepts_only_the_read_only_profile_subcommands() {
+    fn clap_accepts_only_the_inspection_and_signed_store_subcommands() {
         for arguments in [
             &["guard", "profile", "list", "--json"][..],
             &["guard", "profile", "show", "grok", "--json"][..],
+            &[
+                "guard",
+                "profile",
+                "show",
+                "vendor",
+                "--version",
+                "1.0.0",
+                "--json",
+            ][..],
+            &[
+                "guard",
+                "profile",
+                "install",
+                "--package",
+                "p.toml",
+                "--signature",
+                "s.hex",
+                "--public-key",
+                "k.hex",
+                "--signer-sha256",
+                "00",
+            ][..],
+            &["guard", "profile", "remove", "vendor", "1.0.0"][..],
             &["guard", "profile", "lint", "profile.toml", "--json"][..],
             &["guard", "profile", "explain", "grok", "--json"][..],
             &["guard", "profile", "effective", "grok", "--json"][..],
@@ -625,7 +976,30 @@ mod tests {
             let cli = Cli::try_parse_from(arguments).unwrap();
             assert!(matches!(cli.command, Command::Profile(_)));
         }
+        // install requires the full signed input set; no store-path override exists.
         assert!(Cli::try_parse_from(["guard", "profile", "install"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "guard",
+                "profile",
+                "install",
+                "--package",
+                "p.toml",
+                "--store",
+                "/tmp/x",
+            ])
+            .is_err()
+        );
+        // remove requires an exact version; no name-only or --latest form is accepted.
+        assert!(Cli::try_parse_from(["guard", "profile", "remove", "vendor"]).is_err());
+        assert!(Cli::try_parse_from(["guard", "profile", "show", "vendor", "--version"]).is_err());
+        // there is deliberately no runtime execution surface under `guard profile`.
+        assert!(Cli::try_parse_from(["guard", "profile", "run", "grok"]).is_err());
+        assert!(Cli::try_parse_from(["guard", "profile", "execute", "grok"]).is_err());
+        assert!(
+            Cli::try_parse_from(["guard", "profile", "effective", "grok", "--version", "1"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -857,5 +1231,278 @@ mod tests {
         fs::write(&path, "schema_version = 1\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load_profile_overlay_at(&linked.join("profile-overlays.toml")).is_err());
+    }
+
+    // ---- signed profile store CLI wiring ----
+
+    use ed25519_dalek::{Signer, SigningKey};
+    use sandbox_guard_core::{SIGNED_PROFILE_ENVELOPE_SCHEMA_VERSION, SignedProfileEnvelope};
+    use sha2::{Digest, Sha256};
+
+    fn envelope_bytes(name: &str, version: &str) -> Vec<u8> {
+        let mut profile = builtin_vendor_profile("grok").unwrap();
+        profile.name = name.to_owned();
+        let envelope = SignedProfileEnvelope {
+            schema_version: SIGNED_PROFILE_ENVELOPE_SCHEMA_VERSION,
+            profile_version: version.to_owned(),
+            profile,
+        };
+        toml::to_string_pretty(&envelope).unwrap().into_bytes()
+    }
+
+    /// Write a signed package plus its detached signature and public key into `dir`, returning the
+    /// three input paths and the signer fingerprint the CLI must be given.
+    fn write_material(
+        dir: &Path,
+        key: &SigningKey,
+        bytes: &[u8],
+    ) -> (PathBuf, PathBuf, PathBuf, String) {
+        let public_key = key.verifying_key().to_bytes();
+        let signature = key.sign(bytes).to_bytes();
+        let package = dir.join("package.toml");
+        let signature_path = dir.join("signature.hex");
+        let public_key_path = dir.join("public-key.hex");
+        fs::write(&package, bytes).unwrap();
+        fs::write(&signature_path, hex::encode(signature)).unwrap();
+        fs::write(&public_key_path, hex::encode(public_key)).unwrap();
+        (
+            package,
+            signature_path,
+            public_key_path,
+            hex::encode(Sha256::digest(public_key)),
+        )
+    }
+
+    #[test]
+    fn signed_store_round_trip_install_list_show_remove() {
+        let store = tempfile::tempdir().unwrap();
+        let store = &store.path().join("profiles");
+        let input = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let bytes = envelope_bytes("vendor", "1.0.0");
+        let (package, signature, public_key, fingerprint) =
+            write_material(input.path(), &key, &bytes);
+
+        let receipt =
+            install_profile(store, &package, &signature, &public_key, &fingerprint).unwrap();
+        assert_eq!(receipt.name, "vendor");
+        assert_eq!(receipt.version, "1.0.0");
+        assert_eq!(receipt.source, "installed-signed");
+        assert!(!receipt.runtime_effective);
+        assert_eq!(receipt.signer_fingerprint_sha256, fingerprint);
+        assert_eq!(receipt.package_sha256, hex::encode(Sha256::digest(&bytes)));
+
+        let report = profile_list_report(store).unwrap();
+        assert!(report.installed_error.is_none());
+        let builtin = report
+            .profiles
+            .iter()
+            .find(|p| p.source == "built-in")
+            .unwrap();
+        assert_eq!(builtin.name, "grok");
+        let installed = report
+            .profiles
+            .iter()
+            .find(|p| p.source == "installed-signed")
+            .unwrap();
+        assert_eq!(installed.name, "vendor");
+        assert_eq!(installed.version.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            installed.signer_fingerprint_sha256.as_deref(),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(
+            installed.package_sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(&bytes)).as_str())
+        );
+
+        let shown = installed_profile_report(store, "vendor", "1.0.0").unwrap();
+        assert_eq!(shown.schema, PROFILE_INSTALLED_SCHEMA_VERSION);
+        assert_eq!(shown.source, "installed-signed");
+        assert_eq!(shown.name, "vendor");
+        assert_eq!(shown.version, "1.0.0");
+        assert!(!shown.runtime_effective);
+        assert_eq!(shown.profile.name, "vendor");
+        // JSON provenance shape carries no credential values, only public fingerprints/hashes.
+        let json = serde_json::to_value(&shown).unwrap();
+        assert_eq!(json["source"], "installed-signed");
+        assert_eq!(json["runtime_effective"], false);
+        assert_eq!(json["signer_fingerprint_sha256"], fingerprint);
+
+        assert!(remove_profile(store, "vendor", "1.0.0").unwrap());
+        assert!(!remove_profile(store, "vendor", "1.0.0").unwrap());
+        assert!(installed_profile_report(store, "vendor", "1.0.0").is_err());
+        let after = profile_list_report(store).unwrap();
+        assert!(after.profiles.iter().all(|p| p.source == "built-in"));
+    }
+
+    #[test]
+    fn install_rejects_wrong_signer_tamper_and_builtin_shadow_without_publishing() {
+        let store = tempfile::tempdir().unwrap();
+        let store = &store.path().join("profiles");
+        let input = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let bytes = envelope_bytes("vendor", "2.0.0");
+        let (package, signature, public_key, fingerprint) =
+            write_material(input.path(), &key, &bytes);
+
+        // Wrong pinned signer fingerprint.
+        let wrong = "aa".repeat(32);
+        assert!(install_profile(store, &package, &signature, &public_key, &wrong).is_err());
+
+        // Signature does not cover the tampered bytes.
+        let tampered = input.path().join("tampered.toml");
+        let mut mutated = bytes.clone();
+        let index = mutated.iter().position(|b| *b == b'v').unwrap();
+        mutated[index] = b'V';
+        fs::write(&tampered, &mutated).unwrap();
+        assert!(install_profile(store, &tampered, &signature, &public_key, &fingerprint).is_err());
+
+        // A signed package whose profile name shadows a built-in is refused.
+        let shadow_input = tempfile::tempdir().unwrap();
+        let shadow_bytes = envelope_bytes("grok", "2.0.0");
+        let (s_pkg, s_sig, s_key, s_fp) = write_material(shadow_input.path(), &key, &shadow_bytes);
+        assert!(install_profile(store, &s_pkg, &s_sig, &s_key, &s_fp).is_err());
+
+        // Nothing partially published: only built-ins remain listable.
+        let report = profile_list_report(store).unwrap();
+        assert!(report.profiles.iter().all(|p| p.source == "built-in"));
+        assert_eq!(
+            report.installed_error, None,
+            "unexpected installed listing failure"
+        );
+    }
+
+    #[test]
+    fn installed_show_and_list_fail_closed_after_stored_tamper_but_builtins_survive() {
+        let store = tempfile::tempdir().unwrap();
+        let store = &store.path().join("profiles");
+        let input = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let bytes = envelope_bytes("vendor", "3.0.0");
+        let (package, signature, public_key, fingerprint) =
+            write_material(input.path(), &key, &bytes);
+        install_profile(store, &package, &signature, &public_key, &fingerprint).unwrap();
+
+        // Corrupt the stored package bytes in place.
+        let stored = store
+            .join("vendor")
+            .join("3.0.0")
+            .join("profile-package.toml");
+        let mut corrupt = fs::read(&stored).unwrap();
+        corrupt[0] ^= 0xff;
+        fs::write(&stored, &corrupt).unwrap();
+
+        assert!(installed_profile_report(store, "vendor", "3.0.0").is_err());
+        let report = profile_list_report(store).unwrap();
+        // Built-ins are still listed even though the installed store now fails re-verification.
+        assert!(
+            report
+                .profiles
+                .iter()
+                .any(|p| p.name == "grok" && p.source == "built-in")
+        );
+        assert!(report.installed_error.is_some());
+    }
+
+    #[test]
+    fn store_error_rendering_and_component_validation_are_terminal_safe() {
+        // sanitize_terminal escapes control bytes and bidirectional formatting characters and
+        // never passes them through.
+        let hostile = "before\u{1b}]52;c;payload\u{7}\n\u{202e}after";
+        let safe = sanitize_terminal(hostile);
+        assert!(!safe.contains('\u{1b}'));
+        assert!(!safe.contains('\u{7}'));
+        assert!(!safe.contains('\n'));
+        assert!(!safe.contains('\u{202e}'));
+        assert!(safe.contains("\\u{1b}"));
+        assert!(safe.contains("\\u{202e}"));
+
+        // A signed-but-malformed package produces a TOML parser error whose hostile key cannot
+        // reach the terminal raw.
+        let store = tempfile::tempdir().unwrap();
+        let store = &store.path().join("profiles");
+        let input = tempfile::tempdir().unwrap();
+        let key = SigningKey::from_bytes(&[13; 32]);
+        let mut bytes = b"\"\\u001b]52;c;hostile\" = true\n".to_vec();
+        bytes.extend_from_slice(&envelope_bytes("vendor", "4.0.0"));
+        let (package, signature, public_key, fingerprint) =
+            write_material(input.path(), &key, &bytes);
+        let error =
+            install_profile(store, &package, &signature, &public_key, &fingerprint).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("\\u{1b}"));
+
+        // Traversal or control-bearing names are rejected before a path is built, with a
+        // sanitized message.
+        assert!(installed_profile_report(store, "../etc", "4.0.0").is_err());
+        let control = installed_profile_report(store, "vendor", "bad\u{1b}version").unwrap_err();
+        let control = format!("{control:#}");
+        assert!(!control.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn builtin_inspection_is_unaffected_by_a_corrupt_store() {
+        let store = tempfile::tempdir().unwrap();
+        let store = &store.path().join("profiles");
+        // Hand-assemble a corrupt store: an orphan dotted entry forces list to fail closed.
+        fs::create_dir_all(store).unwrap();
+        fs::set_permissions(store, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(store.join(".orphan")).unwrap();
+        fs::set_permissions(store.join(".orphan"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Built-in show and the built-in portion of list still work.
+        assert_eq!(resolve_builtin_profile("grok").unwrap().name, "grok");
+        let report = profile_list_report(store).unwrap();
+        assert!(
+            report
+                .profiles
+                .iter()
+                .any(|p| p.name == "grok" && p.source == "built-in")
+        );
+        assert!(report.installed_error.is_some());
+    }
+
+    #[test]
+    fn no_runtime_module_consumes_the_profile_store_api() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut sources = Vec::new();
+        collect_rust_sources(&manifest.join("../sandbox-guard-runner/src"), &mut sources);
+        // Every CLI source except this inspection/store module is also forbidden from importing
+        // the signed store. This covers the Grok adapter, generic run wiring, and future adapters
+        // rather than relying on a hand-maintained list of runtime modules.
+        collect_rust_sources(&manifest.join("src"), &mut sources);
+        sources.retain(|source| source != &manifest.join("src/profile.rs"));
+
+        let forbidden = [
+            "profile_store",
+            "install_verified_profile",
+            "list_installed_profiles",
+            "remove_installed_profile",
+            "verify_installed_profile",
+            "InstalledProfile",
+            "ProfileInstallManifest",
+        ];
+        for source in sources {
+            let text = fs::read_to_string(&source).unwrap();
+            for needle in forbidden {
+                assert!(
+                    !text.contains(needle),
+                    "runtime source {source:?} references profile-store symbol {needle:?}"
+                );
+            }
+        }
+    }
+
+    fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
     }
 }

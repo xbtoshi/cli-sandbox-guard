@@ -145,7 +145,24 @@ but the lint-only result cannot be installed, trusted, or executed. v0.3 never
 uses owner- or project-supplied profiles for a run. Scripts should use `--json`
 rather than relying on the human-oriented output. `profile lint --json` emits
 JSON for a valid document; invalid input exits 1 and reports a sanitized error
-on standard error. The Grok adapter currently consumes the compiled launch and Lima guest
+on standard error.
+
+`guard profile install` verifies a signed profile package and stores it in an
+owner-private location Guard derives internally; there is no store-path flag,
+downloader, or ambient signer trust. The signature authenticates the exact
+profile bytes under an owner-pinned signer fingerprint — it does not attest a
+release binary. `guard profile list` then also shows installed profiles with
+their provenance and exact distribution version, and `guard profile show NAME
+--version VERSION` re-verifies and prints one installed profile; there is no
+latest-version fallback. Every installed-profile read re-checks the stored
+bytes, signature, signer pin, manifest, and path identity before any content is
+shown. Installed profiles are content-only this milestone: they are never
+runtime-effective, cannot be reached by `guard grok` or any run, and never
+shadow a built-in name. `guard profile remove NAME VERSION` deletes only that
+exact name and version. The signed-profile install and inspection commands are
+documented in more detail under "Signed vendor profiles" below.
+
+The Grok adapter currently consumes the compiled launch and Lima guest
 executable, egress, credential, session, clipboard-import, and terminal sections, including the
 runner-validated writable-home mount target;
 `profile explain grok` reports the exact partial-migration status without treating
@@ -408,6 +425,42 @@ is never overwritten. Recheck an installation with:
 This is an offline verification foundation. Version 0.3 does not download updates, manage a
 root-owned key policy, install a canonical root-owned wrapper, or automatically re-verify a tool
 when `guard run` selects it.
+
+## Signed vendor profiles
+
+`guard profile install` verifies a detached Ed25519 signature over the exact profile package bytes
+against a pinned signer fingerprint, then atomically publishes the package into an owner-private
+store. The store path is derived internally from Guard's data directory; there is deliberately no
+store-path flag, project-relative lookup, downloader, or ambient signer trust. Signature and key
+files are hexadecimal:
+
+    guard profile install \
+      --package ./vendor-profile.toml \
+      --signature ./vendor-profile.sig.hex \
+      --public-key ./vendor-ed25519.pub.hex \
+      --signer-sha256 <64-hex-character-fingerprint>
+
+The signature authenticates the exact profile bytes under the owner-pinned signer fingerprint. It
+does not attest a release binary, and installing a profile does not make it executable. An existing
+name and version is never overwritten, and a package whose profile name matches a built-in is
+refused so installed profiles can never shadow a compiled one.
+
+List installed profiles alongside the built-ins, re-verify and print one installed profile by its
+exact version, or remove exactly one name and version:
+
+    guard profile list
+    guard profile show vendor-profile --version 1.2.3
+    guard profile remove vendor-profile 1.2.3
+
+Every installed-profile inspection re-reads the stored bytes and re-checks the signature, signer
+pin, package hash, manifest, and stored path identity before printing anything; a tampered
+installation fails closed. `guard profile show NAME --version VERSION` has no latest-version
+fallback, and a corrupt installed store never hides the built-in listing. Exact-version removal
+does not require a valid signature, so a corrupted installation remains removable; it still
+validates the owner-private store path and refuses symlink redirection. Installed profiles are
+content-only in this milestone: they are not runtime-effective and cannot be reached by `guard
+grok`, `guard run`, the built-in resolver, or owner overlays. `guard uninstall` removes the profile
+store together with the rest of Guard's private data directory.
 
 ## Policy and development status
 

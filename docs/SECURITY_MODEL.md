@@ -154,6 +154,19 @@ every intentionally forwarded credential to an allowlisted service.
   before authentication, staging, or backend setup; Guard never warns and continues with the
   wider base profile. External documents accepted by `profile lint` remain inspection-only and
   cannot enter this runtime path.
+- Signed vendor profiles installed with `guard profile install` are verified once against a pinned
+  signer fingerprint and re-verified on every later read. The signature authenticates the exact
+  profile bytes under the owner-pinned fingerprint; it does not attest a release binary. The store
+  lives at an internally derived owner-private path with no store-path flag, downloader, or ambient
+  signer trust, and a package whose profile name matches a built-in is refused. Installed profiles
+  are content-only in this milestone: they are never runtime-effective and are unreachable from
+  `guard grok`, `guard run`, the built-in resolver, and owner overlays. Every installed-profile
+  inspection re-checks the stored bytes, signature, signer pin, package hash, manifest, and stored
+  path identity and fails closed on any mismatch; a corrupt installed store never suppresses the
+  built-in listing. `guard profile remove NAME VERSION` deletes only that exact name and version;
+  it intentionally does not require a valid signature so corrupted state remains removable, but
+  still enforces the owner-private, non-symlink store boundary. `guard uninstall` removes the
+  profile store with the rest of Guard's private data directory.
 - `guard grok` accepts only an owner-owned, owner-private, singly linked regular
   `~/.grok/auth.json` no larger than 1 MiB and extracts only the newest unexpired OIDC access token.
 - The host auth file, refresh token, Grok configuration, logs, and home directory are never staged

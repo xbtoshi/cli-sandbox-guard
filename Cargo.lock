@@ -815,6 +815,7 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
+ "ed25519-dalek",
  "hex",
  "libc",
  "sandbox-guard-core",

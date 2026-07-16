@@ -70,7 +70,7 @@ enum Command {
     Test(TestArgs),
     /// Install or verify a detached-signature-verified tool artifact.
     Tool(ToolArgs),
-    /// Inspect compiled trusted vendor profiles. External profiles are not executable.
+    /// Inspect compiled profiles and manage signed profiles. Installed profiles are not executable.
     Profile(profile::ProfileArgs),
 }
 

@@ -158,7 +158,7 @@ fn build_plan(
         "state.data",
         data,
         home,
-        "Guard audits, pending changes, verified tools, remembered egress decisions, and Grok session snapshots",
+        "Guard audits, pending changes, verified tools, installed signed profiles, remembered egress decisions, and Grok session snapshots",
         None,
     );
     let config_duplicate = (config == data).then(|| "state.data".to_owned());

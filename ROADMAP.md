@@ -92,7 +92,13 @@ We will not adopt these weaker postures:
 - [x] Permit owner-controlled policy to tighten a profile, never widen a built-in boundary.
 - [x] Add `guard profile list`, `guard profile show`, `guard profile lint`, and
   `guard profile explain`.
-- [ ] Require signed profiles before supporting third-party distribution.
+- [x] Require signed profiles before supporting third-party distribution. `guard profile install`
+  verifies a detached Ed25519 signature over the exact profile bytes against a pinned signer
+  fingerprint and stores it in an internally derived owner-private location; `guard profile list`
+  and `show NAME --version VERSION` re-verify installed profiles on every read. Exact-version
+  removal remains available even when stored content is corrupt, while retaining the store's path,
+  ownership, and symlink checks. Runtime consumption is deliberately deferred: installed profiles
+  are content-only and are never runtime-effective this milestone.
 
 ## Phase 2: violations, inspection, and approval UX
 
