@@ -5,8 +5,8 @@
 **Probe actor:** the confined tool process (Grok) under a live `guard grok` session on a macOS host
 using the Lima backend
 **Remediation status:** see [Remediation in alpha.4](#remediation-in-alpha4). Finding 1 is fixed;
-Finding 2 is accepted and documented; Finding 4 candidates are converted to real built-in denies and
-tests; Finding 3 is a documented intentional residual.
+Finding 2 is accepted and documented; selected high-confidence Finding 4 candidates are now covered
+by real built-in denies and tests; Finding 3 is a documented intentional residual.
 
 > **Redaction and provenance note.** All host/guest identifiers observed during this probe
 > (username, guest home directory, internal proxy IP and port, per-run stage UUID, runtime ports)
@@ -282,7 +282,7 @@ with an unauthenticated `GET /`.
 
 ---
 
-## Finding 4 — Built-in secret-filename policy: candidate gaps (rule approximation) — **candidates converted in alpha.4**
+## Finding 4 — Built-in secret-filename policy: candidate gaps (rule approximation) — **selected candidates denied in alpha.4**
 
 ### Constraint
 
@@ -353,7 +353,7 @@ third-party hosts was performed.
 | 1 | Launcher session env readable on bwrap `/proc/1/environ` | Yes (Lima metadata) | No | Medium under Lima; potentially High on direct Linux when secrets were inherited | **Fixed** |
 | 2 | Staging pathnames in bwrap `/proc/1/cmdline` | Yes | No | Low (metadata) | **Accepted, documented** |
 | 3 | Access token + allowlisted HTTPS usable by tool | Yes | No | High for confidentiality *within model* | **Intentional residual** |
-| 4 | Secret-filename candidate gaps (rule approximation) | Approximation | N/A | Medium if such files exist | **Candidates converted + native tests** |
+| 4 | Secret-filename candidate gaps (rule approximation) | Approximation | N/A | Medium if such files exist | **Selected candidates denied + native tests** |
 | — | Host file / network / seccomp breakout | Attempted, failed | No | — | — |
 
 ---
