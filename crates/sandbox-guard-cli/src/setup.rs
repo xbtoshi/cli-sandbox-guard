@@ -1,0 +1,1737 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, anyhow, bail};
+use directories::{BaseDirs, ProjectDirs};
+use sandbox_guard_core::CompiledPolicy;
+use sandbox_guard_runner::BackendKind;
+use serde::Serialize;
+
+use crate::{SetupArgs, current_uid};
+
+const REPORT_SCHEMA: u32 = 1;
+const DEFAULT_GUEST_HELPER: &str = "/usr/local/bin/guard-helper";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CheckStatus {
+    Ok,
+    Missing,
+    Mismatch,
+    Misconfigured,
+    Unsafe,
+    Unverifiable,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum RepairKind {
+    Auto,
+    Manual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct Repair {
+    kind: RepairKind,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    requires: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    commands: Vec<String>,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SetupCheck {
+    id: String,
+    component: String,
+    required: bool,
+    status: CheckStatus,
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repair: Option<Repair>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SetupReport {
+    schema: u32,
+    platform: String,
+    backend: BackendKind,
+    ready: bool,
+    checks: Vec<SetupCheck>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    actions_taken: Vec<String>,
+}
+
+impl SetupReport {
+    fn finish(mut self) -> Self {
+        self.ready = self
+            .checks
+            .iter()
+            .filter(|check| check.required)
+            .all(|check| check.status == CheckStatus::Ok);
+        self
+    }
+
+    fn exit_code(&self) -> i32 {
+        if self
+            .checks
+            .iter()
+            .any(|check| check.required && check.status == CheckStatus::Error)
+        {
+            3
+        } else if self.ready {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+impl CheckStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Missing => "missing",
+            Self::Mismatch => "mismatch",
+            Self::Misconfigured => "misconfigured",
+            Self::Unsafe => "unsafe",
+            Self::Unverifiable => "unverifiable",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl RepairKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SetupPaths {
+    home: PathBuf,
+    data: PathBuf,
+    config: PathBuf,
+    audit: PathBuf,
+    pending_changes: PathBuf,
+    tools: PathBuf,
+}
+
+impl SetupPaths {
+    fn discover() -> Result<Self> {
+        let base =
+            BaseDirs::new().ok_or_else(|| anyhow!("could not determine the home directory"))?;
+        let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
+            .ok_or_else(|| anyhow!("could not determine Guard state directories"))?;
+        let data = project.data_local_dir().to_path_buf();
+        let config = project.config_dir().to_path_buf();
+        Ok(Self {
+            home: base.home_dir().to_path_buf(),
+            audit: data.join("audit"),
+            pending_changes: data.join("pending-changes"),
+            tools: data.join("tools"),
+            data,
+            config,
+        })
+    }
+
+    fn private_directories(&self) -> [(&'static str, &Path); 5] {
+        [
+            ("state.data.private", &self.data),
+            ("state.config.private", &self.config),
+            ("state.audit.private", &self.audit),
+            ("state.pending-changes.private", &self.pending_changes),
+            ("state.tools.private", &self.tools),
+        ]
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProbeOutput {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+trait SetupProbes {
+    fn which(&self, name: &str) -> Option<PathBuf>;
+    fn host_helper_path(&self) -> Option<PathBuf>;
+    fn output(&self, program: &Path, args: &[OsString]) -> std::io::Result<ProbeOutput>;
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+    fn openat2_available(&self) -> std::result::Result<bool, String>;
+}
+
+struct SystemProbes;
+
+impl SetupProbes for SystemProbes {
+    fn which(&self, name: &str) -> Option<PathBuf> {
+        which::which(name).ok()
+    }
+
+    fn host_helper_path(&self) -> Option<PathBuf> {
+        env::current_exe()
+            .ok()
+            .map(|path| path.with_file_name("guard-helper"))
+            .filter(|path| path.is_file())
+            .or_else(|| self.which("guard-helper"))
+    }
+
+    fn output(&self, program: &Path, args: &[OsString]) -> std::io::Result<ProbeOutput> {
+        Command::new(program)
+            .args(args)
+            .output()
+            .map(|output| ProbeOutput {
+                success: output.status.success(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+    }
+
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+        fs::read_to_string(path)
+    }
+
+    fn openat2_available(&self) -> std::result::Result<bool, String> {
+        probe_openat2()
+    }
+}
+
+pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
+    validate_lima_instance(&args.lima_instance)?;
+    let backend: BackendKind = args.backend.into();
+    let backend = backend.resolve()?;
+    let paths = SetupPaths::discover()?;
+    let probes = SystemProbes;
+
+    let initial = diagnose(&probes, backend, &args.lima_instance, &paths)?;
+    let actions = if args.check {
+        Vec::new()
+    } else {
+        apply_safe_repairs(&initial, &paths)?
+    };
+    let mut report = if actions.is_empty() {
+        initial
+    } else {
+        diagnose(&probes, backend, &args.lima_instance, &paths)?
+    };
+    report.actions_taken = actions;
+    report = report.finish();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        render_human(&report, args.check);
+    }
+    Ok(report.exit_code())
+}
+
+fn diagnose(
+    probes: &dyn SetupProbes,
+    backend: BackendKind,
+    lima_instance: &str,
+    paths: &SetupPaths,
+) -> Result<SetupReport> {
+    let mut checks = Vec::new();
+    checks.push(executable_check(
+        probes,
+        "host.git",
+        "host",
+        "git",
+        true,
+        platform_install_repair("git"),
+    ));
+
+    let policy = CompiledPolicy::builtin();
+    checks.push(match policy {
+        Ok(policy) => ok_check(
+            "policy.builtin",
+            "policy",
+            true,
+            format!("built-in policy compiled ({})", policy.hash()),
+        ),
+        Err(error) => error_check(
+            "policy.builtin",
+            "policy",
+            true,
+            format!("built-in policy failed to compile: {error:#}"),
+        ),
+    });
+
+    for (id, path) in paths.private_directories() {
+        checks.push(private_directory_check(id, path, &paths.home));
+    }
+
+    match backend {
+        BackendKind::LinuxBwrap => diagnose_linux(probes, &mut checks),
+        BackendKind::MacosLima => {
+            diagnose_macos(probes, &mut checks, lima_instance)?;
+        }
+        BackendKind::Auto => unreachable!("backend is resolved before diagnosis"),
+    }
+
+    Ok(SetupReport {
+        schema: REPORT_SCHEMA,
+        platform: format!("{}-{}", env::consts::OS, env::consts::ARCH),
+        backend,
+        ready: false,
+        checks,
+        actions_taken: Vec::new(),
+    })
+}
+
+fn diagnose_linux(probes: &dyn SetupProbes, checks: &mut Vec<SetupCheck>) {
+    checks.push(executable_check(
+        probes,
+        "linux.bwrap",
+        "linux-host",
+        "bwrap",
+        true,
+        manual_repair(
+            "Install Bubblewrap from the system package manager; Guard never invokes sudo.",
+            &["sudo", "network"],
+            &["sudo apt-get update && sudo apt-get install -y bubblewrap"],
+        ),
+    ));
+    checks.extend(host_helper_checks(probes));
+    checks.push(match probes.openat2_available() {
+        Ok(true) => ok_check(
+            "linux.openat2",
+            "linux-kernel",
+            true,
+            "openat2 is available for descriptor-safe staging".to_owned(),
+        ),
+        Ok(false) => SetupCheck {
+            id: "linux.openat2".to_owned(),
+            component: "linux-kernel".to_owned(),
+            required: true,
+            status: CheckStatus::Missing,
+            detail:
+                "openat2 is unavailable; Linux 5.6 or newer is required and Guard will fail closed"
+                    .to_owned(),
+            path: None,
+            repair: Some(manual_repair(
+                "Upgrade to a kernel that provides openat2; no fallback is permitted.",
+                &["sudo", "confirmation"],
+                &[],
+            )),
+        },
+        Err(error) => error_check(
+            "linux.openat2",
+            "linux-kernel",
+            true,
+            format!("could not probe openat2: {error}"),
+        ),
+    });
+
+    let userns_path = Path::new("/proc/sys/user/max_user_namespaces");
+    checks.push(match probes.read_to_string(userns_path) {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(0) => SetupCheck {
+                id: "linux.userns".to_owned(),
+                component: "linux-kernel".to_owned(),
+                required: true,
+                status: CheckStatus::Misconfigured,
+                detail: "unprivileged user namespaces are disabled".to_owned(),
+                path: Some(userns_path.to_path_buf()),
+                repair: Some(manual_repair(
+                    "Enable user namespaces according to the host distribution policy.",
+                    &["sudo", "confirmation"],
+                    &[],
+                )),
+            },
+            Ok(limit) => ok_check(
+                "linux.userns",
+                "linux-kernel",
+                true,
+                format!("user namespace limit is {limit}"),
+            ),
+            Err(_) => error_check(
+                "linux.userns",
+                "linux-kernel",
+                true,
+                format!("invalid value in {}: {value:?}", userns_path.display()),
+            ),
+        },
+        Err(error) => error_check(
+            "linux.userns",
+            "linux-kernel",
+            true,
+            format!("could not read {}: {error}", userns_path.display()),
+        ),
+    });
+
+    checks.push(executable_check(
+        probes,
+        "linux.systemd-run",
+        "linux-cgroup",
+        "systemd-run",
+        false,
+        manual_repair(
+            "Install systemd-run only if cgroup-required mode is needed.",
+            &["sudo", "network"],
+            &[],
+        ),
+    ));
+    checks.push(executable_check(
+        probes,
+        "linux.zenity",
+        "approval-ui",
+        "zenity",
+        false,
+        manual_repair(
+            "Install Zenity to enable native interactive egress approval on Linux.",
+            &["sudo", "network"],
+            &["sudo apt-get install -y zenity"],
+        ),
+    ));
+}
+
+fn diagnose_macos(
+    probes: &dyn SetupProbes,
+    checks: &mut Vec<SetupCheck>,
+    instance: &str,
+) -> Result<()> {
+    let shell_instance = shell_word(instance)?;
+    let Some(limactl) = probes.which("limactl") else {
+        checks.push(SetupCheck {
+            id: "macos.limactl".to_owned(),
+            component: "macos-host".to_owned(),
+            required: true,
+            status: CheckStatus::Missing,
+            detail: "limactl was not found on PATH".to_owned(),
+            path: None,
+            repair: Some(manual_repair(
+                "Install Lima; Guard does not run Homebrew or download packages.",
+                &["network"],
+                &["brew install lima"],
+            )),
+        });
+        return Ok(());
+    };
+    checks.push(ok_path_check(
+        "macos.limactl",
+        "macos-host",
+        true,
+        "Lima CLI found".to_owned(),
+        limactl.clone(),
+    ));
+
+    let list_args = vec![
+        OsString::from("list"),
+        OsString::from("--json"),
+        OsString::from(instance),
+    ];
+    let list = match probes.output(&limactl, &list_args) {
+        Ok(output) => output,
+        Err(error) => {
+            checks.push(error_check(
+                "lima.instance.exists",
+                "lima-guest",
+                true,
+                format!("failed to inspect Lima instance {instance:?}: {error}"),
+            ));
+            return Ok(());
+        }
+    };
+    if !list.success {
+        checks.push(SetupCheck {
+            id: "lima.instance.exists".to_owned(),
+            component: "lima-guest".to_owned(),
+            required: true,
+            status: CheckStatus::Missing,
+            detail: format!(
+                "Lima instance {instance:?} is unavailable: {}",
+                concise_output(&list.stderr)
+            ),
+            path: None,
+            repair: Some(manual_repair(
+                "Create the dedicated instance with host mounts disabled.",
+                &["network", "confirmation"],
+                &[&format!(
+                    "limactl create --name={} --mount-none template:default",
+                    shell_instance
+                )],
+            )),
+        });
+        return Ok(());
+    }
+
+    let value: serde_json::Value = match serde_json::from_slice(&list.stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            checks.push(error_check(
+                "lima.instance.exists",
+                "lima-guest",
+                true,
+                format!("limactl returned invalid JSON: {error}"),
+            ));
+            return Ok(());
+        }
+    };
+    checks.push(ok_check(
+        "lima.instance.exists",
+        "lima-guest",
+        true,
+        format!("Lima instance {instance:?} exists"),
+    ));
+
+    let config = value.get("config").and_then(serde_json::Value::as_object);
+    let declared_mounts = config.and_then(|config| config.get("mounts"));
+    let declared_mounts_unsafe = declared_mounts
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|mounts| !mounts.is_empty());
+    match (config, declared_mounts) {
+        (None, _) => checks.push(error_check(
+            "lima.instance.mountless-config",
+            "lima-guest",
+            true,
+            "limactl JSON omitted the required config object; mountlessness is unknown".to_owned(),
+        )),
+        (_, Some(mounts)) if !mounts.is_array() => checks.push(error_check(
+            "lima.instance.mountless-config",
+            "lima-guest",
+            true,
+            "limactl JSON config.mounts was not an array; mountlessness is unknown".to_owned(),
+        )),
+        (_, Some(mounts)) if mounts.as_array().is_some_and(|mounts| !mounts.is_empty()) => checks
+            .push(SetupCheck {
+                id: "lima.instance.mountless-config".to_owned(),
+                component: "lima-guest".to_owned(),
+                required: true,
+                status: CheckStatus::Unsafe,
+                detail: format!(
+                    "instance declares {} host mount(s); Guard will not delete or recreate it",
+                    mounts.as_array().map_or(0, Vec::len)
+                ),
+                path: None,
+                repair: None,
+            }),
+        (Some(_), Some(_) | None) => checks.push(ok_check(
+            "lima.instance.mountless-config",
+            "lima-guest",
+            true,
+            "instance configuration declares no host mounts".to_owned(),
+        )),
+    }
+
+    let status = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if status != "Running" {
+        checks.push(SetupCheck {
+            id: "lima.instance.running".to_owned(),
+            component: "lima-guest".to_owned(),
+            required: true,
+            status: if status == "unknown" {
+                CheckStatus::Unverifiable
+            } else {
+                CheckStatus::Missing
+            },
+            detail: format!("instance status is {status:?}; guest checks were not executed"),
+            path: None,
+            repair: (!declared_mounts_unsafe).then(|| {
+                manual_repair(
+                    "Start the instance with host mounts disabled, then re-run the check.",
+                    &["confirmation"],
+                    &[&format!("limactl start --mount-none {}", shell_instance)],
+                )
+            }),
+        });
+        return Ok(());
+    }
+    checks.push(ok_check(
+        "lima.instance.running",
+        "lima-guest",
+        true,
+        "instance is running".to_owned(),
+    ));
+
+    let mounts = lima_shell(
+        probes,
+        &limactl,
+        instance,
+        &["findmnt", "--noheadings", "--output", "TARGET,FSTYPE"],
+    );
+    checks.push(match mounts {
+        Ok(output) if !output.success => error_check(
+            "lima.instance.mountless-runtime",
+            "lima-guest",
+            true,
+            format!("findmnt failed: {}", concise_output(&output.stderr)),
+        ),
+        Ok(output) => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if let Some(line) = text.lines().find(|line| {
+                let lower = line.to_ascii_lowercase();
+                ["9p", "virtiofs", "sshfs", "reverse-sshfs"]
+                    .iter()
+                    .any(|kind| lower.contains(kind))
+            }) {
+                SetupCheck {
+                    id: "lima.instance.mountless-runtime".to_owned(),
+                    component: "lima-guest".to_owned(),
+                    required: true,
+                    status: CheckStatus::Unsafe,
+                    detail: format!("unsafe host-sharing mount detected: {}", line.trim()),
+                    path: None,
+                    repair: None,
+                }
+            } else {
+                ok_check(
+                    "lima.instance.mountless-runtime",
+                    "lima-guest",
+                    true,
+                    "runtime mount table contains no known host-sharing filesystem".to_owned(),
+                )
+            }
+        }
+        Err(error) => error_check(
+            "lima.instance.mountless-runtime",
+            "lima-guest",
+            true,
+            format!("failed to inspect guest mounts: {error}"),
+        ),
+    });
+
+    let packages = lima_shell(
+        probes,
+        &limactl,
+        instance,
+        &[
+            "sh",
+            "-c",
+            "missing=0; for name in bwrap git rsync findmnt; do command -v \"$name\" >/dev/null || { echo \"$name\"; missing=1; }; done; exit \"$missing\"",
+        ],
+    );
+    checks.push(command_result_check(
+        "lima.guest.packages",
+        "lima-guest",
+        packages,
+        "guest contains bwrap, git, rsync, and findmnt",
+        manual_repair(
+            "Install the required packages inside the guest; Guard never invokes guest sudo.",
+            &["sudo", "network"],
+            &[
+                &format!("limactl shell {shell_instance} -- sudo apt-get update"),
+                &format!(
+                    "limactl shell {} -- sudo apt-get install -y bubblewrap git rsync util-linux ca-certificates",
+                    shell_instance
+                ),
+            ],
+        ),
+    ));
+
+    let helper_test = lima_shell(
+        probes,
+        &limactl,
+        instance,
+        &["test", "-x", DEFAULT_GUEST_HELPER],
+    );
+    let helper_present = helper_test.as_ref().is_ok_and(|output| output.success);
+    checks.push(command_result_check(
+        "lima.guest.helper.present",
+        "lima-guest",
+        helper_test,
+        "guest runtime helper is executable",
+        manual_repair(
+            "Install the guard-helper from the same verified release as guard; setup does not trust an arbitrary helper artifact.",
+            &["confirmation"],
+            &[],
+        ),
+    ));
+    if helper_present {
+        let helper_version = lima_shell(
+            probes,
+            &limactl,
+            instance,
+            &[DEFAULT_GUEST_HELPER, "--version"],
+        );
+        checks.push(version_check(
+            "lima.guest.helper.version",
+            "lima-guest",
+            helper_version,
+            "guard-helper",
+            env!("CARGO_PKG_VERSION"),
+        ));
+    }
+    Ok(())
+}
+
+fn lima_shell(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    command: &[&str],
+) -> std::io::Result<ProbeOutput> {
+    let mut args = vec![
+        OsString::from("--tty=false"),
+        OsString::from("shell"),
+        OsString::from(instance),
+        OsString::from("--"),
+    ];
+    args.extend(command.iter().map(OsString::from));
+    probes.output(limactl, &args)
+}
+
+fn executable_check(
+    probes: &dyn SetupProbes,
+    id: &str,
+    component: &str,
+    executable: &str,
+    required: bool,
+    repair: Repair,
+) -> SetupCheck {
+    match probes.which(executable) {
+        Some(path) => ok_path_check(id, component, required, format!("{executable} found"), path),
+        None => SetupCheck {
+            id: id.to_owned(),
+            component: component.to_owned(),
+            required,
+            status: CheckStatus::Missing,
+            detail: format!("{executable} was not found on PATH"),
+            path: None,
+            repair: Some(repair),
+        },
+    }
+}
+
+fn host_helper_checks(probes: &dyn SetupProbes) -> Vec<SetupCheck> {
+    let helper = probes.host_helper_path();
+    let Some(helper) = helper else {
+        return vec![SetupCheck {
+            id: "host.helper.present".to_owned(),
+            component: "linux-host".to_owned(),
+            required: true,
+            status: CheckStatus::Missing,
+            detail: "guard-helper was not found beside guard or on PATH".to_owned(),
+            path: None,
+            repair: Some(manual_repair(
+                "Reinstall guard and guard-helper together from the same verified release archive.",
+                &["confirmation"],
+                &[],
+            )),
+        }];
+    };
+    let present = ok_path_check(
+        "host.helper.present",
+        "linux-host",
+        true,
+        "trusted runtime helper found".to_owned(),
+        helper.clone(),
+    );
+    let args = [OsString::from("--version")];
+    let version = match probes.output(&helper, &args) {
+        Ok(output) if output.success => {
+            let mut check = version_check(
+                "host.helper.version",
+                "linux-host",
+                Ok(output),
+                "guard-helper",
+                env!("CARGO_PKG_VERSION"),
+            );
+            check.path = Some(helper);
+            check
+        }
+        Ok(output) => error_check(
+            "host.helper.version",
+            "linux-host",
+            true,
+            format!(
+                "guard-helper --version failed: {}",
+                concise_output(&output.stderr)
+            ),
+        ),
+        Err(error) => error_check(
+            "host.helper.version",
+            "linux-host",
+            true,
+            format!("could not execute {}: {error}", helper.display()),
+        ),
+    };
+    vec![present, version]
+}
+
+fn version_check(
+    id: &str,
+    component: &str,
+    output: std::io::Result<ProbeOutput>,
+    executable: &str,
+    expected: &str,
+) -> SetupCheck {
+    match output {
+        Ok(output) if output.success => {
+            let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let expected_line = format!("{executable} {expected}");
+            if actual == expected_line {
+                ok_check(
+                    id,
+                    component,
+                    true,
+                    format!("version matches guard ({expected})"),
+                )
+            } else {
+                SetupCheck {
+                    id: id.to_owned(),
+                    component: component.to_owned(),
+                    required: true,
+                    status: CheckStatus::Mismatch,
+                    detail: format!("expected {expected_line:?}, got {actual:?}"),
+                    path: None,
+                    repair: Some(manual_repair(
+                        "Install guard and guard-helper from the same verified release.",
+                        &["confirmation"],
+                        &[],
+                    )),
+                }
+            }
+        }
+        Ok(output) => error_check(
+            id,
+            component,
+            true,
+            format!("version probe failed: {}", concise_output(&output.stderr)),
+        ),
+        Err(error) => error_check(
+            id,
+            component,
+            true,
+            format!("version probe could not run: {error}"),
+        ),
+    }
+}
+
+fn command_result_check(
+    id: &str,
+    component: &str,
+    output: std::io::Result<ProbeOutput>,
+    success_detail: &str,
+    repair: Repair,
+) -> SetupCheck {
+    match output {
+        Ok(output) if output.success => ok_check(id, component, true, success_detail.to_owned()),
+        Ok(output) => SetupCheck {
+            id: id.to_owned(),
+            component: component.to_owned(),
+            required: true,
+            status: CheckStatus::Missing,
+            detail: concise_failure(&output),
+            path: None,
+            repair: Some(repair),
+        },
+        Err(error) => error_check(id, component, true, format!("probe could not run: {error}")),
+    }
+}
+
+fn private_directory_check(id: &str, path: &Path, home: &Path) -> SetupCheck {
+    if let Err(error) = validate_existing_path_components(path, home) {
+        return SetupCheck {
+            id: id.to_owned(),
+            component: "guard-state".to_owned(),
+            required: true,
+            status: CheckStatus::Unsafe,
+            detail: error.to_string(),
+            path: Some(path.to_path_buf()),
+            repair: None,
+        };
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == current_uid()
+                && metadata.permissions().mode() & 0o077 == 0 =>
+        {
+            ok_path_check(
+                id,
+                "guard-state",
+                true,
+                "private directory is owner-only".to_owned(),
+                path.to_path_buf(),
+            )
+        }
+        Ok(metadata)
+            if metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == current_uid() =>
+        {
+            SetupCheck {
+                id: id.to_owned(),
+                component: "guard-state".to_owned(),
+                required: true,
+                status: CheckStatus::Misconfigured,
+                detail: format!(
+                    "mode {:o} is broader than owner-only",
+                    metadata.permissions().mode() & 0o777
+                ),
+                path: Some(path.to_path_buf()),
+                repair: Some(auto_repair("Set the Guard-owned directory mode to 0700.")),
+            }
+        }
+        Ok(_) => SetupCheck {
+            id: id.to_owned(),
+            component: "guard-state".to_owned(),
+            required: true,
+            status: CheckStatus::Unsafe,
+            detail: "path is not an owner-controlled, non-symlink directory".to_owned(),
+            path: Some(path.to_path_buf()),
+            repair: None,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SetupCheck {
+            id: id.to_owned(),
+            component: "guard-state".to_owned(),
+            required: true,
+            status: CheckStatus::Missing,
+            detail: "Guard-owned private directory does not exist".to_owned(),
+            path: Some(path.to_path_buf()),
+            repair: Some(auto_repair(
+                "Create the Guard-owned directory with mode 0700.",
+            )),
+        },
+        Err(error) => error_check(
+            id,
+            "guard-state",
+            true,
+            format!("could not inspect {}: {error}", path.display()),
+        ),
+    }
+}
+
+fn validate_existing_path_components(path: &Path, home: &Path) -> Result<()> {
+    let anchor = trusted_anchor(path, home)?;
+    let relative = path
+        .strip_prefix(&anchor)
+        .context("derive Guard state path relative to trusted anchor")?;
+    let mut current = anchor;
+    validate_owned_directory(&current, false)?;
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(_) => validate_owned_directory(&current, false)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect directory component {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn trusted_anchor(path: &Path, home: &Path) -> Result<PathBuf> {
+    if path.starts_with(home) && path != home {
+        return Ok(home.to_path_buf());
+    }
+    let mut candidate = path
+        .parent()
+        .ok_or_else(|| anyhow!("Guard state path has no parent: {}", path.display()))?
+        .to_path_buf();
+    loop {
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => {
+                validate_owned_directory(&candidate, false).with_context(|| {
+                    format!(
+                        "external data/config root is not anchored by an owner-controlled directory: {}",
+                        candidate.display()
+                    )
+                })?;
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !candidate.pop() {
+                    bail!("no existing owner-controlled anchor for {}", path.display());
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect state anchor {}", candidate.display()));
+            }
+        }
+    }
+}
+
+fn apply_safe_repairs(report: &SetupReport, paths: &SetupPaths) -> Result<Vec<String>> {
+    let allowed: BTreeMap<&Path, &str> = paths
+        .private_directories()
+        .into_iter()
+        .map(|(id, path)| (path, id))
+        .collect();
+    let mut actions = Vec::new();
+    let mut repaired = BTreeSet::new();
+    for check in &report.checks {
+        let Some(path) = check.path.as_deref() else {
+            continue;
+        };
+        if check.repair.as_ref().map(|repair| &repair.kind) != Some(&RepairKind::Auto)
+            || !allowed.contains_key(path)
+            || !repaired.insert(path.to_path_buf())
+        {
+            continue;
+        }
+        repair_private_directory(path, &paths.home)
+            .with_context(|| format!("repair {}", check.id))?;
+        actions.push(format!("secured {} as mode 0700", path.display()));
+    }
+    Ok(actions)
+}
+
+fn repair_private_directory(path: &Path, home: &Path) -> Result<()> {
+    let anchor = trusted_anchor(path, home)?;
+    let relative = path
+        .strip_prefix(&anchor)
+        .context("derive Guard state path relative to trusted anchor")?;
+    let mut current = anchor;
+    validate_owned_directory(&current, false)?;
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(_) => validate_owned_directory(&current, false)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&current)
+                    .with_context(|| format!("create private directory {}", current.display()))?;
+                secure_private_directory(&current)?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect private directory {}", current.display()));
+            }
+        }
+    }
+    validate_owned_directory(path, false)?;
+    secure_private_directory(path)
+}
+
+fn secure_private_directory(path: &Path) -> Result<()> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "open private directory without following links: {}",
+                path.display()
+            )
+        })?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("inspect opened private directory {}", path.display()))?;
+    if !metadata.is_dir() || metadata.uid() != current_uid() {
+        bail!(
+            "opened private directory is not owner-controlled: {}",
+            path.display()
+        );
+    }
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure opened private directory {}", path.display()))?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("reinspect opened private directory {}", path.display()))?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        bail!("private directory is not owner-only: {}", path.display());
+    }
+    Ok(())
+}
+
+fn validate_owned_directory(path: &Path, require_private: bool) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect private directory {}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != current_uid() {
+        bail!("unsafe directory component: {}", path.display());
+    }
+    if require_private && metadata.permissions().mode() & 0o077 != 0 {
+        bail!("private directory is not owner-only: {}", path.display());
+    }
+    Ok(())
+}
+
+fn render_human(report: &SetupReport, check_only: bool) {
+    println!("platform: {}", report.platform);
+    println!("backend: {}", backend_name(report.backend));
+    for check in &report.checks {
+        let requirement = if check.required {
+            "required"
+        } else {
+            "optional"
+        };
+        println!(
+            "[{}] {} ({requirement}): {}{}",
+            check.status.as_str(),
+            check.id,
+            check.detail,
+            check
+                .path
+                .as_ref()
+                .map(|path| format!(" [{}]", path.display()))
+                .unwrap_or_default()
+        );
+        if let Some(repair) = &check.repair {
+            let requirements = if repair.requires.is_empty() {
+                String::new()
+            } else {
+                format!("; requires {}", repair.requires.join(", "))
+            };
+            println!(
+                "  repair ({}{requirements}): {}",
+                repair.kind.as_str(),
+                repair.detail
+            );
+            for command in &repair.commands {
+                println!("    {command}");
+            }
+        }
+    }
+    for action in &report.actions_taken {
+        println!("repaired: {action}");
+    }
+    if report.ready {
+        println!("setup: ready");
+    } else if check_only {
+        println!("setup: not ready; no changes were made");
+    } else {
+        println!(
+            "setup: not ready; complete the remaining manual repairs and run guard setup --check"
+        );
+    }
+}
+
+fn backend_name(backend: BackendKind) -> &'static str {
+    match backend {
+        BackendKind::Auto => "auto",
+        BackendKind::LinuxBwrap => "linux-bwrap",
+        BackendKind::MacosLima => "macos-lima",
+    }
+}
+
+fn ok_check(id: &str, component: &str, required: bool, detail: String) -> SetupCheck {
+    SetupCheck {
+        id: id.to_owned(),
+        component: component.to_owned(),
+        required,
+        status: CheckStatus::Ok,
+        detail,
+        path: None,
+        repair: None,
+    }
+}
+
+fn ok_path_check(
+    id: &str,
+    component: &str,
+    required: bool,
+    detail: String,
+    path: PathBuf,
+) -> SetupCheck {
+    let mut check = ok_check(id, component, required, detail);
+    check.path = Some(path);
+    check
+}
+
+fn error_check(id: &str, component: &str, required: bool, detail: String) -> SetupCheck {
+    SetupCheck {
+        id: id.to_owned(),
+        component: component.to_owned(),
+        required,
+        status: CheckStatus::Error,
+        detail,
+        path: None,
+        repair: None,
+    }
+}
+
+fn auto_repair(detail: &str) -> Repair {
+    Repair {
+        kind: RepairKind::Auto,
+        requires: Vec::new(),
+        commands: Vec::new(),
+        detail: detail.to_owned(),
+    }
+}
+
+fn manual_repair(detail: &str, requires: &[&str], commands: &[&str]) -> Repair {
+    Repair {
+        kind: RepairKind::Manual,
+        requires: requires.iter().map(|value| (*value).to_owned()).collect(),
+        commands: commands.iter().map(|value| (*value).to_owned()).collect(),
+        detail: detail.to_owned(),
+    }
+}
+
+fn platform_install_repair(package: &str) -> Repair {
+    if cfg!(target_os = "macos") {
+        manual_repair(
+            &format!("Install {package} with Homebrew or the platform developer tools."),
+            &["network"],
+            &[&format!("brew install {package}")],
+        )
+    } else {
+        manual_repair(
+            &format!("Install {package} with the system package manager."),
+            &["sudo", "network"],
+            &[&format!(
+                "sudo apt-get update && sudo apt-get install -y {package}"
+            )],
+        )
+    }
+}
+
+fn concise_output(bytes: &[u8]) -> String {
+    let value = String::from_utf8_lossy(bytes)
+        .trim()
+        .replace(['\r', '\n'], " ");
+    if value.is_empty() {
+        "command failed without diagnostic output".to_owned()
+    } else {
+        value.chars().take(500).collect()
+    }
+}
+
+fn concise_failure(output: &ProbeOutput) -> String {
+    if output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
+        concise_output(&output.stderr)
+    } else {
+        concise_output(&output.stdout)
+    }
+}
+
+fn shell_word(value: &str) -> Result<String> {
+    validate_lima_instance(value)?;
+    Ok(value.to_owned())
+}
+
+fn validate_lima_instance(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') && index > 0
+        })
+    {
+        bail!("invalid Lima instance name {value:?}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn probe_openat2() -> std::result::Result<bool, String> {
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let path = b".\0";
+    let how = OpenHow {
+        flags: libc::O_PATH as u64 | libc::O_CLOEXEC as u64,
+        mode: 0,
+        resolve: 0,
+    };
+    // SAFETY: all pointers reference initialized memory for the duration of the syscall.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            path.as_ptr().cast::<libc::c_char>(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        ) as libc::c_int
+    };
+    if fd >= 0 {
+        // SAFETY: fd was returned by openat2 above and is owned by this function.
+        unsafe { libc::close(fd) };
+        Ok(true)
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            Ok(false)
+        } else {
+            Err(error.to_string())
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_openat2() -> std::result::Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::ffi::OsStr;
+    use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct FakeProbes {
+        executables: BTreeMap<String, PathBuf>,
+        host_helper: Option<PathBuf>,
+        outputs: BTreeMap<String, ProbeOutput>,
+        calls: RefCell<Vec<String>>,
+        files: BTreeMap<PathBuf, String>,
+        openat2: bool,
+    }
+
+    impl SetupProbes for FakeProbes {
+        fn which(&self, name: &str) -> Option<PathBuf> {
+            self.executables.get(name).cloned()
+        }
+
+        fn host_helper_path(&self) -> Option<PathBuf> {
+            self.host_helper.clone()
+        }
+
+        fn output(&self, program: &Path, args: &[OsString]) -> std::io::Result<ProbeOutput> {
+            let key = command_key(program, args);
+            self.calls.borrow_mut().push(key.clone());
+            self.outputs.get(&key).cloned().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, format!("no fake for {key}"))
+            })
+        }
+
+        fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            self.files.get(path).cloned().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "missing fake file")
+            })
+        }
+
+        fn openat2_available(&self) -> std::result::Result<bool, String> {
+            Ok(self.openat2)
+        }
+    }
+
+    fn command_key(program: &Path, args: &[OsString]) -> String {
+        std::iter::once(program.as_os_str())
+            .chain(args.iter().map(OsString::as_os_str))
+            .map(OsStr::to_string_lossy)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn output(success: bool, stdout: &str, stderr: &str) -> ProbeOutput {
+        ProbeOutput {
+            success,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    fn private_paths(temp: &TempDir) -> SetupPaths {
+        let data = temp.path().join("data");
+        SetupPaths {
+            home: temp.path().to_path_buf(),
+            config: temp.path().join("config"),
+            audit: data.join("audit"),
+            pending_changes: data.join("pending"),
+            tools: data.join("tools"),
+            data,
+        }
+    }
+
+    #[test]
+    fn state_repairs_are_private_and_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = private_paths(&temp);
+        let report = SetupReport {
+            schema: REPORT_SCHEMA,
+            platform: "test".to_owned(),
+            backend: BackendKind::MacosLima,
+            ready: false,
+            checks: paths
+                .private_directories()
+                .into_iter()
+                .map(|(id, path)| private_directory_check(id, path, &paths.home))
+                .collect(),
+            actions_taken: Vec::new(),
+        };
+        assert_eq!(apply_safe_repairs(&report, &paths).unwrap().len(), 5);
+        for (_, path) in paths.private_directories() {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+        let second = SetupReport {
+            checks: paths
+                .private_directories()
+                .into_iter()
+                .map(|(id, path)| private_directory_check(id, path, &paths.home))
+                .collect(),
+            ..report
+        };
+        assert!(apply_safe_repairs(&second, &paths).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsafe_state_path_is_never_repaired() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = private_paths(&temp);
+        std::os::unix::fs::symlink("elsewhere", &paths.data).unwrap();
+        let check = private_directory_check("state.data.private", &paths.data, &paths.home);
+        assert_eq!(check.status, CheckStatus::Unsafe);
+        assert!(check.repair.is_none());
+    }
+
+    #[test]
+    fn symlinked_state_parent_is_never_accepted_or_repaired() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = private_paths(&temp);
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &paths.data).unwrap();
+        let child = paths.data.join("audit");
+        let check = private_directory_check("state.audit.private", &child, &paths.home);
+        assert_eq!(check.status, CheckStatus::Unsafe);
+        assert!(check.repair.is_none());
+    }
+
+    #[test]
+    fn owner_controlled_external_xdg_root_can_be_repaired() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let xdg = temp.path().join("external-xdg");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&xdg).unwrap();
+        let state = xdg.join("sandbox-guard").join("audit");
+        repair_private_directory(&state, &home).unwrap();
+        let metadata = fs::symlink_metadata(&state).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn diagnosis_does_not_create_missing_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = private_paths(&temp);
+        let probes = FakeProbes::default();
+        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
+            .unwrap()
+            .finish();
+        assert!(!report.ready);
+        for (_, path) in paths.private_directories() {
+            assert!(!path.exists());
+        }
+    }
+
+    #[test]
+    fn mounted_lima_instance_is_unsafe_and_has_no_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = private_paths(&temp);
+        for (_, path) in paths.private_directories() {
+            repair_private_directory(path, &paths.home).unwrap();
+        }
+        let limactl = PathBuf::from("/opt/homebrew/bin/limactl");
+        let mut probes = FakeProbes::default();
+        probes
+            .executables
+            .insert("git".to_owned(), PathBuf::from("/usr/bin/git"));
+        probes
+            .executables
+            .insert("limactl".to_owned(), limactl.clone());
+        probes.outputs.insert(
+            command_key(
+                &limactl,
+                &[
+                    OsString::from("list"),
+                    OsString::from("--json"),
+                    OsString::from("sandbox-guard"),
+                ],
+            ),
+            output(true, r#"{"status":"Running","config":{}}"#, ""),
+        );
+        probes.outputs.insert(
+            command_key(
+                &limactl,
+                &[
+                    "--tty=false",
+                    "shell",
+                    "sandbox-guard",
+                    "--",
+                    "findmnt",
+                    "--noheadings",
+                    "--output",
+                    "TARGET,FSTYPE",
+                ]
+                .map(OsString::from),
+            ),
+            output(true, "/Users virtiofs\n/ ext4\n", ""),
+        );
+        probes.outputs.insert(
+            command_key(
+                &limactl,
+                &[
+                    "--tty=false",
+                    "shell",
+                    "sandbox-guard",
+                    "--",
+                    "sh",
+                    "-c",
+                    "missing=0; for name in bwrap git rsync findmnt; do command -v \"$name\" >/dev/null || { echo \"$name\"; missing=1; }; done; exit \"$missing\"",
+                ]
+                .map(OsString::from),
+            ),
+            output(true, "", ""),
+        );
+        probes.outputs.insert(
+            command_key(
+                &limactl,
+                &[
+                    "--tty=false",
+                    "shell",
+                    "sandbox-guard",
+                    "--",
+                    "test",
+                    "-x",
+                    DEFAULT_GUEST_HELPER,
+                ]
+                .map(OsString::from),
+            ),
+            output(false, "", "missing"),
+        );
+
+        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
+            .unwrap()
+            .finish();
+        let mount = report
+            .checks
+            .iter()
+            .find(|check| check.id == "lima.instance.mountless-runtime")
+            .unwrap();
+        assert_eq!(mount.status, CheckStatus::Unsafe);
+        assert!(mount.repair.is_none());
+        assert!(!report.ready);
+    }
+
+    #[test]
+    fn declared_lima_mount_is_unsafe_and_suppresses_start_advice() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = private_paths(&temp);
+        for (_, path) in paths.private_directories() {
+            repair_private_directory(path, &paths.home).unwrap();
+        }
+        let limactl = PathBuf::from("/opt/homebrew/bin/limactl");
+        let mut probes = FakeProbes::default();
+        probes
+            .executables
+            .insert("git".to_owned(), PathBuf::from("/usr/bin/git"));
+        probes
+            .executables
+            .insert("limactl".to_owned(), limactl.clone());
+        probes.outputs.insert(
+            command_key(
+                &limactl,
+                &[
+                    OsString::from("list"),
+                    OsString::from("--json"),
+                    OsString::from("sandbox-guard"),
+                ],
+            ),
+            output(
+                true,
+                r#"{"status":"Stopped","config":{"mounts":[{"location":"/Users/test"}]}}"#,
+                "",
+            ),
+        );
+        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
+            .unwrap()
+            .finish();
+        let mount = report
+            .checks
+            .iter()
+            .find(|check| check.id == "lima.instance.mountless-config")
+            .unwrap();
+        assert_eq!(mount.status, CheckStatus::Unsafe);
+        assert!(mount.repair.is_none());
+        let running = report
+            .checks
+            .iter()
+            .find(|check| check.id == "lima.instance.running")
+            .unwrap();
+        assert!(running.repair.is_none());
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.contains(" start "))
+        );
+    }
+
+    #[test]
+    fn missing_lima_config_object_is_an_error_not_a_clean_mount_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = private_paths(&temp);
+        for (_, path) in paths.private_directories() {
+            repair_private_directory(path, &paths.home).unwrap();
+        }
+        let limactl = PathBuf::from("/opt/homebrew/bin/limactl");
+        let mut probes = FakeProbes::default();
+        probes
+            .executables
+            .insert("git".to_owned(), PathBuf::from("/usr/bin/git"));
+        probes
+            .executables
+            .insert("limactl".to_owned(), limactl.clone());
+        probes.outputs.insert(
+            command_key(
+                &limactl,
+                &[
+                    OsString::from("list"),
+                    OsString::from("--json"),
+                    OsString::from("sandbox-guard"),
+                ],
+            ),
+            output(true, r#"{"status":"Stopped"}"#, ""),
+        );
+        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
+            .unwrap()
+            .finish();
+        let mount = report
+            .checks
+            .iter()
+            .find(|check| check.id == "lima.instance.mountless-config")
+            .unwrap();
+        assert_eq!(mount.status, CheckStatus::Error);
+        assert_eq!(report.exit_code(), 3);
+    }
+
+    #[test]
+    fn stopped_lima_check_never_starts_the_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = private_paths(&temp);
+        for (_, path) in paths.private_directories() {
+            repair_private_directory(path, &paths.home).unwrap();
+        }
+        let limactl = PathBuf::from("/usr/local/bin/limactl");
+        let mut probes = FakeProbes::default();
+        probes
+            .executables
+            .insert("git".to_owned(), PathBuf::from("/usr/bin/git"));
+        probes
+            .executables
+            .insert("limactl".to_owned(), limactl.clone());
+        probes.outputs.insert(
+            command_key(
+                &limactl,
+                &[
+                    OsString::from("list"),
+                    OsString::from("--json"),
+                    OsString::from("sandbox-guard"),
+                ],
+            ),
+            output(true, r#"{"status":"Stopped","config":{"mounts":[]}}"#, ""),
+        );
+        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
+            .unwrap()
+            .finish();
+        assert!(!report.ready);
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.contains(" start "))
+        );
+        assert_eq!(probes.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn invalid_lima_names_cannot_enter_rendered_commands() {
+        for value in ["", "-bad", "bad name", "bad;rm", "a/b"] {
+            assert!(validate_lima_instance(value).is_err());
+        }
+        assert!(validate_lima_instance("sandbox-guard_2.example").is_ok());
+        assert!(shell_word("bad;name").is_err());
+    }
+
+    #[test]
+    fn exit_codes_distinguish_ready_known_failure_and_probe_error() {
+        let report = |status| {
+            SetupReport {
+                schema: REPORT_SCHEMA,
+                platform: "test".to_owned(),
+                backend: BackendKind::LinuxBwrap,
+                ready: false,
+                checks: vec![SetupCheck {
+                    id: "test".to_owned(),
+                    component: "test".to_owned(),
+                    required: true,
+                    status,
+                    detail: "test".to_owned(),
+                    path: None,
+                    repair: None,
+                }],
+                actions_taken: Vec::new(),
+            }
+            .finish()
+        };
+        assert_eq!(report(CheckStatus::Ok).exit_code(), 0);
+        assert_eq!(report(CheckStatus::Mismatch).exit_code(), 1);
+        assert_eq!(report(CheckStatus::Error).exit_code(), 3);
+    }
+
+    #[test]
+    fn linux_diagnostics_cover_helper_openat2_and_userns() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = private_paths(&temp);
+        for (_, path) in paths.private_directories() {
+            repair_private_directory(path, &paths.home).unwrap();
+        }
+        let helper = PathBuf::from("/tmp/fake-guard-helper");
+        let mut probes = FakeProbes {
+            host_helper: Some(helper.clone()),
+            openat2: true,
+            ..FakeProbes::default()
+        };
+        probes
+            .executables
+            .insert("git".to_owned(), PathBuf::from("/usr/bin/git"));
+        probes
+            .executables
+            .insert("bwrap".to_owned(), PathBuf::from("/usr/bin/bwrap"));
+        probes.files.insert(
+            PathBuf::from("/proc/sys/user/max_user_namespaces"),
+            "1024\n".to_owned(),
+        );
+        probes.outputs.insert(
+            command_key(&helper, &[OsString::from("--version")]),
+            output(
+                true,
+                &format!("guard-helper {}\n", env!("CARGO_PKG_VERSION")),
+                "",
+            ),
+        );
+        let report = diagnose(&probes, BackendKind::LinuxBwrap, "sandbox-guard", &paths)
+            .unwrap()
+            .finish();
+        assert!(report.ready);
+        assert_eq!(report.exit_code(), 0);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "host.helper.version" && check.status == CheckStatus::Ok)
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "linux.openat2" && check.status == CheckStatus::Ok)
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "linux.userns" && check.status == CheckStatus::Ok)
+        );
+    }
+}

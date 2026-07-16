@@ -95,10 +95,20 @@ shell profile if `guard` is not found):
     install -m 0755 sandbox-guard-<version>-linux-<arch>/guard-helper ~/.local/bin/guard-helper
 
 Requirements: Bubblewrap, Git, a kernel with `openat2` (5.6+), and glibc 2.39
-or newer (the binaries are built on Ubuntu 24.04). Then validate the boundary:
+or newer (the binaries are built on Ubuntu 24.04). Initialize Guard's private
+state and inspect every prerequisite before validating the live boundary:
 
-    guard doctor
+    guard setup
+    guard setup --check
     guard test
+
+`guard setup` is intentionally unprivileged: it creates or tightens only
+Guard-owned directories below the current user's data/configuration roots.
+It prints commands for missing host dependencies but never invokes `sudo`, a
+package manager, or a network downloader. `guard setup --check` is the
+read-only/reporting form; add `--json` for the versioned machine-readable
+schema. Exit status is 0 when ready, 1 when known repairs remain, and 3 when a
+required probe failed and readiness is unknown.
 
 ## Binary install — macOS (Apple Silicon)
 
@@ -124,18 +134,22 @@ add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile if needed):
     install -d ~/.local/bin
     install -m 0755 sandbox-guard-<version>-macos-arm64/guard ~/.local/bin/guard
 
-Provision the dedicated Lima guest. **Provisioning is a manual, trusted
-operation in v0.3**: Guard never creates, modifies, or updates the guest
-itself (`guard setup` is a later phase), and everything you place inside the
-guest becomes part of the trusted computing base. The guest must be dedicated
-to Guard, created with `--mount-none`, and must never contain credentials or
-host mounts:
+Run `guard setup --check --backend macos-lima` first for a readiness report.
+The command detects a missing or stopped instance, declared or live host
+mounts, guest packages, and a missing or version-mismatched helper. It never
+starts, creates, deletes, or modifies a Lima instance.
+
+Provision the dedicated Lima guest. **Guest provisioning remains a manual,
+trusted operation in v0.3**: everything you place inside the guest becomes
+part of the trusted computing base. The guest must be dedicated to Guard,
+created with `--mount-none`, and must never contain credentials or host
+mounts:
 
     brew install lima
     limactl create --name=sandbox-guard --mount-none template:default
     limactl start --mount-none sandbox-guard
     limactl shell sandbox-guard sudo apt-get update
-    limactl shell sandbox-guard sudo apt-get install -y bubblewrap git ca-certificates rsync
+    limactl shell sandbox-guard sudo apt-get install -y bubblewrap git ca-certificates rsync util-linux
 
 Install the packaged Linux ARM64 helper inside the guest (the guest
 distribution needs glibc 2.39 or newer, e.g. Ubuntu 24.04+):
@@ -147,8 +161,13 @@ distribution needs glibc 2.39 or newer, e.g. Ubuntu 24.04+):
 Install the AI CLI you intend to confine inside the guest as well (for Grok:
 `/opt/sandbox-guard/tools/grok`). Then validate:
 
-    guard doctor --backend macos-lima
+    guard setup --backend macos-lima
+    guard setup --check --backend macos-lima
     guard test --backend macos-lima
+
+If setup reports the instance as `unsafe` because it contains a host-sharing
+mount, it deliberately offers no automatic repair: inspect the instance and
+decide whether to remove it yourself. Setup never deletes or recreates a VM.
 
 ## Upgrade
 
@@ -157,7 +176,7 @@ Install the AI CLI you intend to confine inside the guest as well (for Grok:
    tested as one version; do not mix versions across the pair.
 3. On macOS, reinstall `lima-guest/guard-helper` into the guest in the same
    step, using the `limactl copy` commands above.
-4. Re-run `guard doctor` and `guard test` (with `--backend macos-lima` on
+4. Re-run `guard setup --check` and `guard test` (with `--backend macos-lima` on
    macOS) before the next real session.
 
 Remembered egress decisions, audit records, and policy files are kept in
@@ -169,8 +188,9 @@ state files whose versions it does not understand.
 Keep the previous release archive and its `SHA256SUMS` until you have
 validated an upgrade. To roll back, reinstall the older binaries (both of
 them, and the guest helper on macOS) using the same steps, then re-run
-`guard doctor` and `guard test`. Never reuse a version number for different
-bytes; if a release is bad, the fix ships as a new prerelease version.
+`guard setup --check` and `guard test`. Never reuse a version number for
+different bytes; if a release is bad, the fix ships as a new prerelease
+version.
 
 ## Removal
 
@@ -184,9 +204,9 @@ bytes; if a release is bad, the fix ships as a new prerelease version.
 4. On macOS, delete the dedicated guest if you no longer need it:
    `limactl delete --force sandbox-guard`.
 
-The Guard CLI itself performs no automated installation in v0.3: it does not
-write outside its private state directories, modify shell profiles, or create
-privileged files. Everything else on this page — the binaries in
-`~/.local/bin`, the Lima instance, and the guest's
+`guard setup` creates or tightens only Guard-owned private state directories;
+it does not write outside those directories, modify shell profiles, invoke
+`sudo`, or create privileged files. Everything else on this page — the
+binaries in `~/.local/bin`, the Lima instance, and the guest's
 `/usr/local/bin/guard-helper` — is created by you through the manual steps
 above, which is why removal is also a manual checklist.

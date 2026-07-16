@@ -25,6 +25,7 @@ use sandbox_guard_runner::{
 };
 
 mod grok;
+mod setup;
 use grok::GrokArgs;
 
 const MASS_DELETION_MIN_FILES: usize = 5;
@@ -57,6 +58,8 @@ enum Command {
     Approvals(ApprovalArgs),
     /// Check host prerequisites without changing the system.
     Doctor(DoctorArgs),
+    /// Check readiness and repair only Guard-owned private state.
+    Setup(SetupArgs),
     /// Remove old, unlocked staging directories owned by the current user.
     Gc(GcArgs),
     /// Execute hostile fixture probes against a real isolation backend.
@@ -217,6 +220,25 @@ struct DoctorArgs {
 }
 
 #[derive(Debug, Args)]
+struct SetupArgs {
+    /// Inspect readiness without repairs, VM startup, or intentional state changes.
+    #[arg(long)]
+    check: bool,
+
+    /// Emit the versioned machine-readable report.
+    #[arg(long)]
+    json: bool,
+
+    /// Backend to prepare.
+    #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
+    backend: BackendArg,
+
+    /// Managed Lima instance used by the macOS backend.
+    #[arg(long, default_value = "sandbox-guard")]
+    lima_instance: String,
+}
+
+#[derive(Debug, Args)]
 struct GcArgs {
     /// Override the staging base to inspect.
     #[arg(long)]
@@ -360,6 +382,7 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Policy(args) => policy_command(args),
         Command::Approvals(args) => approvals_command(args),
         Command::Doctor(args) => doctor_command(args),
+        Command::Setup(args) => setup::setup_command(args),
         Command::Gc(args) => gc_command(args),
         Command::Test(args) => test_command(args),
         Command::Tool(args) => tool_command(args),

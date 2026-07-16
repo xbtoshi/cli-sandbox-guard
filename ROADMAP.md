@@ -75,12 +75,13 @@ We will not adopt these weaker postures:
 
 ### One-command setup
 
-- [ ] Add `guard setup` with platform detection and idempotent repair.
+- [x] Add `guard setup` with platform detection and idempotent repair.
 - [ ] Provision the mountless Lima instance, Bubblewrap, `guard-helper`, and the selected verified
   vendor tool on macOS.
 - [ ] Install and verify the Linux runtime dependencies without silently weakening namespace or
   cgroup requirements.
-- [ ] Add `guard setup --check` and actionable diagnostics for every missing component.
+- [x] Add `guard setup --check` and actionable diagnostics for the host/backend components it
+  checks; selected vendor-tool provisioning remains a separate item above.
 - [ ] Add an explicit removal command that deletes only Guard-owned state.
 
 ### Declarative profiles

@@ -50,6 +50,8 @@ conflict-checked host code; the tool never receives access to the source tree or
   output reopened, policy-filtered, and validated by the trusted staging layer.
 - Offline Ed25519 verification against a pinned signer fingerprint before atomic tool install.
 - Hostile denied-network and controlled-proxy probes through the real backend with `guard test`.
+- `guard setup` for idempotent owner-only state initialization plus actionable, machine-readable
+  host and Lima readiness diagnostics without `sudo`, package installation, or VM mutation.
 
 ## One-command Grok workflow
 
@@ -125,6 +127,11 @@ steps, including manual Lima guest provisioning on macOS. The artifacts are
 alpha prototypes, not production-ready. Maintainers cut releases with
 [docs/RELEASE.md](docs/RELEASE.md).
 
+After installing the binary, run `guard setup`. It repairs only Guard-owned
+private directories and prints manual commands for missing external
+dependencies. `guard setup --check --json` performs no repairs and emits the
+versioned readiness report.
+
 ## Build and self-test
 
 Rust 1.85 or newer is required.
@@ -135,7 +142,7 @@ Rust 1.85 or newer is required.
 The workspace produces `target/release/guard` and `target/release/guard-helper`. Keep the two
 binaries together on Linux. Run the real isolation probe after provisioning a backend:
 
-    guard doctor
+    guard setup --check
     guard test
 
 Use `guard test --require-cgroup` when cgroup v2 delegation is a deployment requirement. CI runs
@@ -156,7 +163,7 @@ current user; advisory locks protect active stages.
 
 Install Bubblewrap and Git, then run:
 
-    guard doctor
+    guard setup
     guard run -- my-ai-cli
 
 Static tools outside `/usr` and `/bin` are mounted individually. Tools needing adjacent runtime
@@ -186,7 +193,8 @@ Install a Linux build of `guard-helper` at `/usr/local/bin/guard-helper` inside 
 with the selected AI CLI. The guest must be dedicated to Guard and contain no credentials or host
 mounts. Then run:
 
-    guard doctor --backend macos-lima
+    guard setup --backend macos-lima
+    guard setup --check --backend macos-lima
     guard test --backend macos-lima
     guard run --backend macos-lima -- my-ai-cli
 
