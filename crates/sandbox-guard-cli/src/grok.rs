@@ -15,7 +15,7 @@ use sandbox_guard_core::{
     ArgumentMatch, CompiledPolicy, CredentialProfile, EgressMode, SessionProfile, Stage,
     StageOptions, ToolLaunchProfile, UserPolicy, VendorProfile, builtin_grok_profile,
 };
-use sandbox_guard_runner::ProcessSpec;
+use sandbox_guard_runner::{InteractiveUx, ProcessSpec};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -202,8 +202,16 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
         run_args,
         environment,
         preflight,
+        profile_interactive_ux(&profile),
         Some(Box::new(session_state)),
     )
+}
+
+fn profile_interactive_ux(profile: &VendorProfile) -> InteractiveUx {
+    InteractiveUx {
+        mouse_reporting_default: true,
+        clipboard_image_import: profile.clipboard.image_import,
+    }
 }
 
 fn grok_tool_arguments(
@@ -956,6 +964,12 @@ mod tests {
         let preflight = profile_preflight(&profile).unwrap();
         assert_eq!(preflight.command, OsString::from("grok"));
         assert_eq!(preflight.args, [OsString::from("login")]);
+        assert!(profile_interactive_ux(&profile).clipboard_image_import);
+        profile.clipboard.image_import = false;
+        let tightened_ux = profile_interactive_ux(&profile);
+        assert!(!tightened_ux.clipboard_image_import);
+        assert!(tightened_ux.mouse_reporting_default);
+        profile.clipboard.image_import = true;
         let sessions = profile.sessions.unwrap();
         assert_eq!(
             sessions.guest_mount_path,

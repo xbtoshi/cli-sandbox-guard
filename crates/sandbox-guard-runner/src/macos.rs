@@ -106,7 +106,7 @@ impl MacosLimaRunner {
         ];
         shell_args.extend(guest_command);
         let execution = if request.interactive {
-            run_interactive(&limactl, &shell_args, || {
+            run_interactive(&limactl, &shell_args, request.interactive_ux, || {
                 import_clipboard_into_guest(&limactl, request, &guest_root)
             })
             .map(|outcome| (outcome.status, outcome.clipboard_imports))
@@ -880,6 +880,7 @@ mod tests {
             },
             preflight: None,
             interactive: false,
+            interactive_ux: crate::InteractiveUx::default(),
             network: NetworkMode::Denied,
             allowed_egress_hosts: Vec::new(),
             interactive_egress_approval: false,

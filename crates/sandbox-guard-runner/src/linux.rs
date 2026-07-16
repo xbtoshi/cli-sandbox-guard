@@ -94,14 +94,15 @@ impl LinuxBwrapRunner {
         let plan = Self::build_plan(request, bwrap, helper, runtime.root(), use_cgroup)?;
         warnings.extend(plan.warnings.clone());
         let (status, clipboard_imports) = if request.interactive {
-            let interactive = run_interactive(&plan.program, &plan.args, || {
-                let image = read_clipboard_image()?;
-                write_private_image(&runtime.inbox, &image)?;
-                Ok(ClipboardPaste {
-                    text: image.attachment_reference(),
-                    audit: image.audit_entry(),
-                })
-            })?;
+            let interactive =
+                run_interactive(&plan.program, &plan.args, request.interactive_ux, || {
+                    let image = read_clipboard_image()?;
+                    write_private_image(&runtime.inbox, &image)?;
+                    Ok(ClipboardPaste {
+                        text: image.attachment_reference(),
+                        audit: image.audit_entry(),
+                    })
+                })?;
             (interactive.status, interactive.clipboard_imports)
         } else {
             let status = Command::new(&plan.program)
@@ -892,6 +893,7 @@ mod tests {
             },
             preflight: None,
             interactive: false,
+            interactive_ux: crate::InteractiveUx::default(),
             network,
             allowed_egress_hosts: if network == NetworkMode::Controlled {
                 vec!["api.example.com".to_owned()]

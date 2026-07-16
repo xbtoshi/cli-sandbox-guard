@@ -99,6 +99,23 @@ pub struct WritableHomeState {
     pub guest_target: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractiveUx {
+    /// Enable the tool's mouse-reporting modes until the user enters host selection mode.
+    pub mouse_reporting_default: bool,
+    /// Allow an explicit Ctrl+V to import one sanitized host clipboard image.
+    pub clipboard_image_import: bool,
+}
+
+impl Default for InteractiveUx {
+    fn default() -> Self {
+        Self {
+            mouse_reporting_default: true,
+            clipboard_image_import: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunRequest {
     pub workspace: PathBuf,
@@ -108,6 +125,8 @@ pub struct RunRequest {
     pub preflight: Option<ProcessSpec>,
     /// Allocate an interactive terminal for backends whose transport requires an explicit PTY.
     pub interactive: bool,
+    /// Convenience capabilities; terminal boundary filtering remains unconditional.
+    pub interactive_ux: InteractiveUx,
     pub network: NetworkMode,
     pub allowed_egress_hosts: Vec<String>,
     /// Ask through a trusted host-native dialog for exact HTTPS destinations not pre-allowed.
@@ -545,6 +564,7 @@ mod tests {
             },
             preflight: None,
             interactive: false,
+            interactive_ux: InteractiveUx::default(),
             network: NetworkMode::Denied,
             allowed_egress_hosts: vec![],
             interactive_egress_approval: false,

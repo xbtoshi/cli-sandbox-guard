@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::RunnerError;
+use crate::{InteractiveUx, RunnerError};
 
 const CTRL_S: u8 = 0x13;
 const CTRL_V: u8 = 0x16;
@@ -16,6 +16,7 @@ const POLL_INTERVAL_MS: i32 = 50;
 const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_OSC_BYTES: usize = 1024 * 1024;
 const MAX_CSI_BYTES: usize = 4096;
+const CLIPBOARD_DISABLED_NOTICE: &str = "clipboard image import is disabled by the active profile";
 const DISABLE_MOUSE_REPORTING: &[u8] =
     b"\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l";
 
@@ -29,9 +30,17 @@ pub(crate) struct InteractiveOutcome {
     pub(crate) clipboard_imports: Vec<String>,
 }
 
+#[derive(Debug)]
+enum ClipboardPasteOutcome {
+    Disabled,
+    Imported(String),
+    Unavailable(RunnerError),
+}
+
 pub(crate) fn run_interactive<F>(
     program: &Path,
     args: &[OsString],
+    interactive_ux: InteractiveUx,
     mut clipboard: F,
 ) -> Result<InteractiveOutcome, RunnerError>
 where
@@ -142,13 +151,20 @@ where
                         ordinary.clear();
                     }
                     if byte == CTRL_V {
-                        match clipboard() {
-                            Ok(paste) => {
-                                write_bracketed_paste(&mut master_writer, &paste.text)
-                                    .map_err(|source| execute_error(program, source))?;
-                                clipboard_imports.push(paste.audit);
+                        match handle_clipboard_paste(
+                            interactive_ux.clipboard_image_import,
+                            &mut master_writer,
+                            &mut clipboard,
+                        )
+                        .map_err(|source| execute_error(program, source))?
+                        {
+                            ClipboardPasteOutcome::Imported(audit) => {
+                                clipboard_imports.push(audit);
                             }
-                            Err(error) => {
+                            ClipboardPasteOutcome::Disabled => {
+                                write_host_notice(CLIPBOARD_DISABLED_NOTICE);
+                            }
+                            ClipboardPasteOutcome::Unavailable(error) => {
                                 write_host_notice(&format!("{error}"));
                             }
                         }
@@ -388,7 +404,27 @@ impl Drop for ChildGuard {
     }
 }
 
-fn write_bracketed_paste(writer: &mut File, text: &str) -> io::Result<()> {
+fn handle_clipboard_paste<W, F>(
+    enabled: bool,
+    writer: &mut W,
+    clipboard: &mut F,
+) -> io::Result<ClipboardPasteOutcome>
+where
+    W: Write,
+    F: FnMut() -> Result<ClipboardPaste, RunnerError>,
+{
+    if !enabled {
+        return Ok(ClipboardPasteOutcome::Disabled);
+    }
+    let paste = match clipboard() {
+        Ok(paste) => paste,
+        Err(error) => return Ok(ClipboardPasteOutcome::Unavailable(error)),
+    };
+    write_bracketed_paste(writer, &paste.text)?;
+    Ok(ClipboardPasteOutcome::Imported(paste.audit))
+}
+
+fn write_bracketed_paste<W: Write>(writer: &mut W, text: &str) -> io::Result<()> {
     writer.write_all(b"\x1b[200~")?;
     writer.write_all(text.as_bytes())?;
     writer.write_all(b"\x1b[201~")?;
@@ -658,6 +694,72 @@ fn enable_mouse_reporting(modes: &BTreeSet<u16>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_capability_removes_import_without_forwarding_ctrl_v() {
+        let calls = std::cell::Cell::new(0);
+        let mut clipboard = || {
+            calls.set(calls.get() + 1);
+            Ok(ClipboardPaste {
+                text: "@/workspace/sandbox-guard-inputs/image.png".to_owned(),
+                audit: "image/png test".to_owned(),
+            })
+        };
+        let mut output = Vec::new();
+        assert!(matches!(
+            handle_clipboard_paste(false, &mut output, &mut clipboard).unwrap(),
+            ClipboardPasteOutcome::Disabled
+        ));
+        assert_eq!(calls.get(), 0);
+        assert!(output.is_empty());
+        assert!(CLIPBOARD_DISABLED_NOTICE.contains("disabled by the active profile"));
+
+        assert!(matches!(
+            handle_clipboard_paste(true, &mut output, &mut clipboard).unwrap(),
+            ClipboardPasteOutcome::Imported(ref audit) if audit == "image/png test"
+        ));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            output,
+            b"\x1b[200~@/workspace/sandbox-guard-inputs/image.png\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn clipboard_source_failure_is_nonfatal_but_pty_write_failure_remains_fatal() {
+        let mut unavailable = || {
+            Err(RunnerError::ClipboardUnavailable(
+                "clipboard unavailable".to_owned(),
+            ))
+        };
+        assert!(matches!(
+            handle_clipboard_paste(true, &mut Vec::new(), &mut unavailable).unwrap(),
+            ClipboardPasteOutcome::Unavailable(RunnerError::ClipboardUnavailable(_))
+        ));
+
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "test failure"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut available = || {
+            Ok(ClipboardPaste {
+                text: "attachment".to_owned(),
+                audit: "audit".to_owned(),
+            })
+        };
+        assert_eq!(
+            handle_clipboard_paste(true, &mut FailingWriter, &mut available)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
 
     #[test]
     fn output_filter_blocks_osc_52_queries_and_writes_across_chunks() {

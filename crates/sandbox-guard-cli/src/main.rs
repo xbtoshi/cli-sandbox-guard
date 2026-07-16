@@ -19,8 +19,8 @@ use sandbox_guard_core::{
 };
 use sandbox_guard_helper::ProbeReport;
 use sandbox_guard_runner::{
-    BackendKind, CgroupMode, NetworkMode, ProcessSpec, ResourceLimits, RunOutcome, RunRequest,
-    ToolSpec, WritableHomeState, clear_remembered_egress_decisions,
+    BackendKind, CgroupMode, InteractiveUx, NetworkMode, ProcessSpec, ResourceLimits, RunOutcome,
+    RunRequest, ToolSpec, WritableHomeState, clear_remembered_egress_decisions,
     forget_remembered_egress_decision, list_remembered_egress_decisions, plan, run as run_isolated,
 };
 
@@ -417,7 +417,7 @@ fn execute(cli: Cli) -> Result<i32> {
 }
 
 fn run_command(args: RunArgs) -> Result<i32> {
-    run_command_with(args, Vec::new(), None, None)
+    run_command_with(args, Vec::new(), None, InteractiveUx::default(), None)
 }
 
 fn approvals_command(args: ApprovalArgs) -> Result<i32> {
@@ -461,6 +461,7 @@ fn run_command_with(
     args: RunArgs,
     injected_environment: Vec<(String, String)>,
     preflight: Option<ProcessSpec>,
+    interactive_ux: InteractiveUx,
     mut persistent_state: Option<Box<dyn PersistentRunState>>,
 ) -> Result<i32> {
     let network: NetworkMode = args.network.into();
@@ -532,6 +533,7 @@ fn run_command_with(
         },
         preflight,
         interactive,
+        interactive_ux,
         network,
         allowed_egress_hosts: args.allow_hosts.clone(),
         interactive_egress_approval,
@@ -773,6 +775,7 @@ fn test_command(args: TestArgs) -> Result<i32> {
             args: Vec::new(),
         }),
         interactive: false,
+        interactive_ux: InteractiveUx::default(),
         network: NetworkMode::Denied,
         allowed_egress_hosts: vec![],
         interactive_egress_approval: false,
@@ -824,6 +827,7 @@ fn test_command(args: TestArgs) -> Result<i32> {
             args: Vec::new(),
         }),
         interactive: false,
+        interactive_ux: InteractiveUx::default(),
         network: NetworkMode::Denied,
         allowed_egress_hosts: Vec::new(),
         interactive_egress_approval: false,
@@ -854,6 +858,7 @@ fn test_command(args: TestArgs) -> Result<i32> {
         },
         preflight: None,
         interactive: false,
+        interactive_ux: InteractiveUx::default(),
         network: NetworkMode::Controlled,
         allowed_egress_hosts: vec!["allowed.example.invalid".to_owned()],
         interactive_egress_approval: false,
