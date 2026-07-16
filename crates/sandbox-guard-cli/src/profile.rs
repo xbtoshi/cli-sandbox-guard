@@ -248,10 +248,11 @@ fn explain_report(profile: &VendorProfile) -> ProfileExplainReport {
             "tool.forbidden_passthrough",
             "egress",
             "credentials",
+            "sessions.layout_and_quotas",
         ],
         runtime_not_consumed_sections: vec![
             "tool.guest_executable",
-            "sessions",
+            "sessions.guest_mount_path",
             "terminal",
             "clipboard",
             "seccomp",
@@ -458,10 +459,19 @@ mod tests {
         assert!(report.runtime_consumed_sections.contains(&"credentials"));
         assert!(
             report
+                .runtime_consumed_sections
+                .contains(&"sessions.layout_and_quotas")
+        );
+        assert!(
+            report
                 .runtime_not_consumed_sections
                 .contains(&"tool.guest_executable")
         );
-        assert!(report.runtime_not_consumed_sections.contains(&"sessions"));
+        assert!(
+            report
+                .runtime_not_consumed_sections
+                .contains(&"sessions.guest_mount_path")
+        );
         assert_eq!(report.sections.len(), 6);
         assert!(
             report
