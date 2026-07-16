@@ -179,8 +179,8 @@ still allowing approved authenticated API calls.
 - [x] Scrub the bwrap launcher's own initial exec environment (fixed `/usr/bin/env -i` boundary
   before bwrap on every backend/mode), so pid 1's `/proc/1/environ` cannot leak inherited host
   session variables to the confined tool. The invariant is checked by the hostile backend probe
-  (empty `/proc/1/environ`); full CI and live-Lima validation of the alpha.4 change are still
-  pending, so this is not yet claimed as end-to-end proven.
+  (empty `/proc/1/environ`) and passed both release-mode Linux CI architectures plus the exact
+  published alpha.4 macOS/guest-helper pair under live mountless Lima with required cgroups.
 - [ ] Replace the focused seccomp deny list with maintained, architecture-generated syscall groups
   qualified against each supported vendor workload.
 - [ ] Generate and test filters for x86-64 and ARM64 from one reviewed source definition.
