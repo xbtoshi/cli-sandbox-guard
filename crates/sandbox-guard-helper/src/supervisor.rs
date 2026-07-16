@@ -447,8 +447,10 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
     let (bwrap_launcher_environment_scrubbed, bwrap_leaked_environment_names) =
         inspect_launcher_environment(&config.forbidden_environment);
     #[cfg(not(target_os = "linux"))]
-    let (bwrap_launcher_environment_scrubbed, bwrap_leaked_environment_names): (bool, Vec<String>) =
-        (false, Vec::new());
+    let (bwrap_launcher_environment_scrubbed, bwrap_leaked_environment_names): (
+        bool,
+        Vec<String>,
+    ) = (false, Vec::new());
     // The clearenv/setenv boundary still delivers the explicit child environment. Proving these
     // remain present guards against an over-broad scrub that would also strip the child's own env.
     let child_environment_present = env::var("HOME").as_deref() == Ok("/home/guard")
@@ -565,7 +567,10 @@ const LAUNCHER_ALLOWED_ENVIRONMENT_NAMES: &[&str] = &["PATH"];
 #[cfg(any(target_os = "linux", test))]
 fn classify_launcher_environment(raw: &[u8], forbidden: &str) -> (bool, Vec<String>) {
     let mut leaked: Vec<String> = Vec::new();
-    for entry in raw.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()) {
+    for entry in raw
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
         let name = entry.split(|byte| *byte == b'=').next().unwrap_or(entry);
         let name = String::from_utf8_lossy(name).into_owned();
         if !LAUNCHER_ALLOWED_ENVIRONMENT_NAMES.contains(&name.as_str()) || name == forbidden {

@@ -1240,9 +1240,7 @@ mod tests {
         assert_eq!(scoped_strings[0], "systemd-run");
         let boundary = scoped_strings
             .windows(4)
-            .position(|window| {
-                window == ["env", "-i", expected_path.as_str(), "bwrap"]
-            })
+            .position(|window| window == ["env", "-i", expected_path.as_str(), "bwrap"])
             .expect("guest cgroup route installs the clean-env boundary before bwrap");
         let terminator = scoped_strings
             .iter()
