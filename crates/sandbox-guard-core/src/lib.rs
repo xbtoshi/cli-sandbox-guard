@@ -10,6 +10,7 @@ mod gc;
 mod git;
 mod policy;
 mod profile;
+mod signed_profile;
 mod staging;
 mod tool_store;
 
@@ -32,6 +33,10 @@ pub use profile::{
     ProfileError, ProfileOverlay, ProfileOverlayDocument, SeccompCompatibility, SessionProfile,
     TerminalProfile, ToolLaunchProfile, VENDOR_PROFILE_SCHEMA_VERSION, VendorProfile,
     apply_profile_overlay, builtin_grok_profile, builtin_vendor_profile,
+};
+pub use signed_profile::{
+    MAX_SIGNED_PROFILE_BYTES, SIGNED_PROFILE_ENVELOPE_SCHEMA_VERSION, SignedProfileEnvelope,
+    SignedProfileError, verify_signed_profile_bytes,
 };
 pub use staging::{
     PersistedStage, Stage, StageError, StageOptions, default_staging_base, display_path,
