@@ -159,7 +159,7 @@ pub(super) fn profile_command(args: ProfileArgs) -> Result<i32> {
             } else {
                 println!("profile: {} ({})", report.profile_name, report.source);
                 println!(
-                    "runtime source: partial compiled-profile migration (guest executable and seccomp compatibility remain descriptive or hardcoded)"
+                    "runtime source: partial compiled-profile migration (seccomp compatibility remains descriptive rather than runtime-configurable)"
                 );
                 for section in report.sections {
                     println!(
@@ -244,6 +244,7 @@ fn explain_report(profile: &VendorProfile) -> ProfileExplainReport {
         runtime_status: "partial",
         runtime_consumed_sections: vec![
             "tool.command_and_arguments",
+            "tool.guest_executable",
             "tool.preflight",
             "tool.forbidden_passthrough",
             "egress",
@@ -254,7 +255,7 @@ fn explain_report(profile: &VendorProfile) -> ProfileExplainReport {
             "terminal.mouse_reporting_default",
             "terminal.native_scrollback_opt_in",
         ],
-        runtime_not_consumed_sections: vec!["tool.guest_executable", "seccomp"],
+        runtime_not_consumed_sections: vec!["seccomp"],
         sections: vec![
             explanation(
                 "tool.*",
@@ -462,7 +463,7 @@ mod tests {
         );
         assert!(
             report
-                .runtime_not_consumed_sections
+                .runtime_consumed_sections
                 .contains(&"tool.guest_executable")
         );
         assert!(

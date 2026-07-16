@@ -145,9 +145,9 @@ but the lint-only result cannot be installed, trusted, or executed. v0.3 never
 uses owner- or project-supplied profiles for a run. Scripts should use `--json`
 rather than relying on the human-oriented output. `profile lint --json` emits
 JSON for a valid document; invalid input exits 1 and reports a sanitized error
-on standard error. The Grok adapter currently consumes the compiled launch,
-egress, credential, session, and clipboard-import sections, including the
-runner-validated writable-home mount target and the terminal mouse-reporting default;
+on standard error. The Grok adapter currently consumes the compiled launch and Lima guest
+executable, egress, credential, session, clipboard-import, and terminal sections, including the
+runner-validated writable-home mount target;
 `profile explain grok` reports the exact partial-migration status without treating
 linted files as executable.
 
@@ -220,6 +220,11 @@ mounts. Then run:
 For Grok installed as `/opt/sandbox-guard/tools/grok`, the final command becomes simply:
 
     guard grok
+
+On the Lima backend, the compiled Grok profile pins both the main process and matching login
+preflight to that absolute guest path instead of falling back to another `grok` on guest `PATH`.
+The run audit therefore records the absolute tool command on macOS; Linux retains the compiled
+`grok` command while the runner resolves its host executable as before.
 
 For `guard run`, Guard automatically requests a Lima PTY when both host standard input and output
 are terminals, so interactive prompts, typing, and paste work without changing the isolation

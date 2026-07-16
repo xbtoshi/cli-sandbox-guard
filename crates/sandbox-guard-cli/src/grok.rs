@@ -15,7 +15,7 @@ use sandbox_guard_core::{
     ArgumentMatch, CompiledPolicy, CredentialProfile, EgressMode, SessionProfile, Stage,
     StageOptions, ToolLaunchProfile, UserPolicy, VendorProfile, builtin_grok_profile,
 };
-use sandbox_guard_runner::{InteractiveUx, ProcessSpec};
+use sandbox_guard_runner::{BackendKind, InteractiveUx, ProcessSpec};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -128,6 +128,7 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
         .validate()
         .context("compiled Grok profile failed validation")?;
     validate_profile_ui_request(&profile, args.scrollback)?;
+    let resolved_backend = BackendKind::from(args.backend).resolve()?;
     let base_dirs = BaseDirs::new().context("could not determine the user home directory")?;
     let auth_path = base_dirs
         .home_dir()
@@ -164,6 +165,7 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
     let session_state = GrokSessionState::prepare(&args.source, args.resume, sessions)?;
     let tool = grok_tool_arguments(
         &profile.tool,
+        resolved_backend,
         args.scrollback,
         args.resume,
         args.continue_session,
@@ -198,7 +200,7 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
         tool,
     };
     let environment = profile_environment(&profile, credential.access_token);
-    let preflight = profile_preflight(&profile);
+    let preflight = profile_preflight(&profile, resolved_backend);
     run_command_with(
         run_args,
         environment,
@@ -224,12 +226,13 @@ fn validate_profile_ui_request(profile: &VendorProfile, scrollback: bool) -> Res
 
 fn grok_tool_arguments(
     profile: &ToolLaunchProfile,
+    backend: BackendKind,
     scrollback: bool,
     resume: Option<Uuid>,
     continue_session: bool,
     grok_args: Vec<OsString>,
 ) -> Vec<OsString> {
-    let mut tool = vec![OsString::from(&profile.command)];
+    let mut tool = vec![profile_tool_command(profile, backend)];
     tool.extend(profile.forced_arguments.iter().map(OsString::from));
     if scrollback {
         tool.extend(profile.scrollback_arguments.iter().map(OsString::from));
@@ -297,15 +300,27 @@ fn profile_environment(profile: &VendorProfile, access_token: String) -> Vec<(St
     ]
 }
 
-fn profile_preflight(profile: &VendorProfile) -> Option<ProcessSpec> {
+fn profile_preflight(profile: &VendorProfile, backend: BackendKind) -> Option<ProcessSpec> {
     profile
         .tool
         .preflight
         .as_ref()
         .map(|preflight| ProcessSpec {
-            command: OsString::from(&preflight.command),
+            command: if preflight.command == profile.tool.command {
+                profile_tool_command(&profile.tool, backend)
+            } else {
+                OsString::from(&preflight.command)
+            },
             args: preflight.arguments.iter().map(OsString::from).collect(),
         })
+}
+
+fn profile_tool_command(profile: &ToolLaunchProfile, backend: BackendKind) -> OsString {
+    match backend {
+        BackendKind::LinuxBwrap => OsString::from(&profile.command),
+        BackendKind::MacosLima => profile.guest_executable.as_os_str().to_owned(),
+        BackendKind::Auto => unreachable!("profile tool command requires a resolved backend"),
+    }
 }
 
 struct GrokSessionState {
@@ -905,8 +920,22 @@ mod tests {
         let mut profile = profile();
         validate_profile_ui_request(&profile, false).unwrap();
         validate_profile_ui_request(&profile, true).unwrap();
-        let normal = grok_tool_arguments(&profile.tool, false, None, false, Vec::new());
-        let scrollback = grok_tool_arguments(&profile.tool, true, None, false, Vec::new());
+        let normal = grok_tool_arguments(
+            &profile.tool,
+            BackendKind::LinuxBwrap,
+            false,
+            None,
+            false,
+            Vec::new(),
+        );
+        let scrollback = grok_tool_arguments(
+            &profile.tool,
+            BackendKind::LinuxBwrap,
+            true,
+            None,
+            false,
+            Vec::new(),
+        );
 
         assert_eq!(
             normal,
@@ -936,7 +965,14 @@ mod tests {
     fn grok_session_arguments_are_guard_owned() {
         let profile = profile();
         let session = Uuid::new_v4();
-        let resumed = grok_tool_arguments(&profile.tool, false, Some(session), false, Vec::new());
+        let resumed = grok_tool_arguments(
+            &profile.tool,
+            BackendKind::LinuxBwrap,
+            false,
+            Some(session),
+            false,
+            Vec::new(),
+        );
         assert!(resumed.windows(2).any(|values| {
             values
                 == [
@@ -976,7 +1012,7 @@ mod tests {
         assert_eq!(environment[0].1, "test-access-token");
         assert_eq!(environment[1].0, "GROK_AUTH_PROVIDER_COMMAND");
         assert_eq!(environment[1].1, "printf '%s\\n' \"$GROK_SESSION_TOKEN\"");
-        let preflight = profile_preflight(&profile).unwrap();
+        let preflight = profile_preflight(&profile, BackendKind::LinuxBwrap).unwrap();
         assert_eq!(preflight.command, OsString::from("grok"));
         assert_eq!(preflight.args, [OsString::from("login")]);
         assert!(profile_interactive_ux(&profile).clipboard_image_import);
@@ -1001,6 +1037,39 @@ mod tests {
         assert!(profile.terminal.native_scrollback_opt_in);
         assert!(profile.clipboard.image_import);
         assert!(profile.seccomp.clone3_enosys_shim_expected);
+    }
+
+    #[test]
+    fn lima_uses_the_compiled_absolute_guest_executable_for_tool_and_preflight() {
+        let profile = profile();
+        let linux = grok_tool_arguments(
+            &profile.tool,
+            BackendKind::LinuxBwrap,
+            false,
+            None,
+            false,
+            Vec::new(),
+        );
+        let lima = grok_tool_arguments(
+            &profile.tool,
+            BackendKind::MacosLima,
+            false,
+            None,
+            false,
+            Vec::new(),
+        );
+        assert_eq!(linux[0], OsString::from("grok"));
+        assert_eq!(lima[0], profile.tool.guest_executable.as_os_str());
+        assert_eq!(linux[1..], lima[1..]);
+
+        let linux_preflight = profile_preflight(&profile, BackendKind::LinuxBwrap).unwrap();
+        let lima_preflight = profile_preflight(&profile, BackendKind::MacosLima).unwrap();
+        assert_eq!(linux_preflight.command, OsString::from("grok"));
+        assert_eq!(
+            lima_preflight.command,
+            profile.tool.guest_executable.as_os_str()
+        );
+        assert_eq!(linux_preflight.args, lima_preflight.args);
     }
 
     #[test]
