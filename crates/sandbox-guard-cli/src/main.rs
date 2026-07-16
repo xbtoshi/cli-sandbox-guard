@@ -25,6 +25,7 @@ use sandbox_guard_runner::{
 };
 
 mod grok;
+mod profile;
 mod setup;
 mod uninstall;
 use grok::GrokArgs;
@@ -69,6 +70,8 @@ enum Command {
     Test(TestArgs),
     /// Install or verify a detached-signature-verified tool artifact.
     Tool(ToolArgs),
+    /// Inspect compiled trusted vendor profiles. External profiles are not executable.
+    Profile(profile::ProfileArgs),
 }
 
 #[derive(Debug, Args)]
@@ -409,6 +412,7 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Gc(args) => gc_command(args),
         Command::Test(args) => test_command(args),
         Command::Tool(args) => tool_command(args),
+        Command::Profile(args) => profile::profile_command(args),
     }
 }
 

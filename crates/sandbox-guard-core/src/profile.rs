@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const VENDOR_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const BUILTIN_VENDOR_PROFILE_NAMES: &[&str] = &["grok"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -335,6 +336,14 @@ pub fn builtin_grok_profile() -> VendorProfile {
     }
 }
 
+/// Return one compiled trusted profile by its exact stable name.
+pub fn builtin_vendor_profile(name: &str) -> Option<VendorProfile> {
+    match name {
+        "grok" => Some(builtin_grok_profile()),
+        _ => None,
+    }
+}
+
 fn argument_rule(kind: ArgumentMatch, value: &str) -> ArgumentRule {
     ArgumentRule {
         kind,
@@ -478,6 +487,18 @@ mod tests {
         decoded.validate().unwrap();
         assert_eq!(decoded, profile);
         assert_eq!(toml::to_string_pretty(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn builtin_registry_contains_only_valid_compiled_profiles() {
+        assert_eq!(BUILTIN_VENDOR_PROFILE_NAMES, ["grok"]);
+        for name in BUILTIN_VENDOR_PROFILE_NAMES {
+            let profile = builtin_vendor_profile(name).unwrap();
+            assert_eq!(profile.name, *name);
+            profile.validate().unwrap();
+        }
+        assert!(builtin_vendor_profile("Grok").is_none());
+        assert!(builtin_vendor_profile("../grok").is_none());
     }
 
     #[test]

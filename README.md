@@ -137,6 +137,11 @@ removal requires `--remove` and the exact terminal phrase (or explicit
 `--remove --yes` automation); binaries, Lima, vendor state, and locked active
 runs are never silently removed.
 
+Inspect the compiled trusted vendor profiles with `guard profile list` and
+`guard profile show grok`. These commands are read-only; v0.3 does not load or
+execute owner- or project-supplied profiles. Scripts should use `--json`
+rather than relying on the human-oriented tabular or TOML output.
+
 ## Build and self-test
 
 Rust 1.85 or newer is required.
