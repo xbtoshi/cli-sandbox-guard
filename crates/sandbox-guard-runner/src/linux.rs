@@ -448,7 +448,7 @@ fn build_bwrap_args(
     if let Some(state) = &request.writable_home_state {
         push(&mut args, "--bind");
         args.push(state.as_os_str().to_owned());
-        push(&mut args, "/home/guard/.grok/sessions");
+        push(&mut args, crate::WRITABLE_HOME_STATE_GUEST_PATH);
     }
     if let Some((host, guest)) = tool_mount {
         push(&mut args, "--ro-bind");
@@ -569,7 +569,7 @@ pub(crate) fn guest_bwrap_args(
     if request.writable_home_state.is_some() {
         push(&mut args, "--bind");
         args.push(runtime_root.join("session-state").into_os_string());
-        push(&mut args, "/home/guard/.grok/sessions");
+        push(&mut args, crate::WRITABLE_HOME_STATE_GUEST_PATH);
     }
     push(&mut args, "--bind");
     args.push(workspace.as_os_str().to_owned());

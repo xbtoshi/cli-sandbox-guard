@@ -82,7 +82,7 @@ We will not adopt these weaker postures:
   cgroup requirements.
 - [x] Add `guard setup --check` and actionable diagnostics for the host/backend components it
   checks; selected vendor-tool provisioning remains a separate item above.
-- [ ] Add an explicit removal command that deletes only Guard-owned state.
+- [x] Add an explicit removal command that deletes only Guard-owned state.
 
 ### Declarative profiles
 

@@ -19,6 +19,8 @@ use std::process::ExitStatus;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const WRITABLE_HOME_STATE_GUEST_PATH: &str = "/home/guard/.grok/sessions";
+
 pub use approval::{
     RememberedEgressDecision, clear_remembered_egress_decisions, forget_remembered_egress_decision,
     list_remembered_egress_decisions,
@@ -104,7 +106,7 @@ pub struct RunRequest {
     pub interactive_egress_approval: bool,
     /// Private host-side file used for remembered exact-host allow and deny choices.
     pub egress_decision_store: Option<PathBuf>,
-    /// Guard-owned writable state exposed only at `/home/guard/.grok/sessions`.
+    /// Guard-owned writable state exposed only at [`WRITABLE_HOME_STATE_GUEST_PATH`].
     pub writable_home_state: Option<PathBuf>,
     pub forwarded_env: Vec<(String, String)>,
     pub resource_limits: ResourceLimits,

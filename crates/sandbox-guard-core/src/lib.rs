@@ -9,6 +9,7 @@ mod export;
 mod gc;
 mod git;
 mod policy;
+mod profile;
 mod staging;
 mod tool_store;
 
@@ -25,6 +26,11 @@ pub use export::{
 };
 pub use gc::{GcError, GcReport, garbage_collect};
 pub use policy::{CompiledPolicy, EffectivePolicy, PolicyError, UserPolicy};
+pub use profile::{
+    ArgumentMatch, ArgumentRule, ClipboardProfile, CommandProfile, CredentialProfile, EgressMode,
+    EgressProfile, HostRule, ProfileError, SeccompCompatibility, SessionProfile, TerminalProfile,
+    ToolLaunchProfile, VENDOR_PROFILE_SCHEMA_VERSION, VendorProfile, builtin_grok_profile,
+};
 pub use staging::{
     PersistedStage, Stage, StageError, StageOptions, default_staging_base, display_path,
     is_valid_candidate_path,

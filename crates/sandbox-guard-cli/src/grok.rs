@@ -816,6 +816,99 @@ mod tests {
     }
 
     #[test]
+    fn compiled_profile_matches_the_current_grok_boundary() {
+        let profile = sandbox_guard_core::builtin_grok_profile();
+        profile.validate().unwrap();
+
+        assert_eq!(profile.name, "grok");
+        assert_eq!(profile.tool.command, "grok");
+        assert_eq!(
+            profile.tool.guest_executable,
+            Path::new("/opt/sandbox-guard/tools/grok")
+        );
+        assert_eq!(
+            profile.tool.forced_arguments,
+            SAFE_GROK_ARGUMENTS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(profile.tool.scrollback_arguments, ["--minimal"]);
+        let preflight = profile.tool.preflight.as_ref().unwrap();
+        assert_eq!(preflight.command, "grok");
+        assert_eq!(preflight.arguments, ["login"]);
+        assert_eq!(
+            profile.tool.forbidden_passthrough,
+            [
+                sandbox_guard_core::ArgumentRule {
+                    kind: sandbox_guard_core::ArgumentMatch::Exact,
+                    value: "--resume".to_owned(),
+                },
+                sandbox_guard_core::ArgumentRule {
+                    kind: sandbox_guard_core::ArgumentMatch::Exact,
+                    value: "-r".to_owned(),
+                },
+                sandbox_guard_core::ArgumentRule {
+                    kind: sandbox_guard_core::ArgumentMatch::Exact,
+                    value: "--continue".to_owned(),
+                },
+                sandbox_guard_core::ArgumentRule {
+                    kind: sandbox_guard_core::ArgumentMatch::Exact,
+                    value: "-c".to_owned(),
+                },
+                sandbox_guard_core::ArgumentRule {
+                    kind: sandbox_guard_core::ArgumentMatch::Prefix,
+                    value: "--resume=".to_owned(),
+                },
+            ]
+        );
+        assert_eq!(
+            profile.egress.allowed_https_hosts[0].hostname,
+            GROK_PROXY_HOST
+        );
+        assert!(!profile.egress.allowed_https_hosts[0].include_subdomains);
+        assert!(profile.egress.interactive_approval_default);
+        assert_eq!(
+            profile.credentials.host_auth_file,
+            Path::new(".grok/auth.json")
+        );
+        assert_eq!(profile.credentials.value_environment, GROK_SESSION_TOKEN);
+        assert_eq!(
+            profile.credentials.provider_command_environment,
+            GROK_AUTH_PROVIDER_COMMAND
+        );
+        assert_eq!(profile.credentials.provider_command, AUTH_PROVIDER_COMMAND);
+        assert_eq!(
+            profile.credentials.minimum_validity_minutes,
+            MINIMUM_TOKEN_VALIDITY_MINUTES as u64
+        );
+        assert_eq!(profile.credentials.max_auth_file_bytes, MAX_AUTH_FILE_BYTES);
+        assert_eq!(
+            profile.credentials.scrubbed_host_environment,
+            [
+                "XAI_API_KEY",
+                GROK_SESSION_TOKEN,
+                GROK_AUTH_PROVIDER_COMMAND,
+                "GROK_SANDBOX"
+            ]
+        );
+        let sessions = profile.sessions.unwrap();
+        assert_eq!(
+            sessions.guest_mount_path,
+            Path::new(sandbox_guard_runner::WRITABLE_HOME_STATE_GUEST_PATH)
+        );
+        assert_eq!(sessions.workspace_key, GROK_SESSION_CWD);
+        assert_eq!(sessions.index_file, GROK_SESSION_INDEX);
+        assert_eq!(sessions.prompt_history_file, GROK_PROMPT_HISTORY);
+        assert_eq!(sessions.max_total_bytes, SESSION_MAX_TOTAL_BYTES);
+        assert_eq!(sessions.max_files, SESSION_MAX_FILES);
+        assert!(profile.terminal.mouse_reporting_default);
+        assert!(profile.terminal.native_scrollback_opt_in);
+        assert!(profile.clipboard.image_import);
+        assert!(profile.seccomp.clone3_enosys_shim_expected);
+    }
+
+    #[test]
     fn private_session_snapshot_round_trips_through_validation() {
         let data = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
