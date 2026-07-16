@@ -25,7 +25,7 @@ const GUEST_HELPER: &str = "/opt/sandbox-guard/helper";
 
 /// Fixed, non-identifying search path used only so the guest's `env -i` boundary can locate
 /// `bwrap` after every inherited variable has been dropped. It carries no host identity or
-/// secret; see `docs/SECURITY_MODEL.md` "Clean launcher environment".
+/// secret; see the launcher-scrub guarantee in `docs/SECURITY_MODEL.md` "Execution invariants".
 const GUEST_CLEAN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub struct LinuxBwrapRunner;
