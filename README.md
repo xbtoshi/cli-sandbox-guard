@@ -150,6 +150,8 @@ executable, egress, credential, session, clipboard-import, and terminal sections
 runner-validated writable-home mount target;
 `profile explain grok` reports the exact partial-migration status without treating
 linted files as executable.
+The remaining seccomp compatibility field is descriptive and CI-cross-pinned to the fixed helper
+filter; neither built-in nor linted profiles can modify runtime syscall enforcement.
 
 ## Build and self-test
 

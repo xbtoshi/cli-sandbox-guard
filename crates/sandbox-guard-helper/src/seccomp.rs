@@ -179,6 +179,7 @@ pub(crate) unsafe fn install_filter(program: &[SockFilter]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sandbox_guard_core::builtin_grok_profile;
 
     #[test]
     fn filter_is_arch_checked_and_ends_in_allow() {
@@ -204,5 +205,27 @@ mod tests {
         ] {
             assert!(filter.iter().any(|instruction| instruction.k == syscall));
         }
+    }
+
+    #[test]
+    fn compiled_grok_profile_matches_the_clone3_compatibility_rule() {
+        // This is the CI cross-pin referenced by README: profiles describe compatibility but
+        // never configure the production filter built above.
+        let profile = builtin_grok_profile();
+        profile.validate().unwrap();
+        let unavailable = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+        let filter = build_filter();
+        let clone3_returns_enosys = filter.windows(2).any(|instructions| {
+            instructions[0].code == BPF_JMP_JEQ_K
+                && instructions[0].k == libc::SYS_clone3 as u32
+                && instructions[0].jt == 0
+                && instructions[0].jf == 1
+                && instructions[1].code == BPF_RET_K
+                && instructions[1].k == unavailable
+        });
+        assert_eq!(
+            clone3_returns_enosys,
+            profile.seccomp.clone3_enosys_shim_expected
+        );
     }
 }

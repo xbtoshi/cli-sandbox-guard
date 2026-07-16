@@ -20,4 +20,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+sandbox-guard-core = { path = "../sandbox-guard-core" }
 tempfile.workspace = true

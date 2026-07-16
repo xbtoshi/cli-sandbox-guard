@@ -857,6 +857,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "sandbox-guard-core",
  "serde",
  "serde_json",
  "tempfile",

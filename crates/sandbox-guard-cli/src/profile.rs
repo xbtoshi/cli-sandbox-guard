@@ -159,7 +159,7 @@ pub(super) fn profile_command(args: ProfileArgs) -> Result<i32> {
             } else {
                 println!("profile: {} ({})", report.profile_name, report.source);
                 println!(
-                    "runtime source: partial compiled-profile migration (seccomp compatibility remains descriptive rather than runtime-configurable)"
+                    "runtime source: compiled profile projection with seccomp compatibility kept descriptive and cross-pinned to the fixed helper filter by tests"
                 );
                 for section in report.sections {
                     println!(
