@@ -77,7 +77,9 @@ We will not adopt these weaker postures:
 
 - [x] Add `guard setup` with platform detection and idempotent repair.
 - [ ] Provision the mountless Lima instance, Bubblewrap, `guard-helper`, and the selected verified
-  vendor tool on macOS.
+  vendor tool on macOS. Partial: `guard setup --create-instance` now creates the absent mountless
+  instance (confirmed, verified, never started/reconfigured/deleted); starting the VM and
+  installing guest packages, the helper, and the vendor tool remain manual and open.
 - [ ] Install and verify the Linux runtime dependencies without silently weakening namespace or
   cgroup requirements.
 - [x] Add `guard setup --check` and actionable diagnostics for the host/backend components it

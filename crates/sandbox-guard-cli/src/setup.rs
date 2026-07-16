@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -214,12 +215,22 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
     let paths = SetupPaths::discover()?;
     let probes = SystemProbes;
 
+    // The only VM-creating path. It resolves the backend and confirms before any external
+    // mutation, is fully independent of the diagnostic classification below, and never starts,
+    // reconfigures, or deletes an instance.
+    let mut actions = Vec::new();
+    if args.create_instance {
+        if let Some(action) =
+            run_create_instance(&probes, backend, &args.lima_instance, args.yes, args.json)?
+        {
+            actions.push(action);
+        }
+    }
+
     let initial = diagnose(&probes, backend, &args.lima_instance, &paths)?;
-    let actions = if args.check {
-        Vec::new()
-    } else {
-        apply_safe_repairs(&initial, &paths)?
-    };
+    if !args.check {
+        actions.extend(apply_safe_repairs(&initial, &paths)?);
+    }
     let mut report = if actions.is_empty() {
         initial
     } else {
@@ -233,6 +244,225 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
         render_human(&report, args.check);
     }
     Ok(report.exit_code())
+}
+
+/// Resolve the mutating create-instance request into an optional recorded action.
+///
+/// Returns `Ok(None)` when the instance already exists (a no-op that never prompts or mutates),
+/// and `Ok(Some(action))` after a confirmed, verified creation. Every abort path — wrong backend,
+/// `--json` without `--yes`, declined confirmation, ambiguous presence, or create failure returns
+/// an error before mutation. An unsafe post-condition fails closed while leaving the newly created
+/// instance for explicit manual inspection; Guard never guesses that it is safe to delete.
+fn run_create_instance(
+    probes: &dyn SetupProbes,
+    backend: BackendKind,
+    instance: &str,
+    assume_yes: bool,
+    json: bool,
+) -> Result<Option<String>> {
+    if json && !assume_yes {
+        bail!(
+            "--create-instance with --json requires --yes so machine-readable output is never mixed with an interactive prompt"
+        );
+    }
+    validate_create_instance_target(backend, std::env::consts::OS)?;
+    create_lima_instance(probes, instance, assume_yes)
+}
+
+fn validate_create_instance_target(backend: BackendKind, host_os: &str) -> Result<()> {
+    if host_os != "macos" {
+        bail!("--create-instance is only supported on a macOS host; detected {host_os:?}");
+    }
+    if backend != BackendKind::MacosLima {
+        bail!(
+            "--create-instance is only supported on the macOS Lima backend; the resolved backend is {}",
+            backend_label(backend)
+        );
+    }
+    Ok(())
+}
+
+fn backend_label(backend: BackendKind) -> &'static str {
+    match backend {
+        BackendKind::Auto => "auto",
+        BackendKind::LinuxBwrap => "linux-bwrap",
+        BackendKind::MacosLima => "macos-lima",
+    }
+}
+
+/// Create the dedicated Lima instance only when it is provably absent.
+///
+/// Presence is decided by an independent, fail-closed enumeration of every instance; an existing
+/// instance of any status or configuration is left untouched. Creation renders a fixed discrete
+/// argv (no shell, no environment interpolation), then re-inspects the result and refuses to
+/// report success unless the instance exists mountless. A failed or unsafe creation is never
+/// auto-deleted; the caller is told to inspect it manually.
+fn create_lima_instance(
+    probes: &dyn SetupProbes,
+    instance: &str,
+    assume_yes: bool,
+) -> Result<Option<String>> {
+    validate_lima_instance(instance)?;
+    let Some(limactl) = probes.which("limactl") else {
+        bail!("limactl was not found on PATH; install Lima before creating the instance");
+    };
+
+    if lima_instance_present(probes, &limactl, instance)? {
+        eprintln!("Lima instance {instance:?} already exists; leaving it unchanged");
+        return Ok(None);
+    }
+
+    confirm_instance_creation(instance, assume_yes)?;
+    run_lima_create(probes, &limactl, instance)?;
+    verify_created_instance(probes, &limactl, instance)?;
+    Ok(Some(format!("created mountless Lima instance {instance}")))
+}
+
+/// Fail-closed presence detection independent of the named diagnostic's broad
+/// nonzero-means-missing classification. Enumerates every instance as JSON-lines and matches the
+/// exact validated name; any command failure, malformed record, missing/non-string name, or a
+/// duplicated name aborts rather than guessing.
+fn lima_instance_present(probes: &dyn SetupProbes, limactl: &Path, instance: &str) -> Result<bool> {
+    let records = lima_list_records(probes, limactl, None)?;
+    let matches = records
+        .iter()
+        .filter(|record| record.get("name").and_then(serde_json::Value::as_str) == Some(instance))
+        .count();
+    match matches {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => bail!(
+            "limactl reported instance {instance:?} more than once; refusing to create or modify anything"
+        ),
+    }
+}
+
+/// Run `limactl list --json [name]` and parse it as JSON-lines: one object per non-empty line.
+/// Untrusted instance names are validated as present strings but are never echoed to the terminal.
+fn lima_list_records(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    filter: Option<&str>,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>> {
+    let mut args = vec![OsString::from("list"), OsString::from("--json")];
+    if let Some(name) = filter {
+        args.push(OsString::from(name));
+    }
+    let output = probes
+        .output(limactl, &args)
+        .map_err(|error| anyhow!("failed to run limactl list --json: {error}"))?;
+    if !output.success {
+        bail!("limactl list --json failed: {}", concise_failure(&output));
+    }
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| anyhow!("limactl list --json produced non-UTF-8 output"))?;
+    let mut records = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|_| anyhow!("limactl list --json produced a malformed record"))?;
+        let object = match value {
+            serde_json::Value::Object(map) => map,
+            _ => bail!("limactl list --json produced a record that was not a JSON object"),
+        };
+        if object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        {
+            bail!("limactl list --json produced a record without a string name");
+        }
+        records.push(object);
+    }
+    Ok(records)
+}
+
+fn confirm_instance_creation(instance: &str, assume_yes: bool) -> Result<()> {
+    if assume_yes {
+        return Ok(());
+    }
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        bail!(
+            "creating the Lima instance requires an interactive terminal or --yes; nothing was changed"
+        );
+    }
+    let phrase = format!("CREATE LIMA INSTANCE {instance}");
+    eprintln!(
+        "This creates a new dedicated Lima VM named {instance:?} with host mounts disabled. It does not start the VM or install anything inside it."
+    );
+    print!("Type {phrase} to confirm: ");
+    io::stdout()
+        .flush()
+        .context("flush Lima creation confirmation prompt")?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0
+        || !instance_creation_phrase_matches(instance, &answer)
+    {
+        bail!("Lima instance creation was not confirmed; nothing was changed");
+    }
+    Ok(())
+}
+
+fn instance_creation_phrase_matches(instance: &str, answer: &str) -> bool {
+    answer.trim_end_matches(['\r', '\n']) == format!("CREATE LIMA INSTANCE {instance}")
+}
+
+/// Execute exactly `limactl create --name <validated-name> --mount-none template:default` as a
+/// discrete argv. No shell, no environment interpolation, and no weaker fallback. A failure is
+/// reported with a terminal-safe diagnostic and no cleanup or delete is attempted.
+fn run_lima_create(probes: &dyn SetupProbes, limactl: &Path, instance: &str) -> Result<()> {
+    validate_lima_instance(instance)?;
+    let args = [
+        OsString::from("create"),
+        OsString::from("--name"),
+        OsString::from(instance),
+        OsString::from("--mount-none"),
+        OsString::from("template:default"),
+    ];
+    let output = probes
+        .output(limactl, &args)
+        .map_err(|error| anyhow!("failed to run limactl create: {error}"))?;
+    if !output.success {
+        bail!(
+            "limactl create failed: {}; inspect Lima manually before retrying",
+            concise_failure(&output)
+        );
+    }
+    Ok(())
+}
+
+/// Read-only post-condition: the exact instance must exist with a config object whose `mounts`
+/// key is absent or an empty array. Any schema drift, non-empty mounts, wrong/missing name, or
+/// command failure is an error, and Guard never deletes the unverified instance.
+fn verify_created_instance(probes: &dyn SetupProbes, limactl: &Path, instance: &str) -> Result<()> {
+    let records = lima_list_records(probes, limactl, Some(instance))?;
+    let [record] = records.as_slice() else {
+        bail!(
+            "limactl did not return exactly one {instance:?} record after creation; inspect it manually before use and Guard will not delete it"
+        );
+    };
+    if record.get("name").and_then(serde_json::Value::as_str) != Some(instance) {
+        bail!(
+            "limactl returned the wrong instance after creating {instance:?}; inspect Lima manually and Guard will not delete anything"
+        );
+    }
+    let Some(config) = record.get("config").and_then(serde_json::Value::as_object) else {
+        bail!(
+            "the created instance {instance:?} reported no config object; inspect it manually and Guard will not delete it"
+        );
+    };
+    match config.get("mounts") {
+        None => Ok(()),
+        Some(serde_json::Value::Array(mounts)) if mounts.is_empty() => Ok(()),
+        Some(serde_json::Value::Array(_)) => bail!(
+            "the created instance {instance:?} declares host mounts; inspect and remove it manually, Guard will not delete it"
+        ),
+        Some(_) => bail!(
+            "the created instance {instance:?} reported a non-array config.mounts; inspect it manually, Guard will not delete it"
+        ),
+    }
 }
 
 fn diagnose(
@@ -538,7 +768,10 @@ fn diagnose_macos(
             } else {
                 CheckStatus::Missing
             },
-            detail: format!("instance status is {status:?}; guest checks were not executed"),
+            detail: format!(
+                "instance status is {:?}; guest checks were not executed",
+                sanitize_terminal_fragment(status)
+            ),
             path: None,
             repair: (!declared_mounts_unsafe).then(|| {
                 manual_repair(
@@ -583,7 +816,10 @@ fn diagnose_macos(
                     component: "lima-guest".to_owned(),
                     required: true,
                     status: CheckStatus::Unsafe,
-                    detail: format!("unsafe host-sharing mount detected: {}", line.trim()),
+                    detail: format!(
+                        "unsafe host-sharing mount detected: {}",
+                        sanitize_terminal_fragment(line.trim())
+                    ),
                     path: None,
                     repair: None,
                 }
@@ -786,7 +1022,10 @@ fn version_check(
                     component: component.to_owned(),
                     required: true,
                     status: CheckStatus::Mismatch,
-                    detail: format!("expected {expected_line:?}, got {actual:?}"),
+                    detail: format!(
+                        "expected {expected_line:?}, got {:?}",
+                        sanitize_terminal_fragment(&actual)
+                    ),
                     path: None,
                     repair: Some(manual_repair(
                         "Install guard and guard-helper from the same verified release.",
@@ -1188,14 +1427,43 @@ fn platform_install_repair(package: &str) -> Repair {
 }
 
 fn concise_output(bytes: &[u8]) -> String {
-    let value = String::from_utf8_lossy(bytes)
-        .trim()
-        .replace(['\r', '\n'], " ");
+    let value = sanitize_terminal_fragment(&String::from_utf8_lossy(bytes));
+    let value = value.trim();
     if value.is_empty() {
         "command failed without diagnostic output".to_owned()
     } else {
         value.chars().take(500).collect()
     }
+}
+
+/// Escape any byte an untrusted subprocess could use to drive the terminal: C0/C1/DEL control
+/// characters and Unicode bidirectional/format overrides become printable `\u{..}` escapes.
+/// Newlines and tabs collapse to spaces so a single concise line cannot be forged into several.
+fn sanitize_terminal_fragment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' | '\r' | '\t' => out.push(' '),
+            control if control.is_control() => out.extend(control.escape_default()),
+            bidi if is_bidi_or_format_control(bidi) => out.extend(bidi.escape_default()),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Conservative set of zero-width, line/paragraph separator, and bidirectional formatting code
+/// points that can reorder or hide terminal text without being classified as control characters.
+fn is_bidi_or_format_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
 }
 
 fn concise_failure(output: &ProbeOutput) -> String {
@@ -1733,5 +2001,293 @@ mod tests {
                 .iter()
                 .any(|check| check.id == "linux.userns" && check.status == CheckStatus::Ok)
         );
+    }
+
+    // ---- explicit Lima instance creation ----
+
+    use crate::Cli;
+    use clap::Parser;
+
+    const LIMACTL: &str = "/opt/homebrew/bin/limactl";
+
+    fn lima_probes() -> FakeProbes {
+        let mut probes = FakeProbes::default();
+        probes
+            .executables
+            .insert("limactl".to_owned(), PathBuf::from(LIMACTL));
+        probes
+    }
+
+    fn list_key(filter: Option<&str>) -> String {
+        let mut args = vec![OsString::from("list"), OsString::from("--json")];
+        if let Some(name) = filter {
+            args.push(OsString::from(name));
+        }
+        command_key(Path::new(LIMACTL), &args)
+    }
+
+    fn create_key(instance: &str) -> String {
+        command_key(
+            Path::new(LIMACTL),
+            &[
+                OsString::from("create"),
+                OsString::from("--name"),
+                OsString::from(instance),
+                OsString::from("--mount-none"),
+                OsString::from("template:default"),
+            ],
+        )
+    }
+
+    fn assert_no_lifecycle_mutation(probes: &FakeProbes) {
+        for call in probes.calls.borrow().iter() {
+            for forbidden in [
+                " start ",
+                " stop ",
+                " delete",
+                " restart",
+                "reconfigure",
+                " edit ",
+            ] {
+                assert!(
+                    !call.contains(forbidden),
+                    "unexpected lifecycle mutation in call: {call}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absent_instance_is_created_mountless_verified_and_recorded() {
+        let mut probes = lima_probes();
+        probes
+            .outputs
+            .insert(list_key(None), output(true, r#"{"name":"other-vm"}"#, ""));
+        probes
+            .outputs
+            .insert(create_key("sandbox-guard"), output(true, "", ""));
+        probes.outputs.insert(
+            list_key(Some("sandbox-guard")),
+            output(
+                true,
+                r#"{"name":"sandbox-guard","status":"Stopped","config":{"mounts":[]}}"#,
+                "",
+            ),
+        );
+
+        let action = create_lima_instance(&probes, "sandbox-guard", true).unwrap();
+        assert_eq!(
+            action.as_deref(),
+            Some("created mountless Lima instance sandbox-guard")
+        );
+        let calls = probes.calls.borrow().clone();
+        assert_eq!(
+            calls,
+            vec![
+                list_key(None),
+                create_key("sandbox-guard"),
+                list_key(Some("sandbox-guard")),
+            ]
+        );
+        assert!(calls[1].contains("--mount-none"));
+        assert!(calls[1].contains("--name sandbox-guard"));
+        assert_no_lifecycle_mutation(&probes);
+    }
+
+    #[test]
+    fn missing_config_object_after_create_absent_mounts_key_is_accepted() {
+        let mut probes = lima_probes();
+        probes.outputs.insert(list_key(None), output(true, "", ""));
+        probes
+            .outputs
+            .insert(create_key("sandbox-guard"), output(true, "", ""));
+        probes.outputs.insert(
+            list_key(Some("sandbox-guard")),
+            output(true, r#"{"name":"sandbox-guard","config":{}}"#, ""),
+        );
+        // An empty config object with no mounts key is mountless and must be accepted.
+        assert!(create_lima_instance(&probes, "sandbox-guard", true).is_ok());
+    }
+
+    #[test]
+    fn existing_instance_of_any_config_is_left_untouched_without_prompt() {
+        let mut probes = lima_probes();
+        // Even a mounted, running instance is a no-op for this action; it is never reconfigured.
+        probes.outputs.insert(
+            list_key(None),
+            output(
+                true,
+                "{\"name\":\"sandbox-guard\",\"status\":\"Running\",\"config\":{\"mounts\":[{\"location\":\"/Users\"}]}}\n{\"name\":\"other\"}",
+                "",
+            ),
+        );
+        // assume_yes=false proves the present branch returns before any confirmation.
+        let action = create_lima_instance(&probes, "sandbox-guard", false).unwrap();
+        assert_eq!(action, None);
+        assert_eq!(probes.calls.borrow().clone(), vec![list_key(None)]);
+        assert_no_lifecycle_mutation(&probes);
+    }
+
+    #[test]
+    fn failed_malformed_or_duplicate_listing_never_creates() {
+        for listing in [
+            output(false, "", "limactl exploded"),
+            output(true, "{ this is not json", ""),
+            output(true, "[1,2,3]", ""),
+            output(true, r#"{"status":"Running"}"#, ""),
+            output(
+                true,
+                "{\"name\":\"sandbox-guard\"}\n{\"name\":\"sandbox-guard\"}",
+                "",
+            ),
+        ] {
+            let mut probes = lima_probes();
+            probes.outputs.insert(list_key(None), listing);
+            probes
+                .outputs
+                .insert(create_key("sandbox-guard"), output(true, "", ""));
+            assert!(create_lima_instance(&probes, "sandbox-guard", true).is_err());
+            assert_eq!(probes.calls.borrow().clone(), vec![list_key(None)]);
+            assert_no_lifecycle_mutation(&probes);
+        }
+    }
+
+    #[test]
+    fn unsafe_postcondition_fails_closed_and_never_deletes() {
+        for verify in [
+            // missing config object
+            output(true, r#"{"name":"sandbox-guard","status":"Stopped"}"#, ""),
+            // non-empty mounts
+            output(
+                true,
+                r#"{"name":"sandbox-guard","config":{"mounts":[{"location":"/Users"}]}}"#,
+                "",
+            ),
+            // mounts is not an array
+            output(
+                true,
+                r#"{"name":"sandbox-guard","config":{"mounts":"/Users"}}"#,
+                "",
+            ),
+            // wrong / missing instance record
+            output(true, r#"{"name":"other","config":{"mounts":[]}}"#, ""),
+            // named lookup returned an ambiguous extra record
+            output(
+                true,
+                "{\"name\":\"sandbox-guard\",\"config\":{}}\n{\"name\":\"other\",\"config\":{}}",
+                "",
+            ),
+            // verification command failed
+            output(false, "", "list failed"),
+        ] {
+            let mut probes = lima_probes();
+            probes.outputs.insert(list_key(None), output(true, "", ""));
+            probes
+                .outputs
+                .insert(create_key("sandbox-guard"), output(true, "", ""));
+            probes
+                .outputs
+                .insert(list_key(Some("sandbox-guard")), verify);
+            assert!(create_lima_instance(&probes, "sandbox-guard", true).is_err());
+            assert_no_lifecycle_mutation(&probes);
+        }
+    }
+
+    #[test]
+    fn create_failure_reports_terminal_safe_diagnostic_without_cleanup() {
+        let mut probes = lima_probes();
+        probes.outputs.insert(list_key(None), output(true, "", ""));
+        probes.outputs.insert(
+            create_key("sandbox-guard"),
+            output(false, "", "boom\u{1b}]0;title\u{7}\u{202e}reversed"),
+        );
+        let error = create_lima_instance(&probes, "sandbox-guard", true).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert_no_lifecycle_mutation(&probes);
+    }
+
+    #[test]
+    fn injected_instance_name_is_rejected_before_any_command() {
+        let probes = lima_probes();
+        for bad in ["bad;rm", "../evil", "a b", "-leading", ""] {
+            assert!(create_lima_instance(&probes, bad, true).is_err());
+        }
+        assert!(probes.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn instance_creation_confirmation_phrase_is_exact() {
+        assert!(instance_creation_phrase_matches(
+            "sandbox-guard",
+            "CREATE LIMA INSTANCE sandbox-guard\n"
+        ));
+        assert!(instance_creation_phrase_matches(
+            "sandbox-guard",
+            "CREATE LIMA INSTANCE sandbox-guard\r\n"
+        ));
+        for answer in [
+            "yes\n",
+            " CREATE LIMA INSTANCE sandbox-guard\n",
+            "CREATE LIMA INSTANCE sandbox-guard \n",
+            "CREATE LIMA INSTANCE other\n",
+        ] {
+            assert!(!instance_creation_phrase_matches("sandbox-guard", answer));
+        }
+    }
+
+    #[test]
+    fn json_create_without_yes_is_rejected_before_probing() {
+        let probes = lima_probes();
+        let error = run_create_instance(
+            &probes,
+            BackendKind::MacosLima,
+            "sandbox-guard",
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("--yes"));
+        assert!(probes.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn linux_backend_rejects_create_before_mutation() {
+        let probes = lima_probes();
+        assert!(
+            run_create_instance(
+                &probes,
+                BackendKind::LinuxBwrap,
+                "sandbox-guard",
+                true,
+                false
+            )
+            .is_err()
+        );
+        assert!(probes.calls.borrow().is_empty());
+        assert!(validate_create_instance_target(BackendKind::MacosLima, "linux").is_err());
+    }
+
+    #[test]
+    fn clap_conflicts_create_instance_with_check() {
+        assert!(Cli::try_parse_from(["guard", "setup", "--check"]).is_ok());
+        assert!(Cli::try_parse_from(["guard", "setup", "--create-instance", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["guard", "setup", "--check", "--create-instance"]).is_err());
+        assert!(Cli::try_parse_from(["guard", "setup", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn concise_output_escapes_control_and_bidi_bytes() {
+        let hostile = b"line1\nline2\x1b]0;hijack\x07\xe2\x80\xaereversed";
+        let rendered = concise_output(hostile);
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(rendered.contains("line1 line2"));
     }
 }

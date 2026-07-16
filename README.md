@@ -128,10 +128,24 @@ steps, including manual Lima guest provisioning on macOS. The artifacts are
 alpha prototypes, not production-ready. Maintainers cut releases with
 [docs/RELEASE.md](docs/RELEASE.md).
 
-After installing the binary, run `guard setup`. It repairs only Guard-owned
+After installing the binary, run `guard setup`. Plain setup repairs only Guard-owned
 private directories and prints manual commands for missing external
 dependencies. `guard setup --check --json` performs no repairs and emits the
 versioned readiness report.
+
+On the macOS Lima backend, `guard setup --create-instance` is the only command
+that creates the dedicated VM, and only when it is absent. It runs exactly
+`limactl create --name <instance> --mount-none template:default`, then re-inspects
+the result and refuses to report success unless the instance exists with no host
+mounts. It never starts, reconfigures, or deletes a VM: an existing instance of
+any status or configuration is left untouched, and a failed or unsafe creation is
+reported for manual inspection rather than auto-deleted. Creation requires an
+interactive typed confirmation (`CREATE LIMA INSTANCE <instance>`) or `--yes` for
+non-interactive hosts; `--create-instance --json` requires `--yes` so machine
+output is never mixed with a prompt. `--create-instance` conflicts with `--check`,
+and the newly created instance is still stopped and unprovisioned, so setup will
+report that guest checks were deferred. Guest packages, the helper, and the
+selected vendor tool all remain separate manual provisioning steps.
 
 `guard uninstall` is the matching non-mutating removal plan. Confirmed state
 removal requires `--remove` and the exact terminal phrase (or explicit

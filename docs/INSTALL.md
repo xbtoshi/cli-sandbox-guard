@@ -102,13 +102,15 @@ state and inspect every prerequisite before validating the live boundary:
     guard setup --check
     guard test
 
-`guard setup` is intentionally unprivileged: it creates or tightens only
-Guard-owned directories below the current user's data/configuration roots.
-It prints commands for missing host dependencies but never invokes `sudo`, a
-package manager, or a network downloader. `guard setup --check` is the
-read-only/reporting form; add `--json` for the versioned machine-readable
-schema. Exit status is 0 when ready, 1 when known repairs remain, and 3 when a
-required probe failed and readiness is unknown.
+Plain `guard setup` is intentionally unprivileged: it creates or tightens only
+Guard-owned directories below the current user's data/configuration roots and
+prints commands for missing host dependencies. The explicit macOS-only
+`--create-instance` action is the sole exception: after confirmation it asks
+Lima to create one mountless VM, but still never invokes `sudo` or a guest
+package manager. `guard setup --check` is the read-only/reporting form; add
+`--json` for the versioned machine-readable schema. Exit status is 0 when
+ready, 1 when known repairs remain, and 3 when a required probe failed and
+readiness is unknown.
 
 ## Binary install — macOS (Apple Silicon)
 
@@ -136,17 +138,28 @@ add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile if needed):
 
 Run `guard setup --check --backend macos-lima` first for a readiness report.
 The command detects a missing or stopped instance, declared or live host
-mounts, guest packages, and a missing or version-mismatched helper. It never
-starts, creates, deletes, or modifies a Lima instance.
+mounts, guest packages, and a missing or version-mismatched helper. `guard setup
+--check` never starts, creates, deletes, or modifies a Lima instance.
 
-Provision the dedicated Lima guest. **Guest provisioning remains a manual,
-trusted operation in v0.3**: everything you place inside the guest becomes
-part of the trusted computing base. The guest must be dedicated to Guard,
-created with `--mount-none`, and must never contain credentials or host
-mounts:
+Create the dedicated mountless instance. Guard can do this one step for you:
 
     brew install lima
+    guard setup --create-instance --backend macos-lima
+
+`guard setup --create-instance` creates the instance only when it is absent,
+running exactly `limactl create --name sandbox-guard --mount-none template:default`
+and then verifying it exists with no host mounts. It prompts for the typed phrase
+`CREATE LIMA INSTANCE sandbox-guard` (or accepts `--yes`), and it never starts,
+reconfigures, or deletes a VM. An existing instance is left untouched. The
+equivalent manual command is:
+
     limactl create --name=sandbox-guard --mount-none template:default
+
+Everything else about guest provisioning **remains a manual, trusted operation
+in v0.3**: everything you place inside the guest becomes part of the trusted
+computing base. Start the instance and install the packages, still with host
+mounts disabled and never containing credentials or host mounts:
+
     limactl start --mount-none sandbox-guard
     limactl shell sandbox-guard sudo apt-get update
     limactl shell sandbox-guard sudo apt-get install -y bubblewrap git ca-certificates rsync util-linux

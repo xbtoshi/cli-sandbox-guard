@@ -60,7 +60,7 @@ enum Command {
     Approvals(ApprovalArgs),
     /// Check host prerequisites without changing the system.
     Doctor(DoctorArgs),
-    /// Check readiness and repair only Guard-owned private state.
+    /// Check readiness, repair Guard-owned state, or explicitly create the mountless Lima VM.
     Setup(SetupArgs),
     /// Inspect Guard-owned state and print a non-mutating removal plan.
     Uninstall(UninstallArgs),
@@ -230,6 +230,16 @@ struct SetupArgs {
     /// Inspect readiness without repairs, VM startup, or intentional state changes.
     #[arg(long)]
     check: bool,
+
+    /// Create the dedicated mountless Lima instance when it is absent (macOS backend only).
+    /// This is the only command path that creates a VM; it never starts or reconfigures one.
+    #[arg(long, conflicts_with = "check")]
+    create_instance: bool,
+
+    /// Confirm a mutating setup action without an interactive prompt. Required with
+    /// --create-instance under --json, and the only way to create a VM on a non-interactive host.
+    #[arg(long, requires = "create_instance")]
+    yes: bool,
 
     /// Emit the versioned machine-readable report.
     #[arg(long)]
