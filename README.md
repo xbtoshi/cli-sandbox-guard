@@ -137,10 +137,14 @@ removal requires `--remove` and the exact terminal phrase (or explicit
 `--remove --yes` automation); binaries, Lima, vendor state, and locked active
 runs are never silently removed.
 
-Inspect the compiled trusted vendor profiles with `guard profile list` and
-`guard profile show grok`. These commands are read-only; v0.3 does not load or
-execute owner- or project-supplied profiles. Scripts should use `--json`
-rather than relying on the human-oriented tabular or TOML output.
+Inspect the compiled trusted vendor profiles with `guard profile list`,
+`guard profile show grok`, and `guard profile explain grok`. `guard profile
+lint FILE` can parse and validate an explicitly selected external TOML file,
+but the lint-only result cannot be installed, trusted, or executed. v0.3 never
+uses owner- or project-supplied profiles for a run. Scripts should use `--json`
+rather than relying on the human-oriented output. `profile lint --json` emits
+JSON for a valid document; invalid input exits 1 and reports a sanitized error
+on standard error.
 
 ## Build and self-test
 
