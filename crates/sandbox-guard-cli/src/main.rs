@@ -816,6 +816,15 @@ fn test_command(args: TestArgs) -> Result<i32> {
     if !report.success {
         bail!("hostile backend probe reported a failed invariant: {report:#?}");
     }
+    if !report.bwrap_launcher_environment_scrubbed {
+        bail!(
+            "bwrap launcher process leaked inherited host environment via /proc/1/environ: {:?}",
+            report.bwrap_leaked_environment_names
+        );
+    }
+    if !report.child_environment_present {
+        bail!("clean-environment boundary also stripped the explicit child environment");
+    }
     let expected = request.resource_limits;
     if report.open_file_limit != expected.open_files
         || report.address_space_limit != expected.memory_bytes
@@ -899,6 +908,7 @@ fn test_command(args: TestArgs) -> Result<i32> {
     println!("backend: {backend:?}");
     println!("filesystem boundary: ok");
     println!("environment boundary: ok");
+    println!("launcher environment (/proc/1/environ): scrubbed");
     println!("PID namespace: ok");
     println!("host loopback isolation: ok");
     println!("controlled egress denial and direct-bypass isolation: ok");

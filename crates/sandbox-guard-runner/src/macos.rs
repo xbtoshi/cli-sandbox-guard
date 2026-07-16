@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use crate::approval::ApprovalController;
 use crate::clipboard::{read_clipboard_image, write_private_image};
 use crate::linux::{
-    cgroup_probe_args, cleanup_workspace_inbox, guest_bwrap_args, guest_helper_path,
-    network_warnings, prepare_workspace_inbox, wrap_guest_cgroup, write_environment_file,
+    cgroup_probe_args, cleanup_workspace_inbox, guest_bwrap_args, guest_bwrap_command,
+    guest_helper_path, network_warnings, prepare_workspace_inbox, wrap_guest_cgroup,
+    write_environment_file,
 };
 use crate::terminal::{ClipboardPaste, run_interactive};
 use crate::{
@@ -31,9 +32,7 @@ impl MacosLimaRunner {
         let helper = guest_helper_path(request);
         let bwrap_args = guest_bwrap_args(request, &guest_workspace(request), &guest_root, &helper);
         let guest_command = if request.cgroup_mode == CgroupMode::Disabled {
-            let mut command = vec![OsString::from("bwrap")];
-            command.extend(bwrap_args);
-            command
+            guest_bwrap_command(bwrap_args)
         } else {
             wrap_guest_cgroup(request, bwrap_args)
         };
@@ -94,9 +93,7 @@ impl MacosLimaRunner {
         let guest_command = if use_cgroup {
             wrap_guest_cgroup(request, bwrap_args)
         } else {
-            let mut command = vec![OsString::from("bwrap")];
-            command.extend(bwrap_args);
-            command
+            guest_bwrap_command(bwrap_args)
         };
         let mut shell_args = vec![
             OsString::from(lima_main_tty_arg(request)),
@@ -905,6 +902,40 @@ mod tests {
             guest_workspace_copy_target(&request, &root),
             format!("sandbox-guard:{}", workspace.display())
         );
+    }
+
+    #[test]
+    fn lima_guest_command_scrubs_the_bwrap_launcher_environment_on_both_cgroup_routes() {
+        // Mirror the exact guest-command assembly in MacosLimaRunner::{plan,run}; plan() itself
+        // needs limactl on PATH and is exercised end-to-end by the release Linux live probe.
+        let request = request();
+        let bwrap_args = guest_bwrap_args(
+            &request,
+            &guest_workspace(&request),
+            &guest_root(&request),
+            &guest_helper_path(&request),
+        );
+
+        let disabled = guest_bwrap_command(bwrap_args.clone());
+        let disabled_strings: Vec<_> = disabled
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&disabled_strings[..2], &["env", "-i"]);
+        assert!(disabled_strings[2].starts_with("PATH="));
+        assert_eq!(disabled_strings[3], "bwrap");
+
+        let enabled = wrap_guest_cgroup(&request, bwrap_args);
+        let enabled_strings: Vec<_> = enabled
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(enabled_strings[0], "systemd-run");
+        let boundary = enabled_strings
+            .windows(2)
+            .position(|window| window == ["env", "-i"])
+            .expect("guest cgroup route installs env -i before bwrap");
+        assert_eq!(enabled_strings[boundary + 3], "bwrap");
     }
 
     #[test]

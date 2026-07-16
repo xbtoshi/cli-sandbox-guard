@@ -23,6 +23,11 @@ const GUEST_ENVIRONMENT: &str = "/run/sandbox-guard/environment.json";
 const GUEST_PROXY_SOCKET: &str = "/run/sandbox-guard/egress.sock";
 const GUEST_HELPER: &str = "/opt/sandbox-guard/helper";
 
+/// Fixed, non-identifying search path used only so the guest's `env -i` boundary can locate
+/// `bwrap` after every inherited variable has been dropped. It carries no host identity or
+/// secret; see `docs/SECURITY_MODEL.md` "Clean launcher environment".
+const GUEST_CLEAN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 pub struct LinuxBwrapRunner;
 
 impl LinuxBwrapRunner {
@@ -60,7 +65,7 @@ impl LinuxBwrapRunner {
         let (program, args) = if use_cgroup {
             wrap_in_systemd_scope(request, bwrap, bwrap_args)
         } else {
-            (bwrap, bwrap_args)
+            launch_bwrap_with_clean_env(bwrap, bwrap_args)
         };
         Ok(CommandPlan {
             program,
@@ -652,12 +657,51 @@ fn supervisor_args(
     args
 }
 
+/// Absolute path to coreutils `env`, used to install a clean-environment boundary immediately
+/// before `bwrap`. Resolved absolutely so the boundary itself needs no inherited PATH.
+fn clean_env_program() -> PathBuf {
+    which::which("env").unwrap_or_else(|_| PathBuf::from("/usr/bin/env"))
+}
+
+/// Launch a host `bwrap` from a fully empty process environment.
+///
+/// Bubblewrap's `--clearenv` scrubs the environment of the executed *child*, but bwrap itself
+/// stays alive as pid 1 inside the sandbox pid namespace, and its own `/proc/1/environ` remains
+/// readable by the confined tool. Interposing `env -i` here means bwrap execs with no inherited
+/// variables at all, so no host session identity or secret survives on pid 1. `bwrap` is passed
+/// by absolute path, so the emptied environment does not defeat command lookup.
+fn launch_bwrap_with_clean_env(
+    bwrap: PathBuf,
+    bwrap_args: Vec<OsString>,
+) -> (PathBuf, Vec<OsString>) {
+    let mut args = Vec::with_capacity(bwrap_args.len() + 2);
+    push(&mut args, "-i");
+    args.push(bwrap.into_os_string());
+    args.extend(bwrap_args);
+    (clean_env_program(), args)
+}
+
 pub(crate) fn wrap_guest_cgroup(request: &RunRequest, bwrap_args: Vec<OsString>) -> Vec<OsString> {
     let mut args = vec![OsString::from("systemd-run")];
     args.extend(systemd_scope_args(request));
-    push(&mut args, "bwrap");
-    args.extend(bwrap_args);
+    args.extend(guest_bwrap_command(bwrap_args));
     args
+}
+
+/// Build the guest-side `bwrap` invocation behind an `env -i` clean-environment boundary.
+///
+/// On the Lima guest, `bwrap` is reached over `limactl shell`, so it inherits the guest login
+/// session's environment (home, proxy, XDG/DBUS, SSH). As on the host, that environment stays
+/// visible on bwrap's `/proc/1/environ`. `env -i` drops all of it; a single fixed, non-secret
+/// PATH is re-established purely so `env` can still locate `bwrap` deterministically.
+pub(crate) fn guest_bwrap_command(bwrap_args: Vec<OsString>) -> Vec<OsString> {
+    let mut command = Vec::with_capacity(bwrap_args.len() + 4);
+    push(&mut command, "env");
+    push(&mut command, "-i");
+    push(&mut command, format!("PATH={GUEST_CLEAN_PATH}"));
+    push(&mut command, "bwrap");
+    command.extend(bwrap_args);
+    command
 }
 
 fn wrap_in_systemd_scope(
@@ -666,6 +710,10 @@ fn wrap_in_systemd_scope(
     bwrap_args: Vec<OsString>,
 ) -> (PathBuf, Vec<OsString>) {
     let mut args = systemd_scope_args(request);
+    // systemd-run legitimately needs the user-session environment to reach the user systemd
+    // manager, so the clean-environment boundary is placed *after* it, immediately before bwrap.
+    args.push(clean_env_program().into_os_string());
+    push(&mut args, "-i");
     args.push(bwrap.into_os_string());
     args.extend(bwrap_args);
     (PathBuf::from("systemd-run"), args)
@@ -1091,6 +1139,119 @@ mod tests {
 
         let guest = wrap_guest_cgroup(&request, vec![OsString::from("--version")]);
         assert_eq!(guest.first(), Some(&OsString::from("systemd-run")));
+    }
+
+    fn rendered_strings(args: &[OsString]) -> Vec<String> {
+        args.iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn host_plan_scrubs_the_bwrap_launcher_environment() {
+        let workspace = tempfile::tempdir().unwrap();
+        let request = request(workspace.path(), NetworkMode::Denied);
+
+        // Best-effort (no cgroup) route: `env -i` is the launched program and bwrap, passed by
+        // absolute path, is its first argument, so bwrap execs with an empty environment.
+        let plan = LinuxBwrapRunner::build_plan(
+            &request,
+            PathBuf::from("/usr/bin/bwrap"),
+            PathBuf::from("/bin/true"),
+            Path::new("/tmp/runtime"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.program.file_name().unwrap(), "env");
+        assert_eq!(plan.args[0], OsString::from("-i"));
+        assert_eq!(plan.args[1], OsString::from("/usr/bin/bwrap"));
+        assert!(
+            !plan
+                .args
+                .iter()
+                .any(|arg| arg.to_string_lossy().starts_with("PATH=")),
+            "host launcher must not re-establish any environment for bwrap"
+        );
+
+        // cgroup route: systemd-run keeps the session env it needs, and the clean-env boundary is
+        // placed after the scope terminator `--`, immediately before bwrap.
+        let scoped = LinuxBwrapRunner::build_plan(
+            &request,
+            PathBuf::from("/usr/bin/bwrap"),
+            PathBuf::from("/bin/true"),
+            Path::new("/tmp/runtime"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(scoped.program, PathBuf::from("systemd-run"));
+        let strings = rendered_strings(&scoped.args);
+        let boundary = strings
+            .windows(2)
+            .position(|window| window[1] == "-i" && window[0].ends_with("env"))
+            .expect("clean-env boundary present on the cgroup route");
+        assert_eq!(strings[boundary + 2], "/usr/bin/bwrap");
+        let terminator = strings
+            .iter()
+            .position(|value| value == "--")
+            .expect("systemd scope terminator present");
+        assert!(
+            terminator < boundary,
+            "the clean-env boundary must sit after the systemd-run scope terminator"
+        );
+    }
+
+    #[test]
+    fn interactive_host_plan_still_scrubs_the_bwrap_launcher_environment() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut request = request(workspace.path(), NetworkMode::Denied);
+        request.interactive = true;
+        let plan = LinuxBwrapRunner::build_plan(
+            &request,
+            PathBuf::from("/usr/bin/bwrap"),
+            PathBuf::from("/bin/true"),
+            Path::new("/tmp/runtime"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(plan.program.file_name().unwrap(), "env");
+        assert_eq!(plan.args[0], OsString::from("-i"));
+        assert_eq!(plan.args[1], OsString::from("/usr/bin/bwrap"));
+    }
+
+    #[test]
+    fn guest_bwrap_command_installs_a_clean_env_boundary_on_every_route() {
+        let expected_path = format!("PATH={GUEST_CLEAN_PATH}");
+        let bwrap_args = vec![
+            OsString::from("--die-with-parent"),
+            OsString::from("supervise"),
+        ];
+
+        let command = guest_bwrap_command(bwrap_args.clone());
+        let strings = rendered_strings(&command);
+        assert_eq!(strings[0], "env");
+        assert_eq!(strings[1], "-i");
+        assert_eq!(strings[2], expected_path);
+        assert_eq!(strings[3], "bwrap");
+        assert_eq!(strings[4], "--die-with-parent");
+
+        let request = request(Path::new("/tmp/guard-test/workspace"), NetworkMode::Denied);
+        let scoped = wrap_guest_cgroup(&request, bwrap_args);
+        let scoped_strings = rendered_strings(&scoped);
+        assert_eq!(scoped_strings[0], "systemd-run");
+        let boundary = scoped_strings
+            .windows(4)
+            .position(|window| {
+                window == ["env", "-i", expected_path.as_str(), "bwrap"]
+            })
+            .expect("guest cgroup route installs the clean-env boundary before bwrap");
+        let terminator = scoped_strings
+            .iter()
+            .position(|value| value == "--")
+            .expect("systemd scope terminator present");
+        assert!(
+            terminator < boundary,
+            "the guest clean-env boundary must sit after the systemd-run scope terminator"
+        );
     }
 
     #[test]
