@@ -60,6 +60,15 @@ explicitly for one run.
 - The host repository is never mounted in the sandbox.
 - The disposable workspace is the only writable project tree.
 - Bubblewrap clears the environment and closes inherited descriptors.
+- The clean-environment guarantee includes the visible launcher process. Bubblewrap's `--clearenv`
+  scrubs only the executed child, but bwrap itself stays alive as pid 1 inside the sandbox pid
+  namespace and its `/proc/1/environ` is readable by the confined tool. The runner therefore
+  interposes a fixed-argv `env -i` boundary immediately before bwrap on every route (Linux host and
+  Lima guest, interactive and noninteractive, cgroup-enforced and best-effort). On the host the
+  launcher inherits an empty environment; on the Lima guest it inherits only a single fixed,
+  non-secret `PATH` used to locate bwrap. The `env -i` boundary is placed *after* the `systemd-run`
+  scope so cgroup delegation to the user manager still works. The hostile backend probe reads
+  `/proc/1/environ` and fails closed if any inherited host variable survives.
 - Loader, runtime injection, Git configuration, proxy override, `PATH`, and `HOME` variables cannot
   be forwarded. Entire known-dangerous families such as GIT, LD, DYLD, NODE, PYTHON, PERL, RUBY,
   JAVA, and LUA are rejected.
@@ -291,7 +300,19 @@ from this store and does not automatically re-verify them before every run.
   `guard gc` removes it. Active stages use an advisory lock; collection checks owner and age. A
   killed macOS run can also leave its mode-`0700` guest runtime in guest `/dev/shm` until reboot or
   manual removal.
-- Filename policy cannot recognize copied secret content under an allowed filename.
+- Filename policy cannot recognize copied secret content under an allowed filename. The built-in
+  deny list is a high-confidence privacy default, not exhaustive; ambiguous names that are often
+  ordinary files (for example `*.tfvars`, generic `secrets.*`, `api_keys.json`, `application.yml`,
+  `google-services.json`, and SQL dumps) are intentionally left to owner policy rather than blocked
+  globally.
+- The bwrap launcher's argument vector is visible to the confined tool through `/proc/1/cmdline`.
+  This discloses the run's staging pathnames — a random-UUID stage directory that is a host tmp path
+  on direct Linux and a disposable guest `/dev/shm` tmpfs path under Lima — plus the fixed guest
+  mount targets. This is accepted low-severity metadata, not a filesystem escape: the paths are not
+  openable from inside the sandbox and carry no credentials. Hiding them would require either
+  bwrap's `--args` file-descriptor form, which cannot survive the `systemd-run`/`limactl` transport
+  boundary, or moving bwrap out of pid 1, which would weaken the `--die-with-parent` reaping and
+  signal model. Neither trade is justified to conceal non-sensitive metadata.
 - Kernel, hypervisor, Bubblewrap, Git, Lima, systemd, and trusted-helper vulnerabilities are outside
   the promised boundary.
 - A credential intentionally forwarded to a malicious tool can be stolen or misused by that tool.

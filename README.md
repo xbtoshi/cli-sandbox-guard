@@ -42,7 +42,8 @@ conflict-checked host code; the tool never receives access to the source tree or
 - A synthetic baseline commit without original objects, refs, hooks, config, alternates, or
   history.
 - Bubblewrap namespaces on Linux and inside a mountless Lima guest on macOS.
-- Environment clearing, explicit credential forwarding through a private file, and audit records
+- Environment clearing that also covers the visible bwrap launcher process (its own
+  `/proc/1/environ`), explicit credential forwarding through a private file, and audit records
   that contain names but never credential values.
 - Network denied by default, or controlled HTTPS CONNECT egress to explicit hostnames.
 - A focused seccomp deny profile, rlimits, and optional cgroup v2 memory/task/CPU enforcement.
@@ -488,10 +489,12 @@ store together with the rest of Guard's private data directory.
 
 ## Policy and development status
 
-The built-in policy rejects `.env` and credential environment files; private-key, keystore, and
-wallet formats; SSH, AWS, GCloud, GitHub CLI, Docker, Kubernetes, Grok-auth, GnuPG, password-store,
-Keychain, netrc, npm, PyPI, and Cargo credential paths; original `.git`; CCB session metadata;
-links; special files; mount crossings; and multiply linked files. The rules are portable paths
+The built-in policy rejects `.env` and `*.env` credential environment files; private-key, keystore,
+and wallet formats (including `wallet.dat`); SSH, AWS, GCloud, GitHub CLI, Docker, Kubernetes
+(`kubeconfig`/`*.kubeconfig`), GCP service-account keys, Grok-auth, GnuPG, password-store, Keychain,
+netrc, npm, Yarn (`.yarnrc.yml`), PyPI, and Cargo credential paths; Terraform state
+(`*.tfstate`); original `.git`; CCB session metadata; links; special files; mount crossings; and
+multiply linked files. The rules are portable paths
 relative to the selected source—Guard never imports host-specific absolute paths. See
 [policy.example.toml](policy.example.toml) for additive rules and lower resource ceilings.
 Filename rules cannot detect secret bytes copied into a distinct regular file under an innocent

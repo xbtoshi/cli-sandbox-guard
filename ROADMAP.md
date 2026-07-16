@@ -176,6 +176,9 @@ still allowing approved authenticated API calls.
 
 ## Phase 5: hardening and resource control
 
+- [x] Scrub the bwrap launcher's own initial exec environment (`env -i` boundary before bwrap on
+  every backend/mode), so pid 1's `/proc/1/environ` cannot leak inherited host session variables to
+  the confined tool; proven by the hostile backend probe (alpha.4).
 - [ ] Replace the focused seccomp deny list with maintained, architecture-generated syscall groups
   qualified against each supported vendor workload.
 - [ ] Generate and test filters for x86-64 and ARM64 from one reviewed source definition.
