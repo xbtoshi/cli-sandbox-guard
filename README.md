@@ -79,8 +79,9 @@ those choices, while `guard approvals --forget HOST` and `guard approvals --clea
 mouse reporting is enabled by default so wheel scrolling works in the regular TUI. Press `Ctrl+S`
 to enter trusted host selection/copy mode, which temporarily disables tool mouse reporting; press
 it again to restore Grok scrolling. The toggle is consumed by Guard and is not delivered to Grok.
-The optional `--scrollback` flag still selects Grok's experimental native-scrollback renderer,
-which uses a visibly different pinned-region layout. The host refresh token and `~/.grok/auth.json` are never
+The optional `--scrollback` flag selects Grok's experimental native-scrollback renderer only when
+the compiled profile permits that opt-in; the built-in profile currently does. It uses a visibly
+different pinned-region layout. The host refresh token and `~/.grok/auth.json` are never
 copied into the workspace or Lima guest.
 
 On macOS, pressing `Ctrl+V` in an interactive Guard session explicitly imports one image from the

@@ -159,7 +159,7 @@ pub(super) fn profile_command(args: ProfileArgs) -> Result<i32> {
             } else {
                 println!("profile: {} ({})", report.profile_name, report.source);
                 println!(
-                    "runtime source: partial compiled-profile migration (guest executable, native-scrollback metadata, and seccomp compatibility remain descriptive or hardcoded)"
+                    "runtime source: partial compiled-profile migration (guest executable and seccomp compatibility remain descriptive or hardcoded)"
                 );
                 for section in report.sections {
                     println!(
@@ -252,12 +252,9 @@ fn explain_report(profile: &VendorProfile) -> ProfileExplainReport {
             "sessions.guest_mount_path",
             "clipboard.image_import",
             "terminal.mouse_reporting_default",
-        ],
-        runtime_not_consumed_sections: vec![
-            "tool.guest_executable",
             "terminal.native_scrollback_opt_in",
-            "seccomp",
         ],
+        runtime_not_consumed_sections: vec!["tool.guest_executable", "seccomp"],
         sections: vec![
             explanation(
                 "tool.*",
@@ -485,7 +482,7 @@ mod tests {
         );
         assert!(
             report
-                .runtime_not_consumed_sections
+                .runtime_consumed_sections
                 .contains(&"terminal.native_scrollback_opt_in")
         );
         assert_eq!(report.sections.len(), 6);

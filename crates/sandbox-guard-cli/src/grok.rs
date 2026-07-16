@@ -127,6 +127,7 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
     profile
         .validate()
         .context("compiled Grok profile failed validation")?;
+    validate_profile_ui_request(&profile, args.scrollback)?;
     let base_dirs = BaseDirs::new().context("could not determine the user home directory")?;
     let auth_path = base_dirs
         .home_dir()
@@ -212,6 +213,13 @@ fn profile_interactive_ux(profile: &VendorProfile) -> InteractiveUx {
         mouse_reporting_default: profile.terminal.mouse_reporting_default,
         clipboard_image_import: profile.clipboard.image_import,
     }
+}
+
+fn validate_profile_ui_request(profile: &VendorProfile, scrollback: bool) -> Result<()> {
+    if scrollback && !profile.terminal.native_scrollback_opt_in {
+        bail!("compiled Grok profile disables the experimental native-scrollback renderer");
+    }
+    Ok(())
 }
 
 fn grok_tool_arguments(
@@ -894,7 +902,9 @@ mod tests {
 
     #[test]
     fn normal_ui_is_default_and_native_scrollback_is_opt_in() {
-        let profile = profile();
+        let mut profile = profile();
+        validate_profile_ui_request(&profile, false).unwrap();
+        validate_profile_ui_request(&profile, true).unwrap();
         let normal = grok_tool_arguments(&profile.tool, false, None, false, Vec::new());
         let scrollback = grok_tool_arguments(&profile.tool, true, None, false, Vec::new());
 
@@ -915,6 +925,11 @@ mod tests {
                 .forced_arguments
                 .contains(&"--no-alt-screen".to_owned())
         );
+
+        profile.terminal.native_scrollback_opt_in = false;
+        profile.validate().unwrap();
+        validate_profile_ui_request(&profile, false).unwrap();
+        assert!(validate_profile_ui_request(&profile, true).is_err());
     }
 
     #[test]
