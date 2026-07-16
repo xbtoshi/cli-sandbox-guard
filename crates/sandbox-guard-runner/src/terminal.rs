@@ -65,9 +65,7 @@ where
     let child_stderr = slave
         .try_clone()
         .map_err(|source| execute_error(program, source))?;
-    write_host_notice(
-        "tool mouse scrolling is enabled; press Ctrl+S to toggle host selection/copy mode",
-    );
+    write_host_notice(mouse_startup_notice(interactive_ux.mouse_reporting_default));
     let mut command = Command::new(program);
     command.args(args);
     command
@@ -103,7 +101,7 @@ where
     let mut exit_status = None;
     let mut exit_seen = None;
     let mut clipboard_imports = Vec::new();
-    let mut output_filter = TerminalOutputFilter::default();
+    let mut output_filter = TerminalOutputFilter::new(interactive_ux.mouse_reporting_default);
 
     while exit_status.is_none() || master_open {
         let mut descriptors = [
@@ -453,6 +451,14 @@ fn disable_host_mouse_reporting() {
         .and_then(|()| io::stdout().flush());
 }
 
+fn mouse_startup_notice(mouse_reporting_default: bool) -> &'static str {
+    if mouse_reporting_default {
+        "tool mouse scrolling is enabled; press Ctrl+S to toggle host selection/copy mode"
+    } else {
+        "host selection/copy mode is enabled; press Ctrl+S to restore tool mouse scrolling"
+    }
+}
+
 struct TerminalOutputFilter {
     state: OutputState,
     selection_mode: bool,
@@ -461,36 +467,21 @@ struct TerminalOutputFilter {
 
 impl Default for TerminalOutputFilter {
     fn default() -> Self {
-        Self {
-            state: OutputState::Normal,
-            selection_mode: false,
-            requested_mouse_modes: BTreeSet::new(),
-        }
+        Self::new(true)
     }
 }
 
-#[derive(Default)]
-enum OutputState {
-    #[default]
-    Normal,
-    Escape,
-    Osc {
-        bytes: Vec<u8>,
-        previous_escape: bool,
-    },
-    DiscardControlString {
-        previous_escape: bool,
-    },
-    Csi {
-        bytes: Vec<u8>,
-    },
-    DiscardOsc {
-        previous_escape: bool,
-    },
-    DiscardCsi,
-}
-
 impl TerminalOutputFilter {
+    fn new(mouse_reporting_default: bool) -> Self {
+        // Starting with mouse reporting disabled must match pressing Ctrl+S immediately:
+        // one selection-mode state machine records tool requests for deliberate replay.
+        Self {
+            state: OutputState::Normal,
+            selection_mode: !mouse_reporting_default,
+            requested_mouse_modes: BTreeSet::new(),
+        }
+    }
+
     fn filter(&mut self, input: &[u8]) -> Vec<u8> {
         let mut output = Vec::with_capacity(input.len());
         for &byte in input {
@@ -649,6 +640,27 @@ impl TerminalOutputFilter {
     }
 }
 
+#[derive(Default)]
+enum OutputState {
+    #[default]
+    Normal,
+    Escape,
+    Osc {
+        bytes: Vec<u8>,
+        previous_escape: bool,
+    },
+    DiscardControlString {
+        previous_escape: bool,
+    },
+    Csi {
+        bytes: Vec<u8>,
+    },
+    DiscardOsc {
+        previous_escape: bool,
+    },
+    DiscardCsi,
+}
+
 fn is_host_sensitive_osc(sequence: &[u8]) -> bool {
     let payload = sequence.strip_prefix(b"\x1b]");
     let Some(command) = payload.and_then(|payload| payload.split(|byte| *byte == b';').next())
@@ -759,6 +771,27 @@ mod tests {
                 .kind(),
             io::ErrorKind::BrokenPipe
         );
+    }
+
+    #[test]
+    fn mouse_reporting_default_only_controls_the_initial_selection_mode() {
+        assert_eq!(
+            mouse_startup_notice(true),
+            "tool mouse scrolling is enabled; press Ctrl+S to toggle host selection/copy mode"
+        );
+        assert_eq!(
+            mouse_startup_notice(false),
+            "host selection/copy mode is enabled; press Ctrl+S to restore tool mouse scrolling"
+        );
+
+        let mut tool_mouse = TerminalOutputFilter::new(true);
+        assert_eq!(tool_mouse.filter(b"\x1b[?1000h"), b"\x1b[?1000h");
+
+        let mut host_selection = TerminalOutputFilter::new(false);
+        assert!(host_selection.filter(b"\x1b[?1000h").is_empty());
+        let (restored, selection_mode) = host_selection.toggle_selection_mode();
+        assert!(!selection_mode);
+        assert_eq!(restored, b"\x1b[?1000h");
     }
 
     #[test]

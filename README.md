@@ -146,8 +146,9 @@ rather than relying on the human-oriented output. `profile lint --json` emits
 JSON for a valid document; invalid input exits 1 and reports a sanitized error
 on standard error. The Grok adapter currently consumes the compiled launch,
 egress, credential, session, and clipboard-import sections, including the
-runner-validated writable-home mount target; `profile explain grok` reports the exact
-partial-migration status without treating linted files as executable.
+runner-validated writable-home mount target and the terminal mouse-reporting default;
+`profile explain grok` reports the exact partial-migration status without treating
+linted files as executable.
 
 ## Build and self-test
 

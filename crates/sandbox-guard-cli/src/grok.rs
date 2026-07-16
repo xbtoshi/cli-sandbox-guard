@@ -209,7 +209,7 @@ pub(super) fn run(args: GrokArgs) -> Result<i32> {
 
 fn profile_interactive_ux(profile: &VendorProfile) -> InteractiveUx {
     InteractiveUx {
-        mouse_reporting_default: true,
+        mouse_reporting_default: profile.terminal.mouse_reporting_default,
         clipboard_image_import: profile.clipboard.image_import,
     }
 }
@@ -966,10 +966,12 @@ mod tests {
         assert_eq!(preflight.args, [OsString::from("login")]);
         assert!(profile_interactive_ux(&profile).clipboard_image_import);
         profile.clipboard.image_import = false;
+        profile.terminal.mouse_reporting_default = false;
         let tightened_ux = profile_interactive_ux(&profile);
         assert!(!tightened_ux.clipboard_image_import);
-        assert!(tightened_ux.mouse_reporting_default);
+        assert!(!tightened_ux.mouse_reporting_default);
         profile.clipboard.image_import = true;
+        profile.terminal.mouse_reporting_default = true;
         let sessions = profile.sessions.unwrap();
         assert_eq!(
             sessions.guest_mount_path,
