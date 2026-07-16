@@ -119,17 +119,17 @@ impl RepairKind {
 }
 
 #[derive(Debug, Clone)]
-struct SetupPaths {
-    home: PathBuf,
-    data: PathBuf,
-    config: PathBuf,
+pub(super) struct SetupPaths {
+    pub(super) home: PathBuf,
+    pub(super) data: PathBuf,
+    pub(super) config: PathBuf,
     audit: PathBuf,
     pending_changes: PathBuf,
     tools: PathBuf,
 }
 
 impl SetupPaths {
-    fn discover() -> Result<Self> {
+    pub(super) fn discover() -> Result<Self> {
         let base =
             BaseDirs::new().ok_or_else(|| anyhow!("could not determine the home directory"))?;
         let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
@@ -907,7 +907,7 @@ fn private_directory_check(id: &str, path: &Path, home: &Path) -> SetupCheck {
     }
 }
 
-fn validate_existing_path_components(path: &Path, home: &Path) -> Result<()> {
+pub(super) fn validate_existing_path_components(path: &Path, home: &Path) -> Result<()> {
     let anchor = trusted_anchor(path, home)?;
     let relative = path
         .strip_prefix(&anchor)
@@ -1211,7 +1211,7 @@ fn shell_word(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn validate_lima_instance(value: &str) -> Result<()> {
+pub(super) fn validate_lima_instance(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 64
         || !value.bytes().enumerate().all(|(index, byte)| {

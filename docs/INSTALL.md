@@ -194,6 +194,12 @@ version.
 
 ## Removal
 
+Run `guard uninstall` first to inspect the exact Guard-owned data and
+configuration roots plus the manual binary/VM steps. In this increment the
+command is deliberately planning-only: it never deletes anything. Add
+`--json` for its versioned machine-readable report. The manual checklist
+remains authoritative until confirmed deletion support lands.
+
 1. Optionally clean leftover stages first: `guard gc`.
 2. Delete the binaries: `guard` and `guard-helper` from your install
    directory.
@@ -202,7 +208,7 @@ version.
    - Linux: `~/.local/share/sandbox-guard` and `~/.config/sandbox-guard`
    - macOS: `~/Library/Application Support/com.xbtoshi.sandbox-guard`
 4. On macOS, delete the dedicated guest if you no longer need it:
-   `limactl delete --force sandbox-guard`.
+   `limactl delete sandbox-guard` (stop it first if Lima requires that).
 
 `guard setup` creates or tightens only Guard-owned private state directories;
 it does not write outside those directories, modify shell profiles, invoke

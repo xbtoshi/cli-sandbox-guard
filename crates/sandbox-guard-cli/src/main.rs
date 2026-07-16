@@ -26,6 +26,7 @@ use sandbox_guard_runner::{
 
 mod grok;
 mod setup;
+mod uninstall;
 use grok::GrokArgs;
 
 const MASS_DELETION_MIN_FILES: usize = 5;
@@ -60,6 +61,8 @@ enum Command {
     Doctor(DoctorArgs),
     /// Check readiness and repair only Guard-owned private state.
     Setup(SetupArgs),
+    /// Inspect Guard-owned state and print a non-mutating removal plan.
+    Uninstall(UninstallArgs),
     /// Remove old, unlocked staging directories owned by the current user.
     Gc(GcArgs),
     /// Execute hostile fixture probes against a real isolation backend.
@@ -239,6 +242,17 @@ struct SetupArgs {
 }
 
 #[derive(Debug, Args)]
+struct UninstallArgs {
+    /// Emit the versioned machine-readable removal plan.
+    #[arg(long)]
+    json: bool,
+
+    /// Managed Lima instance to mention in manual removal steps.
+    #[arg(long, default_value = "sandbox-guard")]
+    lima_instance: String,
+}
+
+#[derive(Debug, Args)]
 struct GcArgs {
     /// Override the staging base to inspect.
     #[arg(long)]
@@ -383,6 +397,7 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Approvals(args) => approvals_command(args),
         Command::Doctor(args) => doctor_command(args),
         Command::Setup(args) => setup::setup_command(args),
+        Command::Uninstall(args) => uninstall::uninstall_command(args),
         Command::Gc(args) => gc_command(args),
         Command::Test(args) => test_command(args),
         Command::Tool(args) => tool_command(args),
