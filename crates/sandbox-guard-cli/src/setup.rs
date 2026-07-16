@@ -17,6 +17,9 @@ use crate::{SetupArgs, current_uid};
 
 const REPORT_SCHEMA: u32 = 1;
 const DEFAULT_GUEST_HELPER: &str = "/usr/local/bin/guard-helper";
+/// Fixed absolute bubblewrap path the runtime invokes at the clean-environment boundary; the guest
+/// diagnostic requires this exact executable.
+const GUEST_BWRAP: &str = "/usr/bin/bwrap";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1048,6 +1051,25 @@ fn diagnose_macos(
         ),
     });
 
+    // The runtime invokes bwrap by its fixed absolute path `/usr/bin/bwrap` at the clean-environment
+    // boundary, so the diagnostic requires that exact executable rather than a PATH lookup. No
+    // fallback path is accepted.
+    let bwrap = lima_shell(probes, &limactl, instance, &["test", "-x", GUEST_BWRAP]);
+    checks.push(command_result_check(
+        "lima.guest.bwrap",
+        "lima-guest",
+        bwrap,
+        &format!("guest bubblewrap is executable at {GUEST_BWRAP}"),
+        manual_repair(
+            "Install bubblewrap inside the guest; Guard never invokes guest sudo.",
+            &["sudo", "network"],
+            &[
+                &format!("limactl shell {shell_instance} -- sudo apt-get update"),
+                &format!("limactl shell {shell_instance} -- sudo apt-get install -y bubblewrap"),
+            ],
+        ),
+    ));
+
     let packages = lima_shell(
         probes,
         &limactl,
@@ -1055,21 +1077,21 @@ fn diagnose_macos(
         &[
             "sh",
             "-c",
-            "missing=0; for name in bwrap git rsync findmnt; do command -v \"$name\" >/dev/null || { echo \"$name\"; missing=1; }; done; exit \"$missing\"",
+            "missing=0; for name in git rsync findmnt; do command -v \"$name\" >/dev/null || { echo \"$name\"; missing=1; }; done; exit \"$missing\"",
         ],
     );
     checks.push(command_result_check(
         "lima.guest.packages",
         "lima-guest",
         packages,
-        "guest contains bwrap, git, rsync, and findmnt",
+        "guest contains git, rsync, and findmnt",
         manual_repair(
             "Install the required packages inside the guest; Guard never invokes guest sudo.",
             &["sudo", "network"],
             &[
                 &format!("limactl shell {shell_instance} -- sudo apt-get update"),
                 &format!(
-                    "limactl shell {} -- sudo apt-get install -y bubblewrap git rsync util-linux ca-certificates",
+                    "limactl shell {} -- sudo apt-get install -y git rsync util-linux ca-certificates",
                     shell_instance
                 ),
             ],
@@ -1951,7 +1973,7 @@ mod tests {
                     "--",
                     "sh",
                     "-c",
-                    "missing=0; for name in bwrap git rsync findmnt; do command -v \"$name\" >/dev/null || { echo \"$name\"; missing=1; }; done; exit \"$missing\"",
+                    "missing=0; for name in git rsync findmnt; do command -v \"$name\" >/dev/null || { echo \"$name\"; missing=1; }; done; exit \"$missing\"",
                 ]
                 .map(OsString::from),
             ),

@@ -921,9 +921,16 @@ mod tests {
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(&disabled_strings[..2], &["env", "-i"]);
-        assert!(disabled_strings[2].starts_with("PATH="));
-        assert_eq!(disabled_strings[3], "bwrap");
+        assert_eq!(
+            &disabled_strings[..3],
+            &["/usr/bin/env", "-i", "/usr/bin/bwrap"]
+        );
+        assert!(
+            !disabled_strings
+                .iter()
+                .any(|value| value.starts_with("PATH=")),
+            "guest launcher must inherit an empty environment"
+        );
 
         let enabled = wrap_guest_cgroup(&request, bwrap_args);
         let enabled_strings: Vec<_> = enabled
@@ -932,10 +939,10 @@ mod tests {
             .collect();
         assert_eq!(enabled_strings[0], "systemd-run");
         let boundary = enabled_strings
-            .windows(2)
-            .position(|window| window == ["env", "-i"])
+            .windows(3)
+            .position(|window| window == ["/usr/bin/env", "-i", "/usr/bin/bwrap"])
             .expect("guest cgroup route installs env -i before bwrap");
-        assert_eq!(enabled_strings[boundary + 3], "bwrap");
+        assert_eq!(enabled_strings[boundary], "/usr/bin/env");
     }
 
     #[test]

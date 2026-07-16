@@ -23,10 +23,15 @@ const GUEST_ENVIRONMENT: &str = "/run/sandbox-guard/environment.json";
 const GUEST_PROXY_SOCKET: &str = "/run/sandbox-guard/egress.sock";
 const GUEST_HELPER: &str = "/opt/sandbox-guard/helper";
 
-/// Fixed, non-identifying search path used only so the guest's `env -i` boundary can locate
-/// `bwrap` after every inherited variable has been dropped. It carries no host identity or
-/// secret; see the launcher-scrub guarantee in `docs/SECURITY_MODEL.md` "Execution invariants".
-const GUEST_CLEAN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Fixed absolute `env` used to install the clean-environment boundary before bwrap. Hard-coding
+/// the path (rather than a PATH lookup) guarantees no PATH-selected `env` runs before the
+/// environment is cleared. See the launcher-scrub guarantee in `docs/SECURITY_MODEL.md`.
+const HOST_CLEAN_ENV: &str = "/usr/bin/env";
+/// Same fixed `env` inside the managed Lima guest.
+const GUEST_CLEAN_ENV: &str = "/usr/bin/env";
+/// Canonical apt-installed `bwrap` location inside the managed Lima guest. The setup diagnostic
+/// requires this exact executable, so the guest boundary invokes it absolutely (no PATH lookup).
+const GUEST_BWRAP: &str = "/usr/bin/bwrap";
 
 pub struct LinuxBwrapRunner;
 
@@ -657,19 +662,16 @@ fn supervisor_args(
     args
 }
 
-/// Absolute path to coreutils `env`, used to install a clean-environment boundary immediately
-/// before `bwrap`. Resolved absolutely so the boundary itself needs no inherited PATH.
-fn clean_env_program() -> PathBuf {
-    which::which("env").unwrap_or_else(|_| PathBuf::from("/usr/bin/env"))
-}
-
 /// Launch a host `bwrap` from a fully empty process environment.
 ///
 /// Bubblewrap's `--clearenv` scrubs the environment of the executed *child*, but bwrap itself
 /// stays alive as pid 1 inside the sandbox pid namespace, and its own `/proc/1/environ` remains
 /// readable by the confined tool. Interposing `env -i` here means bwrap execs with no inherited
-/// variables at all, so no host session identity or secret survives on pid 1. `bwrap` is passed
-/// by absolute path, so the emptied environment does not defeat command lookup.
+/// variables at all, so no host session identity or secret survives on pid 1.
+///
+/// Both executables at this trust boundary are fixed absolute paths: `/usr/bin/env` (so a
+/// PATH-selected `env` cannot run before the environment is cleared) and the runner's already
+/// resolved absolute `bwrap` path (so the emptied environment does not defeat command lookup).
 fn launch_bwrap_with_clean_env(
     bwrap: PathBuf,
     bwrap_args: Vec<OsString>,
@@ -678,7 +680,7 @@ fn launch_bwrap_with_clean_env(
     push(&mut args, "-i");
     args.push(bwrap.into_os_string());
     args.extend(bwrap_args);
-    (clean_env_program(), args)
+    (PathBuf::from(HOST_CLEAN_ENV), args)
 }
 
 pub(crate) fn wrap_guest_cgroup(request: &RunRequest, bwrap_args: Vec<OsString>) -> Vec<OsString> {
@@ -692,14 +694,17 @@ pub(crate) fn wrap_guest_cgroup(request: &RunRequest, bwrap_args: Vec<OsString>)
 ///
 /// On the Lima guest, `bwrap` is reached over `limactl shell`, so it inherits the guest login
 /// session's environment (home, proxy, XDG/DBUS, SSH). As on the host, that environment stays
-/// visible on bwrap's `/proc/1/environ`. `env -i` drops all of it; a single fixed, non-secret
-/// PATH is re-established purely so `env` can still locate `bwrap` deterministically.
+/// visible on bwrap's `/proc/1/environ`. `env -i` drops all of it, leaving pid 1 with an empty
+/// environment; the bwrap child receives its own PATH through `--setenv`.
+///
+/// Both executables are fixed absolute guest paths — `/usr/bin/env` and `/usr/bin/bwrap`, the
+/// canonical apt-installed locations the setup diagnostic requires — so a PATH-selected binary can
+/// never run at this boundary and no fixed PATH needs to leak onto pid 1.
 pub(crate) fn guest_bwrap_command(bwrap_args: Vec<OsString>) -> Vec<OsString> {
-    let mut command = Vec::with_capacity(bwrap_args.len() + 4);
-    push(&mut command, "env");
+    let mut command = Vec::with_capacity(bwrap_args.len() + 3);
+    push(&mut command, GUEST_CLEAN_ENV);
     push(&mut command, "-i");
-    push(&mut command, format!("PATH={GUEST_CLEAN_PATH}"));
-    push(&mut command, "bwrap");
+    push(&mut command, GUEST_BWRAP);
     command.extend(bwrap_args);
     command
 }
@@ -712,7 +717,8 @@ fn wrap_in_systemd_scope(
     let mut args = systemd_scope_args(request);
     // systemd-run legitimately needs the user-session environment to reach the user systemd
     // manager, so the clean-environment boundary is placed *after* it, immediately before bwrap.
-    args.push(clean_env_program().into_os_string());
+    // `/usr/bin/env` is fixed and absolute so a PATH-selected `env` cannot run at this boundary.
+    push(&mut args, HOST_CLEAN_ENV);
     push(&mut args, "-i");
     args.push(bwrap.into_os_string());
     args.extend(bwrap_args);
@@ -1162,7 +1168,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(plan.program.file_name().unwrap(), "env");
+        assert_eq!(plan.program, PathBuf::from("/usr/bin/env"));
         assert_eq!(plan.args[0], OsString::from("-i"));
         assert_eq!(plan.args[1], OsString::from("/usr/bin/bwrap"));
         assert!(
@@ -1187,7 +1193,7 @@ mod tests {
         let strings = rendered_strings(&scoped.args);
         let boundary = strings
             .windows(2)
-            .position(|window| window[1] == "-i" && window[0].ends_with("env"))
+            .position(|window| window == ["/usr/bin/env", "-i"])
             .expect("clean-env boundary present on the cgroup route");
         assert_eq!(strings[boundary + 2], "/usr/bin/bwrap");
         let terminator = strings
@@ -1213,34 +1219,38 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(plan.program.file_name().unwrap(), "env");
+        assert_eq!(plan.program, PathBuf::from("/usr/bin/env"));
         assert_eq!(plan.args[0], OsString::from("-i"));
         assert_eq!(plan.args[1], OsString::from("/usr/bin/bwrap"));
     }
 
     #[test]
     fn guest_bwrap_command_installs_a_clean_env_boundary_on_every_route() {
-        let expected_path = format!("PATH={GUEST_CLEAN_PATH}");
         let bwrap_args = vec![
             OsString::from("--die-with-parent"),
             OsString::from("supervise"),
         ];
 
+        // Both boundary executables are fixed absolute guest paths and the launcher environment is
+        // empty: no `PATH=` assignment is injected.
         let command = guest_bwrap_command(bwrap_args.clone());
         let strings = rendered_strings(&command);
-        assert_eq!(strings[0], "env");
+        assert_eq!(strings[0], "/usr/bin/env");
         assert_eq!(strings[1], "-i");
-        assert_eq!(strings[2], expected_path);
-        assert_eq!(strings[3], "bwrap");
-        assert_eq!(strings[4], "--die-with-parent");
+        assert_eq!(strings[2], "/usr/bin/bwrap");
+        assert_eq!(strings[3], "--die-with-parent");
+        assert!(
+            !strings.iter().any(|value| value.starts_with("PATH=")),
+            "guest launcher must inherit an empty environment"
+        );
 
         let request = request(Path::new("/tmp/guard-test/workspace"), NetworkMode::Denied);
         let scoped = wrap_guest_cgroup(&request, bwrap_args);
         let scoped_strings = rendered_strings(&scoped);
         assert_eq!(scoped_strings[0], "systemd-run");
         let boundary = scoped_strings
-            .windows(4)
-            .position(|window| window == ["env", "-i", expected_path.as_str(), "bwrap"])
+            .windows(3)
+            .position(|window| window == ["/usr/bin/env", "-i", "/usr/bin/bwrap"])
             .expect("guest cgroup route installs the clean-env boundary before bwrap");
         let terminator = scoped_strings
             .iter()

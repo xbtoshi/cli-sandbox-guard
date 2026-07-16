@@ -418,11 +418,12 @@ pub struct ProbeReport {
     pub success: bool,
     pub outside_path_hidden: bool,
     pub host_environment_hidden: bool,
-    /// The bwrap launcher process (pid 1 in the sandbox pid namespace) exposes no inherited host
-    /// session environment through `/proc/1/environ`.
+    /// The bwrap launcher process (pid 1 in the sandbox pid namespace) exposes an empty
+    /// `/proc/1/environ` — no inherited environment at all. An unreadable environ also satisfies
+    /// this (it cannot leak).
     pub bwrap_launcher_environment_scrubbed: bool,
-    /// Names observed on `/proc/1/environ` that are not part of the fixed clean-launcher allow
-    /// list. Diagnostic only; recorded for a failing probe. Names, never values.
+    /// Any variable names observed on `/proc/1/environ`. The invariant is emptiness, so a non-empty
+    /// list is a leak. Diagnostic only; recorded for a failing probe. Names, never values.
     pub bwrap_leaked_environment_names: Vec<String>,
     /// The explicit child environment delivered through bwrap `--setenv` (HOME/PATH/LANG) survives.
     pub child_environment_present: bool,
@@ -445,7 +446,7 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
     let host_environment_hidden = env::var_os(&config.forbidden_environment).is_none();
     #[cfg(target_os = "linux")]
     let (bwrap_launcher_environment_scrubbed, bwrap_leaked_environment_names) =
-        inspect_launcher_environment(&config.forbidden_environment);
+        inspect_launcher_environment();
     #[cfg(not(target_os = "linux"))]
     let (bwrap_launcher_environment_scrubbed, bwrap_leaked_environment_names): (
         bool,
@@ -544,38 +545,30 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
 /// Inspect the environment of pid 1 in the sandbox pid namespace — the bwrap launcher itself.
 ///
 /// Bubblewrap's `--clearenv` scrubs only the executed child; the launcher survives as pid 1 and
-/// its `/proc/1/environ` is readable by the confined tool. With the runner's `env -i` boundary in
-/// place, that environ is empty on Linux hosts and carries only a fixed, non-secret `PATH` on the
-/// Lima guest. Any other variable name is a leak of the launcher's inherited host environment.
+/// its `/proc/1/environ` is readable by the confined tool. Both backends now invoke bwrap behind a
+/// fixed `/usr/bin/env -i` boundary, so the launcher's environment is empty. The invariant is a
+/// completely empty `environ`: any variable name at all is an inherited-environment leak.
 ///
 /// Returns `(scrubbed, leaked_names)`. An unreadable environ cannot leak and counts as scrubbed.
 #[cfg(target_os = "linux")]
-fn inspect_launcher_environment(forbidden: &str) -> (bool, Vec<String>) {
+fn inspect_launcher_environment() -> (bool, Vec<String>) {
     match fs::read("/proc/1/environ") {
-        Ok(bytes) => classify_launcher_environment(&bytes, forbidden),
+        Ok(bytes) => classify_launcher_environment(&bytes),
         Err(_) => (true, Vec::new()),
     }
 }
 
-/// Names permitted on the bwrap launcher's environment after the `env -i` boundary. The host
-/// route leaves it empty; the Lima guest route re-establishes only a fixed, non-secret `PATH`.
+/// Pure classifier over the raw NUL-separated `environ` bytes of the bwrap launcher (pid 1). The
+/// invariant is an empty environment, so any name present at all is reported as a leak.
 #[cfg(any(target_os = "linux", test))]
-const LAUNCHER_ALLOWED_ENVIRONMENT_NAMES: &[&str] = &["PATH"];
-
-/// Pure classifier over the raw NUL-separated `environ` bytes. Any name outside the allow list,
-/// or the harness-injected `forbidden` sentinel, is reported as an inherited-environment leak.
-#[cfg(any(target_os = "linux", test))]
-fn classify_launcher_environment(raw: &[u8], forbidden: &str) -> (bool, Vec<String>) {
+fn classify_launcher_environment(raw: &[u8]) -> (bool, Vec<String>) {
     let mut leaked: Vec<String> = Vec::new();
     for entry in raw
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
     {
         let name = entry.split(|byte| *byte == b'=').next().unwrap_or(entry);
-        let name = String::from_utf8_lossy(name).into_owned();
-        if !LAUNCHER_ALLOWED_ENVIRONMENT_NAMES.contains(&name.as_str()) || name == forbidden {
-            leaked.push(name);
-        }
+        leaked.push(String::from_utf8_lossy(name).into_owned());
     }
     leaked.sort();
     leaked.dedup();
@@ -711,29 +704,24 @@ mod tests {
     }
 
     #[test]
-    fn launcher_environment_classifier_flags_inherited_host_variables() {
-        // Empty environ (host route): fully scrubbed.
-        assert_eq!(classify_launcher_environment(b"", "CANARY"), (true, vec![]));
+    fn launcher_environment_classifier_requires_an_empty_environ() {
+        // Empty environ (both backends after the `env -i` boundary): scrubbed.
+        assert_eq!(classify_launcher_environment(b""), (true, vec![]));
 
-        // Guest route: only the fixed non-secret PATH remains.
-        let (scrubbed, leaked) = classify_launcher_environment(
-            b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0",
-            "CANARY",
-        );
-        assert!(scrubbed);
-        assert!(leaked.is_empty());
+        // The invariant is strict emptiness: even a lone PATH is now treated as a leak.
+        let (scrubbed, leaked) = classify_launcher_environment(b"PATH=/usr/bin:/bin\0");
+        assert!(!scrubbed);
+        assert_eq!(leaked, vec!["PATH"]);
 
         // A regressed launcher leaking inherited host session variables (mirrors the live probe).
         let leaked_environ =
-            b"HOME=/home/anton.guest\0USER=anton\0HTTPS_PROXY=http://10.0.0.2:17890\0CANARY=1\0PATH=/bin\0";
-        let (scrubbed, leaked) = classify_launcher_environment(leaked_environ, "CANARY");
+            b"HOME=/home/redacted\0USER=redacted\0HTTPS_PROXY=http://10.0.0.2:17890\0CANARY=1\0PATH=/bin\0";
+        let (scrubbed, leaked) = classify_launcher_environment(leaked_environ);
         assert!(!scrubbed);
-        assert_eq!(leaked, vec!["CANARY", "HOME", "HTTPS_PROXY", "USER"]);
-
-        // The sentinel is caught even if it collides with an otherwise-allowed name.
-        let (scrubbed, leaked) = classify_launcher_environment(b"PATH=/bin\0", "PATH");
-        assert!(!scrubbed);
-        assert_eq!(leaked, vec!["PATH"]);
+        assert_eq!(
+            leaked,
+            vec!["CANARY", "HOME", "HTTPS_PROXY", "PATH", "USER"]
+        );
     }
 
     #[test]
