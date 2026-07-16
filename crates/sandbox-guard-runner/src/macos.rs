@@ -145,8 +145,14 @@ impl MacosLimaRunner {
                 let guest_state = guest_root.join("session-state");
                 let state_canary =
                     create_retrieval_canary(&limactl, request, &guest_state, "session-state")?;
-                retrieve_guest_directory(&limactl, request, &guest_state, state, "session-state")?;
-                verify_retrieval_canary(state, &state_canary)?;
+                retrieve_guest_directory(
+                    &limactl,
+                    request,
+                    &guest_state,
+                    &state.host_source,
+                    "session-state",
+                )?;
+                verify_retrieval_canary(&state.host_source, &state_canary)?;
             }
             Ok(())
         })();
@@ -473,7 +479,7 @@ fn copy_workspace_and_environment(
                 OsString::from("copy"),
                 OsString::from("--backend=rsync"),
                 OsString::from("--recursive"),
-                state.as_os_str().to_owned(),
+                state.host_source.as_os_str().to_owned(),
                 OsString::from(state_target),
             ],
             "copy private session state to Lima",

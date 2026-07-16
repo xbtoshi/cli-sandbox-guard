@@ -20,8 +20,8 @@ use sandbox_guard_core::{
 use sandbox_guard_helper::ProbeReport;
 use sandbox_guard_runner::{
     BackendKind, CgroupMode, NetworkMode, ProcessSpec, ResourceLimits, RunOutcome, RunRequest,
-    ToolSpec, clear_remembered_egress_decisions, forget_remembered_egress_decision,
-    list_remembered_egress_decisions, plan, run as run_isolated,
+    ToolSpec, WritableHomeState, clear_remembered_egress_decisions,
+    forget_remembered_egress_decision, list_remembered_egress_decisions, plan, run as run_isolated,
 };
 
 mod grok;
@@ -453,6 +453,7 @@ fn approvals_command(args: ApprovalArgs) -> Result<i32> {
 
 pub(crate) trait PersistentRunState {
     fn writable_path(&self) -> &Path;
+    fn writable_guest_path(&self) -> &Path;
     fn publish(self: Box<Self>) -> Result<()>;
 }
 
@@ -537,9 +538,10 @@ fn run_command_with(
         egress_decision_store: interactive_egress_approval
             .then(default_egress_decision_path)
             .transpose()?,
-        writable_home_state: persistent_state
-            .as_ref()
-            .map(|state| state.writable_path().to_path_buf()),
+        writable_home_state: persistent_state.as_ref().map(|state| WritableHomeState {
+            host_source: state.writable_path().to_path_buf(),
+            guest_target: state.writable_guest_path().to_path_buf(),
+        }),
         forwarded_env,
         resource_limits,
         cgroup_mode: args.cgroup.into(),

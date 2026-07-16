@@ -344,6 +344,10 @@ impl PersistentRunState for GrokSessionState {
         self.stage.workspace()
     }
 
+    fn writable_guest_path(&self) -> &Path {
+        &self.profile.guest_mount_path
+    }
+
     fn publish(self: Box<Self>) -> Result<()> {
         let mut options = StageOptions::new(self.stage.workspace(), session_policy(&self.profile)?);
         options.synthetic_git = false;
@@ -955,7 +959,7 @@ mod tests {
         let sessions = profile.sessions.unwrap();
         assert_eq!(
             sessions.guest_mount_path,
-            Path::new(sandbox_guard_runner::WRITABLE_HOME_STATE_GUEST_PATH)
+            Path::new("/home/guard/.grok/sessions")
         );
         assert_eq!(sessions.workspace_key, "%2Fworkspace");
         assert_eq!(sessions.index_file, "session_search.sqlite");
@@ -1000,13 +1004,13 @@ mod tests {
         )
         .unwrap();
 
-        Box::new(GrokSessionState {
+        let state = GrokSessionState {
             store,
             stage,
             profile: sessions.clone(),
-        })
-        .publish()
-        .unwrap();
+        };
+        assert_eq!(state.writable_guest_path(), sessions.guest_mount_path);
+        Box::new(state).publish().unwrap();
 
         let reopened = GrokSessionStore::open_at(data.path(), &source).unwrap();
         let snapshot = reopened.current_snapshot().unwrap().unwrap();

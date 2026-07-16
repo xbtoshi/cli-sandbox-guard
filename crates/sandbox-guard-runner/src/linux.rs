@@ -18,7 +18,7 @@ use crate::{
     path_is_within,
 };
 
-const GUEST_RUNTIME: &str = "/run/sandbox-guard";
+pub(crate) const GUEST_RUNTIME: &str = "/run/sandbox-guard";
 const GUEST_ENVIRONMENT: &str = "/run/sandbox-guard/environment.json";
 const GUEST_PROXY_SOCKET: &str = "/run/sandbox-guard/egress.sock";
 const GUEST_HELPER: &str = "/opt/sandbox-guard/helper";
@@ -447,8 +447,8 @@ fn build_bwrap_args(
     push(&mut args, GUEST_RUNTIME);
     if let Some(state) = &request.writable_home_state {
         push(&mut args, "--bind");
-        args.push(state.as_os_str().to_owned());
-        push(&mut args, crate::WRITABLE_HOME_STATE_GUEST_PATH);
+        args.push(state.host_source.as_os_str().to_owned());
+        args.push(state.guest_target.as_os_str().to_owned());
     }
     if let Some((host, guest)) = tool_mount {
         push(&mut args, "--ro-bind");
@@ -566,10 +566,10 @@ pub(crate) fn guest_bwrap_args(
     push(&mut args, "--ro-bind");
     args.push(runtime_root.as_os_str().to_owned());
     push(&mut args, GUEST_RUNTIME);
-    if request.writable_home_state.is_some() {
+    if let Some(state) = &request.writable_home_state {
         push(&mut args, "--bind");
         args.push(runtime_root.join("session-state").into_os_string());
-        push(&mut args, crate::WRITABLE_HOME_STATE_GUEST_PATH);
+        args.push(state.guest_target.as_os_str().to_owned());
     }
     push(&mut args, "--bind");
     args.push(workspace.as_os_str().to_owned());
@@ -879,7 +879,7 @@ pub(crate) fn network_warnings(mode: NetworkMode, boundary: &str) -> Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProcessSpec, ToolSpec};
+    use crate::{ProcessSpec, ToolSpec, WritableHomeState};
 
     fn request(workspace: &Path, network: NetworkMode) -> RunRequest {
         RunRequest {
@@ -1006,19 +1006,22 @@ mod tests {
         let workspace = Path::new("/tmp/guard-test/workspace");
         let runtime = Path::new("/tmp/guard-test/runtime");
         let mut request = request(workspace, NetworkMode::Denied);
-        request.writable_home_state = Some(PathBuf::from("/private/guard-session-stage"));
-        let args = guest_bwrap_args(
+        request.writable_home_state = Some(WritableHomeState {
+            host_source: PathBuf::from("/private/guard-session-stage"),
+            guest_target: PathBuf::from("/home/guard/.grok/sessions"),
+        });
+        let guest_args = guest_bwrap_args(
             &request,
             workspace,
             runtime,
             Path::new("/usr/local/bin/guard-helper"),
         );
-        let strings: Vec<_> = args
+        let guest_strings: Vec<_> = guest_args
             .iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
 
-        assert!(strings.windows(3).any(|window| {
+        assert!(guest_strings.windows(3).any(|window| {
             window
                 == [
                     "--bind",
@@ -1027,10 +1030,32 @@ mod tests {
                 ]
         }));
         assert!(
-            !strings
+            !guest_strings
                 .windows(3)
                 .any(|window| { window[0] == "--bind" && window[2] == "/home/guard/.grok" })
         );
+
+        let host_args = build_bwrap_args(
+            &request,
+            workspace,
+            runtime,
+            Path::new("/usr/local/bin/guard-helper"),
+            Path::new("/opt/sandbox-guard/helper"),
+            OsString::from("/usr/bin/tool"),
+            None,
+        );
+        let host_strings: Vec<_> = host_args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(host_strings.windows(3).any(|window| {
+            window
+                == [
+                    "--bind",
+                    "/private/guard-session-stage",
+                    "/home/guard/.grok/sessions",
+                ]
+        }));
     }
 
     #[test]

@@ -12,14 +12,14 @@ mod terminal;
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-pub const WRITABLE_HOME_STATE_GUEST_PATH: &str = "/home/guard/.grok/sessions";
 
 pub use approval::{
     RememberedEgressDecision, clear_remembered_egress_decisions, forget_remembered_egress_decision,
@@ -92,6 +92,14 @@ pub struct ProcessSpec {
 }
 
 #[derive(Debug, Clone)]
+pub struct WritableHomeState {
+    /// Private Guard-owned directory on the host (or copied into the Lima guest runtime).
+    pub host_source: PathBuf,
+    /// Narrow writable mount target inside the synthetic sandbox home.
+    pub guest_target: PathBuf,
+}
+
+#[derive(Debug, Clone)]
 pub struct RunRequest {
     pub workspace: PathBuf,
     pub run_id: String,
@@ -106,8 +114,8 @@ pub struct RunRequest {
     pub interactive_egress_approval: bool,
     /// Private host-side file used for remembered exact-host allow and deny choices.
     pub egress_decision_store: Option<PathBuf>,
-    /// Guard-owned writable state exposed only at [`WRITABLE_HOME_STATE_GUEST_PATH`].
-    pub writable_home_state: Option<PathBuf>,
+    /// Guard-owned writable state exposed at an independently validated guest-home target.
+    pub writable_home_state: Option<WritableHomeState>,
     pub forwarded_env: Vec<(String, String)>,
     pub resource_limits: ResourceLimits,
     pub cgroup_mode: CgroupMode,
@@ -224,32 +232,35 @@ fn validate_request(request: &RunRequest) -> Result<(), RunnerError> {
         return Err(RunnerError::InvalidHelperPath(helper.clone()));
     }
     if let Some(state) = &request.writable_home_state {
-        if !state.is_absolute() {
-            return Err(RunnerError::InvalidWritableState(state.clone()));
+        if !state.host_source.is_absolute() {
+            return Err(RunnerError::InvalidWritableState(state.host_source.clone()));
         }
-        let metadata = fs::symlink_metadata(state).map_err(|source| RunnerError::Inspect {
-            path: state.clone(),
-            source,
-        })?;
+        let metadata =
+            fs::symlink_metadata(&state.host_source).map_err(|source| RunnerError::Inspect {
+                path: state.host_source.clone(),
+                source,
+            })?;
         if !metadata.is_dir()
             || metadata.file_type().is_symlink()
             || metadata.uid() != current_uid()
             || metadata.permissions().mode() & 0o077 != 0
         {
-            return Err(RunnerError::InvalidWritableState(state.clone()));
+            return Err(RunnerError::InvalidWritableState(state.host_source.clone()));
         }
-        let state = fs::canonicalize(state).map_err(|source| RunnerError::Inspect {
-            path: state.clone(),
-            source,
-        })?;
+        let host_source =
+            fs::canonicalize(&state.host_source).map_err(|source| RunnerError::Inspect {
+                path: state.host_source.clone(),
+                source,
+            })?;
         let workspace =
             fs::canonicalize(&request.workspace).map_err(|source| RunnerError::Inspect {
                 path: request.workspace.clone(),
                 source,
             })?;
-        if path_is_within(&state, &workspace) || path_is_within(&workspace, &state) {
-            return Err(RunnerError::InvalidWritableState(state));
+        if path_is_within(&host_source, &workspace) || path_is_within(&workspace, &host_source) {
+            return Err(RunnerError::InvalidWritableState(host_source));
         }
+        validate_writable_state_guest_target(&state.guest_target)?;
     }
     match request.network {
         NetworkMode::Controlled if request.allowed_egress_hosts.is_empty() => {
@@ -297,7 +308,8 @@ fn validate_request(request: &RunRequest) -> Result<(), RunnerError> {
             || path_is_within(&parent, &workspace)
             || path_is_within(&workspace, &parent)
             || request.writable_home_state.as_ref().is_some_and(|state| {
-                fs::canonicalize(state).is_ok_and(|state| path_is_within(&resolved_path, &state))
+                fs::canonicalize(&state.host_source)
+                    .is_ok_and(|state| path_is_within(&resolved_path, &state))
             })
         {
             return Err(RunnerError::InvalidEgressDecisionStore(path.clone()));
@@ -310,6 +322,61 @@ fn validate_request(request: &RunRequest) -> Result<(), RunnerError> {
     }
     for (name, _) in &request.forwarded_env {
         validate_forwarded_environment_name(name)?;
+    }
+    Ok(())
+}
+
+fn validate_writable_state_guest_target(target: &Path) -> Result<(), RunnerError> {
+    const SYNTHETIC_HOME: &str = "/home/guard";
+    const RESERVED_TARGETS: [&str; 4] = [
+        "/workspace",
+        clipboard::SANDBOX_INBOX,
+        "/opt/sandbox-guard",
+        linux::GUEST_RUNTIME,
+    ];
+
+    // Path::components intentionally erases `.` and repeated separators. Validate the raw Unix
+    // syntax first, then use components only for containment of that exact accepted spelling.
+    let raw = target.as_os_str().as_bytes();
+    if !raw.starts_with(b"/")
+        || raw.len() == 1
+        || raw[1..].split(|byte| *byte == b'/').any(|component| {
+            component.is_empty()
+                || component == b"."
+                || component == b".."
+                || component.contains(&0)
+        })
+    {
+        return Err(RunnerError::InvalidWritableStateTarget(
+            target.to_path_buf(),
+        ));
+    }
+
+    let mut normalized = PathBuf::from("/");
+    let mut saw_root = false;
+    for component in target.components() {
+        match component {
+            Component::RootDir if !saw_root => saw_root = true,
+            Component::Normal(value) if !value.as_bytes().contains(&0) => normalized.push(value),
+            _ => {
+                return Err(RunnerError::InvalidWritableStateTarget(
+                    target.to_path_buf(),
+                ));
+            }
+        }
+    }
+    let home = Path::new(SYNTHETIC_HOME);
+    if !saw_root
+        || normalized == home
+        || !path_is_within(&normalized, home)
+        || RESERVED_TARGETS.iter().any(|reserved| {
+            let reserved = Path::new(reserved);
+            path_is_within(&normalized, reserved) || path_is_within(reserved, &normalized)
+        })
+    {
+        return Err(RunnerError::InvalidWritableStateTarget(
+            target.to_path_buf(),
+        ));
     }
     Ok(())
 }
@@ -427,6 +494,10 @@ pub enum RunnerError {
         "writable home state must be a private, owner-owned directory outside the workspace: {0}"
     )]
     InvalidWritableState(PathBuf),
+    #[error(
+        "writable home state guest target must be a normalized path strictly below /home/guard and disjoint from other sandbox mounts: {0}"
+    )]
+    InvalidWritableStateTarget(PathBuf),
     #[error("controlled network mode requires at least one --allow-host")]
     ControlledEgressWithoutHosts,
     #[error("--allow-host is valid only with controlled network mode")]
@@ -561,12 +632,53 @@ mod tests {
 
         let state = tempfile::tempdir().unwrap();
         fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        request.writable_home_state = Some(state.path().to_path_buf());
+        request.writable_home_state = Some(WritableHomeState {
+            host_source: state.path().to_path_buf(),
+            guest_target: PathBuf::from("/home/guard/.grok/sessions"),
+        });
         request.egress_decision_store = Some(state.path().join("decisions.json"));
         assert!(matches!(
             validate_request(&request),
             Err(RunnerError::InvalidEgressDecisionStore(_))
         ));
+    }
+
+    #[test]
+    fn writable_state_guest_target_is_independently_confined_to_synthetic_home() {
+        let workspace = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        fs::set_permissions(state.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut request = request(workspace.path());
+        request.writable_home_state = Some(WritableHomeState {
+            host_source: state.path().to_path_buf(),
+            guest_target: PathBuf::from("/home/guard/.grok/sessions"),
+        });
+        validate_request(&request).unwrap();
+
+        for hostile in [
+            "home/guard/.grok/sessions",
+            "/home/guard",
+            "/home/guard/..",
+            "/home/guard/../../etc",
+            "/home/guard/.grok/./sessions",
+            "/home/guard/.grok/sessions/",
+            "/home/guard//sessions",
+            "/etc/passwd",
+            "/workspace",
+            "/workspace/sandbox-guard-inputs",
+            "/opt/sandbox-guard/tool",
+            "/run/sandbox-guard/environment.json",
+        ] {
+            request.writable_home_state.as_mut().unwrap().guest_target = PathBuf::from(hostile);
+            assert!(
+                matches!(
+                    validate_request(&request),
+                    Err(RunnerError::InvalidWritableStateTarget(ref rejected))
+                        if rejected == Path::new(hostile)
+                ),
+                "unsafe guest target {hostile:?} was accepted"
+            );
+        }
     }
 
     #[test]

@@ -159,7 +159,7 @@ pub(super) fn profile_command(args: ProfileArgs) -> Result<i32> {
             } else {
                 println!("profile: {} ({})", report.profile_name, report.source);
                 println!(
-                    "runtime source: partial compiled-profile migration (session, terminal, clipboard, and seccomp metadata remain descriptive or hardcoded)"
+                    "runtime source: partial compiled-profile migration (guest executable, terminal, clipboard, and seccomp metadata remain descriptive or hardcoded)"
                 );
                 for section in report.sections {
                     println!(
@@ -249,10 +249,10 @@ fn explain_report(profile: &VendorProfile) -> ProfileExplainReport {
             "egress",
             "credentials",
             "sessions.layout_and_quotas",
+            "sessions.guest_mount_path",
         ],
         runtime_not_consumed_sections: vec![
             "tool.guest_executable",
-            "sessions.guest_mount_path",
             "terminal",
             "clipboard",
             "seccomp",
@@ -469,7 +469,7 @@ mod tests {
         );
         assert!(
             report
-                .runtime_not_consumed_sections
+                .runtime_consumed_sections
                 .contains(&"sessions.guest_mount_path")
         );
         assert_eq!(report.sections.len(), 6);
