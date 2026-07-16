@@ -28,9 +28,10 @@ pub use gc::{GcError, GcReport, garbage_collect};
 pub use policy::{CompiledPolicy, EffectivePolicy, PolicyError, UserPolicy};
 pub use profile::{
     ArgumentMatch, ArgumentRule, BUILTIN_VENDOR_PROFILE_NAMES, ClipboardProfile, CommandProfile,
-    CredentialProfile, EgressMode, EgressProfile, HostRule, ProfileError, SeccompCompatibility,
-    SessionProfile, TerminalProfile, ToolLaunchProfile, VENDOR_PROFILE_SCHEMA_VERSION,
-    VendorProfile, builtin_grok_profile, builtin_vendor_profile,
+    CredentialProfile, EgressMode, EgressProfile, HostRule, PROFILE_OVERLAY_SCHEMA_VERSION,
+    ProfileError, ProfileOverlay, ProfileOverlayDocument, SeccompCompatibility, SessionProfile,
+    TerminalProfile, ToolLaunchProfile, VENDOR_PROFILE_SCHEMA_VERSION, VendorProfile,
+    apply_profile_overlay, builtin_grok_profile, builtin_vendor_profile,
 };
 pub use staging::{
     PersistedStage, Stage, StageError, StageOptions, default_staging_base, display_path,

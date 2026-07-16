@@ -1,11 +1,33 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const VENDOR_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const PROFILE_OVERLAY_SCHEMA_VERSION: u32 = 1;
 pub const BUILTIN_VENDOR_PROFILE_NAMES: &[&str] = &["grok"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileOverlayDocument {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ProfileOverlay>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileOverlay {
+    pub remove_egress_hosts: Vec<String>,
+    pub restrict_to_exact_hosts: Vec<String>,
+    pub interactive_approval: Option<bool>,
+    pub clipboard_image_import: Option<bool>,
+    pub mouse_reporting_default: Option<bool>,
+    pub native_scrollback_opt_in: Option<bool>,
+    pub max_session_total_bytes: Option<u64>,
+    pub max_session_files: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -168,8 +190,8 @@ impl VendorProfile {
         let mut hosts = BTreeSet::new();
         for host in &self.egress.allowed_https_hosts {
             validate_hostname(&host.hostname)?;
-            if !hosts.insert(host.clone()) {
-                return invalid("egress.allowed_https_hosts", "duplicate host rule");
+            if !hosts.insert(host.hostname.as_str()) {
+                return invalid("egress.allowed_https_hosts", "duplicate hostname rule");
             }
         }
 
@@ -282,6 +304,143 @@ impl VendorProfile {
         }
         Ok(())
     }
+}
+
+impl ProfileOverlayDocument {
+    pub fn validate(&self) -> Result<(), ProfileError> {
+        if self.schema_version != PROFILE_OVERLAY_SCHEMA_VERSION {
+            return Err(ProfileError::UnsupportedOverlaySchema(self.schema_version));
+        }
+        for (name, overlay) in &self.profiles {
+            let base = builtin_vendor_profile(name)
+                .ok_or_else(|| ProfileError::UnknownBuiltinProfile(name.clone()))?;
+            apply_profile_overlay(&base, overlay)?;
+        }
+        Ok(())
+    }
+}
+
+/// Apply owner policy that can only remove reach, disable optional capabilities, or lower quotas.
+pub fn apply_profile_overlay(
+    base: &VendorProfile,
+    overlay: &ProfileOverlay,
+) -> Result<VendorProfile, ProfileError> {
+    base.validate()?;
+    validate_overlay(overlay)?;
+    let mut merged = base.clone();
+
+    for hostname in &overlay.remove_egress_hosts {
+        let index = merged
+            .egress
+            .allowed_https_hosts
+            .iter()
+            .position(|rule| rule.hostname == *hostname)
+            .ok_or_else(|| ProfileError::UnknownOverlayHost {
+                operation: "remove",
+                hostname: hostname.clone(),
+            })?;
+        merged.egress.allowed_https_hosts.remove(index);
+    }
+    if merged.egress.allowed_https_hosts.is_empty() {
+        return Err(ProfileError::EmptyOverlayEgress);
+    }
+
+    for hostname in &overlay.restrict_to_exact_hosts {
+        let rule = merged
+            .egress
+            .allowed_https_hosts
+            .iter_mut()
+            .find(|rule| rule.hostname == *hostname)
+            .ok_or_else(|| ProfileError::UnknownOverlayHost {
+                operation: "restrict",
+                hostname: hostname.clone(),
+            })?;
+        if !rule.include_subdomains {
+            return Err(ProfileError::HostAlreadyExact(hostname.clone()));
+        }
+        rule.include_subdomains = false;
+    }
+
+    if overlay.interactive_approval == Some(false) {
+        merged.egress.interactive_approval_default = false;
+    }
+    if overlay.clipboard_image_import == Some(false) {
+        merged.clipboard.image_import = false;
+    }
+    if overlay.mouse_reporting_default == Some(false) {
+        merged.terminal.mouse_reporting_default = false;
+    }
+    if overlay.native_scrollback_opt_in == Some(false) {
+        merged.terminal.native_scrollback_opt_in = false;
+    }
+    if overlay.max_session_total_bytes.is_some() || overlay.max_session_files.is_some() {
+        let sessions = merged
+            .sessions
+            .as_mut()
+            .ok_or(ProfileError::OverlayRequiresSessions)?;
+        if let Some(limit) = overlay.max_session_total_bytes {
+            if limit > sessions.max_total_bytes {
+                return Err(ProfileError::OverlayQuotaIncrease {
+                    field: "max_session_total_bytes",
+                    requested: limit,
+                    maximum: sessions.max_total_bytes,
+                });
+            }
+            sessions.max_total_bytes = limit;
+        }
+        if let Some(limit) = overlay.max_session_files {
+            if limit > sessions.max_files {
+                return Err(ProfileError::OverlayQuotaIncrease {
+                    field: "max_session_files",
+                    requested: limit,
+                    maximum: sessions.max_files,
+                });
+            }
+            sessions.max_files = limit;
+        }
+    }
+
+    merged.validate()?;
+    Ok(merged)
+}
+
+fn validate_overlay(overlay: &ProfileOverlay) -> Result<(), ProfileError> {
+    let mut remove = BTreeSet::new();
+    for hostname in &overlay.remove_egress_hosts {
+        validate_hostname(hostname)?;
+        if !remove.insert(hostname.as_str()) {
+            return invalid("remove_egress_hosts", "duplicate hostname");
+        }
+    }
+    let mut restrict = BTreeSet::new();
+    for hostname in &overlay.restrict_to_exact_hosts {
+        validate_hostname(hostname)?;
+        if !restrict.insert(hostname.as_str()) {
+            return invalid("restrict_to_exact_hosts", "duplicate hostname");
+        }
+        if remove.contains(hostname.as_str()) {
+            return invalid("restrict_to_exact_hosts", "hostname cannot also be removed");
+        }
+    }
+    for (field, value) in [
+        ("interactive_approval", overlay.interactive_approval),
+        ("clipboard_image_import", overlay.clipboard_image_import),
+        ("mouse_reporting_default", overlay.mouse_reporting_default),
+        ("native_scrollback_opt_in", overlay.native_scrollback_opt_in),
+    ] {
+        if value == Some(true) {
+            return Err(ProfileError::OverlayBooleanWidening { field });
+        }
+    }
+    for (field, value) in [
+        ("max_session_total_bytes", overlay.max_session_total_bytes),
+        ("max_session_files", overlay.max_session_files),
+    ] {
+        if value == Some(0) {
+            return invalid(field, "overlay quota must be non-zero");
+        }
+    }
+    Ok(())
 }
 
 /// Return the compiled Grok profile. It is not loaded from owner- or project-controlled storage.
@@ -482,6 +641,33 @@ fn invalid<T>(field: &'static str, reason: &'static str) -> Result<T, ProfileErr
 pub enum ProfileError {
     #[error("unsupported vendor profile schema version {0}")]
     UnsupportedSchema(u32),
+    #[error("unsupported profile overlay schema version {0}")]
+    UnsupportedOverlaySchema(u32),
+    #[error("profile overlay names unknown built-in profile {0:?}")]
+    UnknownBuiltinProfile(String),
+    #[error("profile overlay cannot set {field} to true")]
+    OverlayBooleanWidening { field: &'static str },
+    #[error("profile overlay cannot {operation} unknown egress hostname {hostname:?}")]
+    UnknownOverlayHost {
+        operation: &'static str,
+        hostname: String,
+    },
+    /// Host restriction names must still describe a real reduction so stale/typoed intent fails;
+    /// false boolean and equal quota overlays remain idempotent for built-in evolution.
+    #[error("profile overlay cannot restrict already-exact egress hostname {0:?}")]
+    HostAlreadyExact(String),
+    #[error(
+        "profile overlay cannot remove every controlled egress host; use denied network mode instead"
+    )]
+    EmptyOverlayEgress,
+    #[error("profile overlay session quota requires a built-in profile with managed sessions")]
+    OverlayRequiresSessions,
+    #[error("profile overlay cannot raise {field} to {requested}; built-in maximum is {maximum}")]
+    OverlayQuotaIncrease {
+        field: &'static str,
+        requested: u64,
+        maximum: u64,
+    },
     #[error("invalid vendor profile field {field}: {reason}")]
     InvalidField {
         field: &'static str,
@@ -514,6 +700,186 @@ mod tests {
         }
         assert!(builtin_vendor_profile("Grok").is_none());
         assert!(builtin_vendor_profile("../grok").is_none());
+    }
+
+    #[test]
+    fn empty_overlay_is_identity_and_maximal_overlay_is_monotonic() {
+        let base = overlay_test_profile();
+        assert_eq!(
+            apply_profile_overlay(&base, &ProfileOverlay::default()).unwrap(),
+            base
+        );
+
+        let overlay = ProfileOverlay {
+            remove_egress_hosts: vec!["uploads.grok.example".to_owned()],
+            restrict_to_exact_hosts: vec!["cli-chat-proxy.grok.com".to_owned()],
+            interactive_approval: Some(false),
+            clipboard_image_import: Some(false),
+            mouse_reporting_default: Some(false),
+            native_scrollback_opt_in: Some(false),
+            max_session_total_bytes: Some(1024),
+            max_session_files: Some(10),
+        };
+        let merged = apply_profile_overlay(&base, &overlay).unwrap();
+        assert_tightened(&base, &merged);
+        assert_eq!(merged.egress.allowed_https_hosts.len(), 1);
+        assert!(!merged.egress.allowed_https_hosts[0].include_subdomains);
+        assert!(!merged.egress.interactive_approval_default);
+        assert!(!merged.clipboard.image_import);
+        assert!(!merged.terminal.mouse_reporting_default);
+        assert!(!merged.terminal.native_scrollback_opt_in);
+        assert_eq!(merged.sessions.as_ref().unwrap().max_total_bytes, 1024);
+        assert_eq!(merged.sessions.as_ref().unwrap().max_files, 10);
+    }
+
+    #[test]
+    fn overlay_rejects_every_widening_or_ambiguous_operation() {
+        let base = builtin_grok_profile();
+        for field in [
+            "interactive_approval",
+            "clipboard_image_import",
+            "mouse_reporting_default",
+            "native_scrollback_opt_in",
+        ] {
+            let mut overlay = ProfileOverlay::default();
+            match field {
+                "interactive_approval" => overlay.interactive_approval = Some(true),
+                "clipboard_image_import" => overlay.clipboard_image_import = Some(true),
+                "mouse_reporting_default" => overlay.mouse_reporting_default = Some(true),
+                "native_scrollback_opt_in" => overlay.native_scrollback_opt_in = Some(true),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                apply_profile_overlay(&base, &overlay),
+                Err(ProfileError::OverlayBooleanWidening { field: rejected }) if rejected == field
+            ));
+        }
+
+        for overlay in [
+            ProfileOverlay {
+                max_session_total_bytes: Some(base.sessions.as_ref().unwrap().max_total_bytes + 1),
+                ..ProfileOverlay::default()
+            },
+            ProfileOverlay {
+                max_session_files: Some(base.sessions.as_ref().unwrap().max_files + 1),
+                ..ProfileOverlay::default()
+            },
+        ] {
+            assert!(matches!(
+                apply_profile_overlay(&base, &overlay),
+                Err(ProfileError::OverlayQuotaIncrease { .. })
+            ));
+        }
+        for overlay in [
+            ProfileOverlay {
+                max_session_total_bytes: Some(0),
+                ..ProfileOverlay::default()
+            },
+            ProfileOverlay {
+                max_session_files: Some(0),
+                ..ProfileOverlay::default()
+            },
+        ] {
+            assert!(apply_profile_overlay(&base, &overlay).is_err());
+        }
+
+        for overlay in [
+            ProfileOverlay {
+                remove_egress_hosts: vec!["unknown.example".to_owned()],
+                ..ProfileOverlay::default()
+            },
+            ProfileOverlay {
+                restrict_to_exact_hosts: vec!["cli-chat-proxy.grok.com".to_owned()],
+                ..ProfileOverlay::default()
+            },
+            ProfileOverlay {
+                remove_egress_hosts: vec!["cli-chat-proxy.grok.com".to_owned()],
+                ..ProfileOverlay::default()
+            },
+            ProfileOverlay {
+                remove_egress_hosts: vec!["cli-chat-proxy.grok.com".to_owned(); 2],
+                ..ProfileOverlay::default()
+            },
+            ProfileOverlay {
+                remove_egress_hosts: vec!["*.grok.com".to_owned()],
+                ..ProfileOverlay::default()
+            },
+        ] {
+            assert!(apply_profile_overlay(&base, &overlay).is_err());
+        }
+    }
+
+    #[test]
+    fn overlay_document_is_versioned_deny_unknown_and_builtin_only() {
+        let document = ProfileOverlayDocument {
+            schema_version: PROFILE_OVERLAY_SCHEMA_VERSION,
+            profiles: BTreeMap::from([("grok".to_owned(), ProfileOverlay::default())]),
+        };
+        document.validate().unwrap();
+        let encoded = toml::to_string_pretty(&document).unwrap();
+        let decoded: ProfileOverlayDocument = toml::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, document);
+        let empty: ProfileOverlayDocument = toml::from_str("schema_version = 1\n").unwrap();
+        empty.validate().unwrap();
+        assert!(empty.profiles.is_empty());
+
+        let mut unsupported = document.clone();
+        unsupported.schema_version += 1;
+        assert!(matches!(
+            unsupported.validate(),
+            Err(ProfileError::UnsupportedOverlaySchema(_))
+        ));
+        let mut unknown = document.clone();
+        unknown
+            .profiles
+            .insert("../grok".to_owned(), ProfileOverlay::default());
+        assert!(matches!(
+            unknown.validate(),
+            Err(ProfileError::UnknownBuiltinProfile(_))
+        ));
+
+        assert!(
+            toml::from_str::<ProfileOverlayDocument>("schema_version = 1\nunexpected = true\n")
+                .is_err()
+        );
+        assert!(
+            toml::from_str::<ProfileOverlayDocument>(
+                "schema_version = 1\n[profiles.grok]\nunexpected = true\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn false_boolean_and_equal_quota_overlays_are_idempotent() {
+        let mut base = builtin_grok_profile();
+        base.egress.interactive_approval_default = false;
+        base.clipboard.image_import = false;
+        base.terminal.mouse_reporting_default = false;
+        base.terminal.native_scrollback_opt_in = false;
+        base.validate().unwrap();
+        let sessions = base.sessions.as_ref().unwrap();
+        let overlay = ProfileOverlay {
+            interactive_approval: Some(false),
+            clipboard_image_import: Some(false),
+            mouse_reporting_default: Some(false),
+            native_scrollback_opt_in: Some(false),
+            max_session_total_bytes: Some(sessions.max_total_bytes),
+            max_session_files: Some(sessions.max_files),
+            ..ProfileOverlay::default()
+        };
+        assert_eq!(apply_profile_overlay(&base, &overlay).unwrap(), base);
+    }
+
+    #[test]
+    fn egress_hostnames_are_unique_independent_of_subdomain_scope() {
+        let mut profile = builtin_grok_profile();
+        profile.egress.allowed_https_hosts.push(HostRule {
+            hostname: "cli-chat-proxy.grok.com".to_owned(),
+            include_subdomains: true,
+        });
+        assert!(profile.validate().is_err());
     }
 
     #[test]
@@ -623,5 +989,54 @@ mod tests {
             .as_table_mut()
             .unwrap()
             .insert("unexpected".to_owned(), toml::Value::Boolean(true));
+    }
+
+    fn overlay_test_profile() -> VendorProfile {
+        let mut profile = builtin_grok_profile();
+        profile.egress.allowed_https_hosts[0].include_subdomains = true;
+        profile.egress.allowed_https_hosts.push(HostRule {
+            hostname: "uploads.grok.example".to_owned(),
+            include_subdomains: false,
+        });
+        profile.validate().unwrap();
+        profile
+    }
+
+    fn assert_tightened(base: &VendorProfile, merged: &VendorProfile) {
+        assert_eq!(merged.schema_version, base.schema_version);
+        assert_eq!(merged.name, base.name);
+        assert_eq!(merged.tool, base.tool);
+        assert_eq!(merged.credentials, base.credentials);
+        assert_eq!(merged.seccomp, base.seccomp);
+        assert_eq!(merged.egress.mode, base.egress.mode);
+        assert!(
+            !merged.egress.interactive_approval_default || base.egress.interactive_approval_default
+        );
+        for rule in &merged.egress.allowed_https_hosts {
+            let original = base
+                .egress
+                .allowed_https_hosts
+                .iter()
+                .find(|candidate| candidate.hostname == rule.hostname)
+                .expect("merged host must exist in base");
+            assert!(!rule.include_subdomains || original.include_subdomains);
+        }
+        assert!(!merged.clipboard.image_import || base.clipboard.image_import);
+        assert!(!merged.terminal.mouse_reporting_default || base.terminal.mouse_reporting_default);
+        assert!(
+            !merged.terminal.native_scrollback_opt_in || base.terminal.native_scrollback_opt_in
+        );
+        match (&base.sessions, &merged.sessions) {
+            (Some(base), Some(merged)) => {
+                assert_eq!(merged.guest_mount_path, base.guest_mount_path);
+                assert_eq!(merged.workspace_key, base.workspace_key);
+                assert_eq!(merged.index_file, base.index_file);
+                assert_eq!(merged.prompt_history_file, base.prompt_history_file);
+                assert!(merged.max_total_bytes <= base.max_total_bytes);
+                assert!(merged.max_files <= base.max_files);
+            }
+            (None, None) => {}
+            _ => panic!("overlay changed session presence"),
+        }
     }
 }
