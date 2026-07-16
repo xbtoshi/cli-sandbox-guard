@@ -31,6 +31,14 @@
 
 set -euo pipefail
 
+# Pin byte-wise collation so member-name ordering, the manifest `files` arrays,
+# and every sort/uniq check are deterministic regardless of the caller's locale.
+# Without this, a UTF-8 host locale interleaves upper- and lower-case names
+# differently from the C-locale order the CI prepublish step records, and
+# maintainer `published` verification fails on the array order alone even though
+# every hash and size matches.
+export LC_ALL=C
+
 die() {
     echo "verify-release-artifacts: $*" >&2
     exit 1
