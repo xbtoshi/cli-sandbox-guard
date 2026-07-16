@@ -82,7 +82,13 @@ fn installs_verifies_and_lists_a_signed_profile() {
         inputs.fingerprint
     );
     assert_eq!(installed.envelope.profile.name, "vendor-example");
-    assert_eq!(installed.root, store.join("vendor-example/1.0.0"));
+    // The store canonicalizes its root, so resolve the expected side too; otherwise the
+    // comparison breaks on hosts whose temporary directory sits behind a symlink such as
+    // the macOS /var -> /private/var indirection.
+    assert_eq!(
+        installed.root,
+        store.canonicalize().unwrap().join("vendor-example/1.0.0")
+    );
 
     let mut entries = fs::read_dir(&installed.root)
         .unwrap()

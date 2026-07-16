@@ -1162,9 +1162,21 @@ mod tests {
         assert_eq!(identity.profile, resolve_builtin_profile("grok").unwrap());
     }
 
+    /// The overlay loader validates every ancestor of the overlay, so fixtures must live under
+    /// an owner-controlled anchor. The system temporary directory does not qualify on CI hosts
+    /// (root-owned world-writable /tmp on Linux runners), so anchor fixtures in the home
+    /// directory, which the validator trusts by construction.
+    fn private_home_tempdir() -> tempfile::TempDir {
+        let home = BaseDirs::new().unwrap().home_dir().to_path_buf();
+        tempfile::Builder::new()
+            .prefix(".sandbox-guard-overlay-test-")
+            .tempdir_in(home)
+            .unwrap()
+    }
+
     #[test]
     fn owner_overlay_loader_accepts_only_private_bounded_regular_files() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_home_tempdir();
         let valid = directory.path().join("profile-overlays.toml");
         let document = ProfileOverlayDocument {
             schema_version: PROFILE_OVERLAY_SCHEMA_VERSION,
@@ -1222,7 +1234,9 @@ mod tests {
 
     #[test]
     fn owner_overlay_loader_rejects_a_symlinked_configuration_parent() {
-        let directory = tempfile::tempdir().unwrap();
+        // Anchor under the home directory so the rejection below is attributable to the
+        // symlinked parent component itself, not to an untrusted temporary-directory ancestor.
+        let directory = private_home_tempdir();
         let real = directory.path().join("real");
         let linked = directory.path().join("linked");
         fs::create_dir(&real).unwrap();
