@@ -12,7 +12,9 @@ use directories::{BaseDirs, ProjectDirs};
 use sandbox_guard_core::{
     CompiledPolicy, VendorProfile, builtin_vendor_profile, verify_installed_tool_snapshot,
 };
-use sandbox_guard_runner::BackendKind;
+use sandbox_guard_runner::{
+    BackendKind, ResourceLimits, linux_cgroup_probe_available, linux_namespace_probe_available,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -42,6 +44,14 @@ const GUEST_TOOL_DIRECTORY: &str = "/opt/sandbox-guard/tools";
 const MAX_GUEST_TOOL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GUEST_TOOL_RECEIPT_BYTES: u64 = 64 * 1024;
 const GUEST_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+const HOST_ENV: &str = "/usr/bin/env";
+const HOST_TEST: &str = "/usr/bin/test";
+const HOST_SUDO: &str = "/usr/bin/sudo";
+const HOST_APT_GET: &str = "/usr/bin/apt-get";
+const HOST_BWRAP: &str = "/usr/bin/bwrap";
+const HOST_GIT: &str = "/usr/bin/git";
+const HOST_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+const HOST_OS_RELEASE: &str = "/etc/os-release";
 const MAX_GUEST_HELPER_BYTES: u64 = 128 * 1024 * 1024;
 const GUEST_PACKAGE_EXECUTABLES: &[(&str, &str)] = &[
     ("bubblewrap", GUEST_BWRAP),
@@ -228,6 +238,9 @@ trait SetupProbes {
     fn output(&self, program: &Path, args: &[OsString]) -> std::io::Result<ProbeOutput>;
     fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
     fn openat2_available(&self) -> std::result::Result<bool, String>;
+    fn linux_namespace_available(&self, bwrap: &Path) -> std::result::Result<bool, String>;
+    fn linux_cgroup_available(&self, helper: &Path) -> std::result::Result<bool, String>;
+    fn glibc_version(&self) -> std::result::Result<Option<String>, String>;
     fn snapshot_guest_helper(
         &self,
         artifact: &Path,
@@ -273,6 +286,19 @@ impl SetupProbes for SystemProbes {
         probe_openat2()
     }
 
+    fn linux_namespace_available(&self, bwrap: &Path) -> std::result::Result<bool, String> {
+        linux_namespace_probe_available(bwrap).map_err(|error| format!("{error:#}"))
+    }
+
+    fn linux_cgroup_available(&self, helper: &Path) -> std::result::Result<bool, String> {
+        linux_cgroup_probe_available(ResourceLimits::default(), helper)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn glibc_version(&self) -> std::result::Result<Option<String>, String> {
+        probe_glibc_version()
+    }
+
     fn snapshot_guest_helper(
         &self,
         artifact: &Path,
@@ -304,6 +330,7 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
     validate_lima_instance(&args.lima_instance)?;
     let backend: BackendKind = args.backend.into();
     let backend = backend.resolve()?;
+    validate_setup_cgroup_target(backend, args.require_cgroup)?;
     let paths = SetupPaths::discover()?;
     let probes = SystemProbes;
 
@@ -326,6 +353,12 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
     } else if args.install_guest_packages {
         if let Some(action) =
             run_install_guest_packages(&probes, backend, &args.lima_instance, args.yes, args.json)?
+        {
+            actions.push(action);
+        }
+    } else if args.install_linux_packages {
+        if let Some(action) =
+            run_install_linux_packages(&probes, backend, args.yes, args.json, args.require_cgroup)?
         {
             actions.push(action);
         }
@@ -368,14 +401,26 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
         }
     }
 
-    let initial = diagnose(&probes, backend, &args.lima_instance, &paths)?;
+    let initial = diagnose(
+        &probes,
+        backend,
+        &args.lima_instance,
+        &paths,
+        args.require_cgroup,
+    )?;
     if !args.check {
         actions.extend(apply_safe_repairs(&initial, &paths)?);
     }
     let mut report = if actions.is_empty() {
         initial
     } else {
-        diagnose(&probes, backend, &args.lima_instance, &paths)?
+        diagnose(
+            &probes,
+            backend,
+            &args.lima_instance,
+            &paths,
+            args.require_cgroup,
+        )?
     };
     report.actions_taken = actions;
     report = report.finish();
@@ -385,6 +430,13 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
         render_human(&report, args.check);
     }
     Ok(report.exit_code())
+}
+
+fn validate_setup_cgroup_target(backend: BackendKind, require_cgroup: bool) -> Result<()> {
+    if require_cgroup && backend != BackendKind::LinuxBwrap {
+        bail!("--require-cgroup is supported only by the Linux Bubblewrap setup backend");
+    }
+    Ok(())
 }
 
 /// Resolve the mutating create-instance request into an optional recorded action.
@@ -467,6 +519,383 @@ fn run_install_guest_packages(
     }
     validate_instance_action_target("--install-guest-packages", backend, std::env::consts::OS)?;
     install_lima_guest_packages(probes, instance, assume_yes)
+}
+
+/// Resolve the one explicitly privileged Linux-host setup action.
+///
+/// The action is intentionally narrower than a general installer: it supports only Ubuntu 24.04
+/// on the release architectures, installs three fixed repository package names, and never changes
+/// user-namespace, AppArmor, setuid, systemd, or cgroup policy. Machine-readable mode requires
+/// explicit non-interactive confirmation before any inspection subprocess is launched.
+fn run_install_linux_packages(
+    probes: &dyn SetupProbes,
+    backend: BackendKind,
+    assume_yes: bool,
+    json: bool,
+    require_cgroup: bool,
+) -> Result<Option<String>> {
+    if json && !assume_yes {
+        bail!(
+            "--install-linux-packages with --json requires --yes so machine-readable output is never mixed with an interactive prompt"
+        );
+    }
+    validate_linux_package_target(
+        backend,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        current_uid(),
+    )?;
+    install_linux_packages(probes, assume_yes, require_cgroup)
+}
+
+fn validate_linux_package_target(
+    backend: BackendKind,
+    host_os: &str,
+    host_arch: &str,
+    uid: u32,
+) -> Result<()> {
+    if host_os != "linux" {
+        bail!("--install-linux-packages is only supported on Linux; detected {host_os:?}");
+    }
+    if backend != BackendKind::LinuxBwrap {
+        bail!(
+            "--install-linux-packages is only supported on the Linux Bubblewrap backend; the resolved backend is {}",
+            backend_label(backend)
+        );
+    }
+    if !matches!(host_arch, "x86_64" | "aarch64") {
+        bail!(
+            "--install-linux-packages supports only x86_64 and aarch64 Ubuntu hosts; detected {host_arch:?}"
+        );
+    }
+    if uid == 0 {
+        bail!(
+            "--install-linux-packages must be run as a non-root owner; Guard invokes fixed host sudo only after confirmation"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MissingLinuxArtifact {
+    package: &'static str,
+    path: &'static str,
+}
+
+fn install_linux_packages(
+    probes: &dyn SetupProbes,
+    assume_yes: bool,
+    require_cgroup: bool,
+) -> Result<Option<String>> {
+    require_supported_ubuntu(probes, "before inspection")?;
+    let missing = missing_linux_runtime_artifacts(probes)?;
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    require_linux_installer_prerequisites(probes)?;
+    require_linux_cgroup_for_install(probes, require_cgroup, "before confirmation")?;
+    confirm_linux_package_install(&missing, assume_yes)?;
+
+    require_supported_ubuntu(probes, "immediately before apt-get update")?;
+    require_linux_installer_prerequisites(probes)?;
+    require_linux_cgroup_for_install(probes, require_cgroup, "immediately before apt-get update")?;
+    let missing = missing_linux_runtime_artifacts(probes)?;
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    run_linux_apt(probes, &[])?;
+
+    require_supported_ubuntu(probes, "between apt-get update and install")?;
+    require_linux_installer_prerequisites(probes)?;
+    require_linux_cgroup_for_install(probes, require_cgroup, "between update and install")?;
+    let missing = missing_linux_runtime_artifacts(probes)?;
+    let packages: Vec<_> = missing.iter().map(|artifact| artifact.package).collect();
+    if packages.is_empty() {
+        return Ok(Some(
+            "updated Ubuntu package metadata; required Linux runtime artifacts are now present"
+                .to_owned(),
+        ));
+    }
+    run_linux_apt(probes, &packages)?;
+
+    require_supported_ubuntu(probes, "after package installation")?;
+    require_linux_installer_prerequisites(probes)?;
+    require_linux_cgroup_for_install(probes, require_cgroup, "after package installation")?;
+    let missing = missing_linux_runtime_artifacts(probes)?;
+    if !missing.is_empty() {
+        bail!(
+            "Linux package installation completed but required artifacts are still missing ({}); inspect the host manually. Guard will not change namespace, AppArmor, setuid, systemd, or cgroup policy",
+            missing
+                .iter()
+                .map(|artifact| artifact.path)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(Some(format!(
+        "installed and verified Linux runtime packages: {}",
+        packages.join(", ")
+    )))
+}
+
+fn require_supported_ubuntu(probes: &dyn SetupProbes, phase: &str) -> Result<()> {
+    refuse_wsl_or_container(probes, phase)?;
+    let text = probes
+        .read_to_string(Path::new(HOST_OS_RELEASE))
+        .with_context(|| format!("read {HOST_OS_RELEASE} {phase}"))?;
+    let id = strict_os_release_value(&text, "ID", phase)?;
+    let version_id = strict_os_release_value(&text, "VERSION_ID", phase)?;
+    if id.as_deref() != Some("ubuntu") || version_id.as_deref() != Some("24.04") {
+        bail!(
+            "--install-linux-packages supports only Ubuntu 24.04; observed ID={:?} VERSION_ID={:?} {phase}",
+            id.as_deref(),
+            version_id.as_deref()
+        );
+    }
+    Ok(())
+}
+
+fn strict_os_release_value(text: &str, wanted: &str, phase: &str) -> Result<Option<String>> {
+    let mut result = None;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw)) = line.split_once('=') else {
+            if line == wanted || line.starts_with(&format!("{wanted} ")) {
+                bail!(
+                    "{HOST_OS_RELEASE} contains malformed {wanted} at line {} {phase}",
+                    index + 1
+                );
+            }
+            continue;
+        };
+        if key != wanted {
+            continue;
+        }
+        if result.is_some() {
+            bail!("{HOST_OS_RELEASE} contains duplicate {wanted} fields {phase}");
+        }
+        let value = if let Some(quoted) = raw.strip_prefix('"') {
+            let Some(value) = quoted.strip_suffix('"') else {
+                bail!("{HOST_OS_RELEASE} contains unterminated {wanted} quoting {phase}");
+            };
+            if value.contains(['\\', '"']) {
+                bail!("{HOST_OS_RELEASE} contains escaped or nested {wanted} quoting {phase}");
+            }
+            value
+        } else {
+            if raw.contains(['"', '\'', '\\'])
+                || !raw
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+            {
+                bail!("{HOST_OS_RELEASE} contains unsafe unquoted {wanted} syntax {phase}");
+            }
+            raw
+        };
+        if value.is_empty() || value.chars().any(char::is_control) {
+            bail!("{HOST_OS_RELEASE} contains an invalid empty/control {wanted} value {phase}");
+        }
+        result = Some(value.to_owned());
+    }
+    Ok(result)
+}
+
+fn refuse_wsl_or_container(probes: &dyn SetupProbes, phase: &str) -> Result<()> {
+    let kernel = probes
+        .read_to_string(Path::new("/proc/sys/kernel/osrelease"))
+        .with_context(|| format!("read Linux kernel release {phase}"))?;
+    let lower = kernel.to_ascii_lowercase();
+    if lower.contains("microsoft") || lower.contains("wsl") {
+        bail!(
+            "--install-linux-packages refuses WSL hosts because their namespace/cgroup policy is not the qualified Ubuntu 24.04 host boundary {phase}"
+        );
+    }
+    let cgroup = probes
+        .read_to_string(Path::new("/proc/1/cgroup"))
+        .with_context(|| format!("read pid-1 cgroup membership {phase}"))?;
+    let lower = cgroup.to_ascii_lowercase();
+    if ["/docker/", "kubepods", "containerd", "/lxc/", "/podman/"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        bail!(
+            "--install-linux-packages refuses containerized hosts; install host packages from the real Ubuntu 24.04 owner session {phase}"
+        );
+    }
+    for path in [
+        "/.dockerenv",
+        "/run/.containerenv",
+        "/run/systemd/container",
+    ] {
+        match probes.read_to_string(Path::new(path)) {
+            Ok(_) => bail!(
+                "--install-linux-packages refuses a container marker at {path}; install host packages outside the container {phase}"
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => bail!("could not inspect container marker {path} {phase}: {error}"),
+        }
+    }
+    Ok(())
+}
+
+fn missing_linux_runtime_artifacts(probes: &dyn SetupProbes) -> Result<Vec<MissingLinuxArtifact>> {
+    let mut missing = Vec::new();
+    for (package, flag, path) in [
+        ("bubblewrap", "-x", HOST_BWRAP),
+        ("git", "-x", HOST_GIT),
+        ("ca-certificates", "-s", HOST_CA_BUNDLE),
+    ] {
+        let args = [OsString::from(flag), OsString::from(path)];
+        match probes.output(Path::new(HOST_TEST), &args) {
+            Ok(output) if output.success => {}
+            Ok(_) => missing.push(MissingLinuxArtifact { package, path }),
+            Err(error) => bail!("could not inspect {path} with {HOST_TEST}: {error}"),
+        }
+    }
+    Ok(missing)
+}
+
+fn require_linux_cgroup_for_install(
+    probes: &dyn SetupProbes,
+    required: bool,
+    phase: &str,
+) -> Result<()> {
+    if !required {
+        return Ok(());
+    }
+    let helper = require_matching_host_helper(probes, phase)?;
+    match probes.linux_cgroup_available(&helper) {
+        Ok(true) => Ok(()),
+        Ok(false) => bail!(
+            "required cgroup-v2 delegation probe failed {phase}; Guard will not install packages and silently downgrade required mode"
+        ),
+        Err(error) => bail!(
+            "could not execute the required cgroup probe {phase}: {}",
+            sanitize_terminal_fragment(&error)
+        ),
+    }
+}
+
+fn require_matching_host_helper(probes: &dyn SetupProbes, phase: &str) -> Result<PathBuf> {
+    let helper = probes
+        .host_helper_path()
+        .ok_or_else(|| anyhow!("required cgroup probe cannot run without guard-helper {phase}"))?;
+    let args = [OsString::from("--version")];
+    match probes.output(&helper, &args) {
+        Ok(output) if output.success => {
+            let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let expected = format!("guard-helper {}", env!("CARGO_PKG_VERSION"));
+            if actual != expected {
+                bail!(
+                    "required cgroup probe refuses mismatched guard-helper {phase}: expected {expected:?}, got {:?}",
+                    sanitize_terminal_fragment(&actual)
+                );
+            }
+            Ok(helper)
+        }
+        Ok(output) => bail!(
+            "required cgroup probe could not verify guard-helper {phase}: {}",
+            concise_failure(&output)
+        ),
+        Err(error) => bail!(
+            "required cgroup probe could not execute guard-helper {} {phase}: {}",
+            safe_path_for_error(&helper),
+            sanitize_terminal_fragment(&error.to_string())
+        ),
+    }
+}
+
+fn require_linux_installer_prerequisites(probes: &dyn SetupProbes) -> Result<()> {
+    for path in [HOST_TEST, HOST_SUDO, HOST_ENV, HOST_APT_GET] {
+        let args = [OsString::from("-x"), OsString::from(path)];
+        match probes.output(Path::new(HOST_TEST), &args) {
+            Ok(output) if output.success => {}
+            Ok(_) => bail!(
+                "required fixed installer executable {path} is unavailable; Guard will not use a PATH fallback"
+            ),
+            Err(error) => bail!("could not inspect fixed installer executable {path}: {error}"),
+        }
+    }
+    Ok(())
+}
+
+fn confirm_linux_package_install(missing: &[MissingLinuxArtifact], assume_yes: bool) -> Result<()> {
+    if assume_yes {
+        return Ok(());
+    }
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        bail!(
+            "refusing to install host packages without an interactive terminal; rerun with --yes after reviewing the fixed sudo/apt action"
+        );
+    }
+    let phrase = "INSTALL LINUX PACKAGES ubuntu-24.04";
+    let packages = missing
+        .iter()
+        .map(|artifact| artifact.package)
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprint!(
+        "This will invoke host sudo and Ubuntu APT to reinstall the missing package subset: {packages}.\nType {phrase} to continue: "
+    );
+    io::stderr().flush().context("flush confirmation prompt")?;
+    let mut answer = String::new();
+    if io::stdin()
+        .read_line(&mut answer)
+        .context("read package-install confirmation")?
+        == 0
+    {
+        bail!("Linux package installation declined (end of input)");
+    }
+    if !linux_package_install_phrase_matches(&answer) {
+        bail!("Linux package installation declined; confirmation phrase did not match exactly");
+    }
+    Ok(())
+}
+
+fn linux_package_install_phrase_matches(answer: &str) -> bool {
+    answer.trim_end_matches(['\r', '\n']) == "INSTALL LINUX PACKAGES ubuntu-24.04"
+}
+
+fn run_linux_apt(probes: &dyn SetupProbes, packages: &[&str]) -> Result<()> {
+    let install = !packages.is_empty();
+    let mut args = vec![
+        OsString::from("--non-interactive"),
+        OsString::from("--"),
+        OsString::from(HOST_ENV),
+        OsString::from("-i"),
+        OsString::from("PATH=/usr/sbin:/usr/bin:/sbin:/bin"),
+        OsString::from("HOME=/root"),
+        OsString::from("DEBIAN_FRONTEND=noninteractive"),
+        OsString::from("APT_LISTCHANGES_FRONTEND=none"),
+        OsString::from("LANG=C.UTF-8"),
+        OsString::from("LC_ALL=C"),
+        OsString::from(HOST_APT_GET),
+    ];
+    if install {
+        args.extend(
+            ["install", "--yes", "--no-install-recommends", "--reinstall"]
+                .into_iter()
+                .map(OsString::from),
+        );
+        args.extend(packages.iter().copied().map(OsString::from));
+    } else {
+        args.push(OsString::from("update"));
+    }
+    match probes.output(Path::new(HOST_SUDO), &args) {
+        Ok(output) if output.success => Ok(()),
+        Ok(output) => bail!(
+            "host apt-get {} failed: {}. Partial repository/package state is left for manual inspection; Guard will not run cleanup or modify host policy",
+            if install { "install" } else { "update" },
+            concise_failure(&output)
+        ),
+        Err(error) => bail!(
+            "could not execute fixed host sudo for apt-get {}: {error}",
+            if install { "install" } else { "update" }
+        ),
+    }
 }
 
 fn run_install_guest_helper(
@@ -2778,6 +3207,7 @@ fn diagnose(
     backend: BackendKind,
     lima_instance: &str,
     paths: &SetupPaths,
+    require_cgroup: bool,
 ) -> Result<SetupReport> {
     let mut checks = Vec::new();
     checks.push(executable_check(
@@ -2810,7 +3240,7 @@ fn diagnose(
     }
 
     match backend {
-        BackendKind::LinuxBwrap => diagnose_linux(probes, &mut checks),
+        BackendKind::LinuxBwrap => diagnose_linux(probes, &mut checks, require_cgroup),
         BackendKind::MacosLima => {
             diagnose_macos(probes, &mut checks, lima_instance)?;
         }
@@ -2827,7 +3257,8 @@ fn diagnose(
     })
 }
 
-fn diagnose_linux(probes: &dyn SetupProbes, checks: &mut Vec<SetupCheck>) {
+fn diagnose_linux(probes: &dyn SetupProbes, checks: &mut Vec<SetupCheck>, require_cgroup: bool) {
+    let bwrap = probes.which("bwrap");
     checks.push(executable_check(
         probes,
         "linux.bwrap",
@@ -2841,6 +3272,75 @@ fn diagnose_linux(probes: &dyn SetupProbes, checks: &mut Vec<SetupCheck>) {
         ),
     ));
     checks.extend(host_helper_checks(probes));
+    checks.push(fixed_host_artifact_check(
+        probes,
+        "linux.env.fixed",
+        "linux-host",
+        HOST_ENV,
+        "-x",
+        "fixed clean-environment launcher is executable",
+        manual_repair(
+            "Restore the distribution-provided /usr/bin/env; Guard permits no PATH fallback at the bwrap boundary.",
+            &["sudo", "confirmation"],
+            &[],
+        ),
+    ));
+    checks.push(fixed_host_artifact_check(
+        probes,
+        "linux.ca-bundle",
+        "linux-host",
+        HOST_CA_BUNDLE,
+        "-s",
+        "system CA certificate bundle is present and nonempty",
+        platform_install_repair("ca-certificates"),
+    ));
+    checks.push(fixed_git_check(probes));
+    checks.push(glibc_check(probes));
+    let namespace_probe = bwrap
+        .as_deref()
+        .map(|path| probes.linux_namespace_available(path));
+    checks.push(match (bwrap.as_deref(), namespace_probe) {
+        (Some(path), Some(Ok(true))) => ok_path_check(
+            "linux.bwrap.namespace-probe",
+            "linux-kernel",
+            true,
+            "production-like Bubblewrap namespace probe succeeded".to_owned(),
+            path.to_path_buf(),
+        ),
+        (Some(path), Some(Ok(false))) => SetupCheck {
+            id: "linux.bwrap.namespace-probe".to_owned(),
+            component: "linux-kernel".to_owned(),
+            required: true,
+            status: CheckStatus::Misconfigured,
+            detail: "Bubblewrap is present but the production-like unprivileged namespace probe failed; Guard will not fall back to weaker isolation".to_owned(),
+            path: Some(path.to_path_buf()),
+            repair: Some(manual_repair(
+                "Restore unprivileged Bubblewrap operation under the distribution's kernel/AppArmor policy; Guard will not change sysctls, setuid bits, or AppArmor policy.",
+                &["sudo", "confirmation"],
+                &[],
+            )),
+        },
+        (Some(path), Some(Err(error))) => error_check(
+            "linux.bwrap.namespace-probe",
+            "linux-kernel",
+            true,
+            format!(
+                "could not execute the production-like Bubblewrap namespace probe through {}: {}",
+                safe_path_for_error(path),
+                sanitize_terminal_fragment(&error)
+            ),
+        ),
+        (None, None) => SetupCheck {
+            id: "linux.bwrap.namespace-probe".to_owned(),
+            component: "linux-kernel".to_owned(),
+            required: true,
+            status: CheckStatus::Missing,
+            detail: "Bubblewrap is absent, so the required namespace probe could not run".to_owned(),
+            path: None,
+            repair: Some(platform_install_repair("bubblewrap")),
+        },
+        _ => unreachable!("namespace probe presence follows the bwrap path"),
+    });
     checks.push(match probes.openat2_available() {
         Ok(true) => ok_check(
             "linux.openat2",
@@ -2908,18 +3408,61 @@ fn diagnose_linux(probes: &dyn SetupProbes, checks: &mut Vec<SetupCheck>) {
         ),
     });
 
-    checks.push(executable_check(
-        probes,
-        "linux.systemd-run",
-        "linux-cgroup",
-        "systemd-run",
-        false,
-        manual_repair(
-            "Install systemd-run only if cgroup-required mode is needed.",
-            &["sudo", "network"],
-            &[],
+    let cgroup_required = require_cgroup;
+    let cgroup_helper = probes.host_helper_path();
+    let cgroup_probe = cgroup_helper
+        .as_deref()
+        .map(|helper| probes.linux_cgroup_available(helper));
+    checks.push(match (cgroup_helper, cgroup_probe) {
+        (Some(helper), Some(Ok(true))) => ok_path_check(
+            "linux.cgroup-probe",
+            "linux-cgroup",
+            cgroup_required,
+            "transient cgroup-v2 probe enforced the production resource properties".to_owned(),
+            helper,
         ),
-    ));
+        (Some(_), Some(Ok(false))) => SetupCheck {
+            id: "linux.cgroup-probe".to_owned(),
+            component: "linux-cgroup".to_owned(),
+            required: cgroup_required,
+            status: CheckStatus::Missing,
+            detail: if cgroup_required {
+                "required cgroup-v2 user delegation probe failed; Guard will not downgrade to best-effort".to_owned()
+            } else {
+                "cgroup-v2 user delegation probe is unavailable; default runs retain rlimits and seccomp, while --cgroup required will fail closed".to_owned()
+            },
+            path: None,
+            repair: Some(manual_repair(
+                "Enable a delegated user systemd instance and verify it with guard test --require-cgroup; Guard will not change cgroup policy.",
+                &["sudo", "confirmation"],
+                &[],
+            )),
+        },
+        (Some(helper), Some(Err(error))) => error_check(
+            "linux.cgroup-probe",
+            "linux-cgroup",
+            cgroup_required,
+            format!(
+                "could not execute the production cgroup probe through {}: {}",
+                safe_path_for_error(&helper),
+                sanitize_terminal_fragment(&error)
+            ),
+        ),
+        (None, None) => SetupCheck {
+            id: "linux.cgroup-probe".to_owned(),
+            component: "linux-cgroup".to_owned(),
+            required: cgroup_required,
+            status: CheckStatus::Missing,
+            detail: "guard-helper is absent, so the production cgroup probe could not run".to_owned(),
+            path: None,
+            repair: Some(manual_repair(
+                "Install the matching guard-helper, then rerun guard setup --check.",
+                &["confirmation"],
+                &[],
+            )),
+        },
+        _ => unreachable!("cgroup probe presence follows the helper path"),
+    });
     checks.push(executable_check(
         probes,
         "linux.zenity",
@@ -3314,6 +3857,166 @@ fn executable_check(
             repair: Some(repair),
         },
     }
+}
+
+fn fixed_host_artifact_check(
+    probes: &dyn SetupProbes,
+    id: &str,
+    component: &str,
+    path: &str,
+    test_flag: &str,
+    ok_detail: &str,
+    repair: Repair,
+) -> SetupCheck {
+    let args = [OsString::from(test_flag), OsString::from(path)];
+    match probes.output(Path::new(HOST_TEST), &args) {
+        Ok(output) if output.success => ok_path_check(
+            id,
+            component,
+            true,
+            ok_detail.to_owned(),
+            PathBuf::from(path),
+        ),
+        Ok(_) => SetupCheck {
+            id: id.to_owned(),
+            component: component.to_owned(),
+            required: true,
+            status: CheckStatus::Missing,
+            detail: format!("required fixed host artifact {path} is unavailable"),
+            path: Some(PathBuf::from(path)),
+            repair: Some(repair),
+        },
+        Err(error) => error_check(
+            id,
+            component,
+            true,
+            format!("could not inspect required fixed host artifact {path}: {error}"),
+        ),
+    }
+}
+
+fn glibc_check(probes: &dyn SetupProbes) -> SetupCheck {
+    match probes.glibc_version() {
+        Ok(Some(text)) => match parse_glibc_version(&text) {
+            Some((major, minor)) if (major, minor) >= (2, 39) => ok_check(
+                    "linux.glibc",
+                    "linux-host",
+                    true,
+                    format!("glibc {major}.{minor} satisfies the release runtime minimum"),
+            ),
+                Some((major, minor)) => SetupCheck {
+                    id: "linux.glibc".to_owned(),
+                    component: "linux-host".to_owned(),
+                    required: true,
+                    status: CheckStatus::Mismatch,
+                    detail: format!(
+                        "glibc {major}.{minor} is older than the required release runtime 2.39"
+                    ),
+                    path: None,
+                    repair: Some(manual_repair(
+                        "Use Ubuntu 24.04 or another supported host providing glibc 2.39 or newer.",
+                        &["confirmation"],
+                        &[],
+                    )),
+                },
+                None => error_check(
+                    "linux.glibc",
+                    "linux-host",
+                    true,
+                    format!(
+                        "could not parse glibc version from {}",
+                        sanitize_terminal_fragment(text.trim())
+                    ),
+                ),
+            },
+        Ok(None) => SetupCheck {
+            id: "linux.glibc".to_owned(),
+            component: "linux-host".to_owned(),
+            required: true,
+            status: CheckStatus::Missing,
+            detail: "the running host does not expose GNU libc; release binaries require glibc 2.39 or newer".to_owned(),
+            path: None,
+            repair: Some(manual_repair(
+                "Use Ubuntu 24.04 or another supported GNU/Linux host providing glibc 2.39 or newer.",
+                &["confirmation"],
+                &[],
+            )),
+        },
+        Err(error) => error_check(
+            "linux.glibc",
+            "linux-host",
+            true,
+            format!("could not query the running GNU libc version: {error}"),
+        ),
+    }
+}
+
+fn fixed_git_check(probes: &dyn SetupProbes) -> SetupCheck {
+    let executable = [OsString::from("-x"), OsString::from(HOST_GIT)];
+    match probes.output(Path::new(HOST_TEST), &executable) {
+        Ok(output) if output.success => {}
+        Ok(_) => {
+            return SetupCheck {
+                id: "linux.git.fixed".to_owned(),
+                component: "linux-host".to_owned(),
+                required: true,
+                status: CheckStatus::Missing,
+                detail: format!("required fixed Git executable {HOST_GIT} is unavailable"),
+                path: Some(PathBuf::from(HOST_GIT)),
+                repair: Some(platform_install_repair("git")),
+            };
+        }
+        Err(error) => {
+            return error_check(
+                "linux.git.fixed",
+                "linux-host",
+                true,
+                format!("could not inspect {HOST_GIT}: {error}"),
+            );
+        }
+    }
+    let args = [OsString::from("--version")];
+    match probes.output(Path::new(HOST_GIT), &args) {
+        Ok(output) if output.success => ok_path_check(
+            "linux.git.fixed",
+            "linux-host",
+            true,
+            format!(
+                "fixed Git executable works ({})",
+                concise_output(&output.stdout)
+            ),
+            PathBuf::from(HOST_GIT),
+        ),
+        Ok(output) => SetupCheck {
+            id: "linux.git.fixed".to_owned(),
+            component: "linux-host".to_owned(),
+            required: true,
+            status: CheckStatus::Misconfigured,
+            detail: format!("{HOST_GIT} exists but failed: {}", concise_failure(&output)),
+            path: Some(PathBuf::from(HOST_GIT)),
+            repair: Some(platform_install_repair("git")),
+        },
+        Err(error) => error_check(
+            "linux.git.fixed",
+            "linux-host",
+            true,
+            format!("could not execute {HOST_GIT}: {error}"),
+        ),
+    }
+}
+
+fn parse_glibc_version(text: &str) -> Option<(u64, u64)> {
+    text.lines()
+        .next()?
+        .split_ascii_whitespace()
+        .rev()
+        .find_map(|token| {
+            let token = token
+                .trim_matches(|character: char| !character.is_ascii_digit() && character != '.');
+            let (major, rest) = token.split_once('.')?;
+            let minor = rest.split('.').next()?;
+            Some((major.parse().ok()?, minor.parse().ok()?))
+        })
 }
 
 fn host_helper_checks(probes: &dyn SetupProbes) -> Vec<SetupCheck> {
@@ -3908,6 +4611,27 @@ fn probe_openat2() -> std::result::Result<bool, String> {
     Ok(false)
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn probe_glibc_version() -> std::result::Result<Option<String>, String> {
+    use std::ffi::CStr;
+
+    // SAFETY: glibc returns a process-lifetime NUL-terminated version string.
+    let pointer = unsafe { libc::gnu_get_libc_version() };
+    if pointer.is_null() {
+        return Err("gnu_get_libc_version returned a null pointer".to_owned());
+    }
+    // SAFETY: the non-null pointer above is documented by glibc as a NUL-terminated string.
+    let version = unsafe { CStr::from_ptr(pointer) }
+        .to_str()
+        .map_err(|error| format!("glibc returned a non-UTF-8 version: {error}"))?;
+    Ok(Some(version.to_owned()))
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn probe_glibc_version() -> std::result::Result<Option<String>, String> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3924,9 +4648,16 @@ mod tests {
         host_helper: Option<PathBuf>,
         outputs: BTreeMap<String, ProbeOutput>,
         queued_outputs: RefCell<BTreeMap<String, VecDeque<ProbeOutput>>>,
+        queued_files: RefCell<BTreeMap<PathBuf, VecDeque<String>>>,
         calls: RefCell<Vec<String>>,
         files: BTreeMap<PathBuf, String>,
         openat2: bool,
+        linux_namespace: bool,
+        linux_cgroup: bool,
+        linux_namespace_error: Option<String>,
+        linux_cgroup_error: Option<String>,
+        glibc_version: Option<String>,
+        glibc_error: Option<String>,
         snapshot_path: Option<PathBuf>,
         snapshot_error: Option<String>,
         helper_temp_path: Option<String>,
@@ -3962,6 +4693,14 @@ mod tests {
         }
 
         fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
+            if let Some(value) = self
+                .queued_files
+                .borrow_mut()
+                .get_mut(path)
+                .and_then(VecDeque::pop_front)
+            {
+                return Ok(value);
+            }
             self.files.get(path).cloned().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, "missing fake file")
             })
@@ -3969,6 +4708,30 @@ mod tests {
 
         fn openat2_available(&self) -> std::result::Result<bool, String> {
             Ok(self.openat2)
+        }
+
+        fn linux_namespace_available(&self, bwrap: &Path) -> std::result::Result<bool, String> {
+            self.calls
+                .borrow_mut()
+                .push(format!("linux-namespace {}", bwrap.display()));
+            self.linux_namespace_error
+                .as_ref()
+                .map_or(Ok(self.linux_namespace), |error| Err(error.clone()))
+        }
+
+        fn linux_cgroup_available(&self, helper: &Path) -> std::result::Result<bool, String> {
+            self.calls
+                .borrow_mut()
+                .push(format!("linux-cgroup {}", helper.display()));
+            self.linux_cgroup_error
+                .as_ref()
+                .map_or(Ok(self.linux_cgroup), |error| Err(error.clone()))
+        }
+
+        fn glibc_version(&self) -> std::result::Result<Option<String>, String> {
+            self.glibc_error
+                .as_ref()
+                .map_or(Ok(self.glibc_version.clone()), |error| Err(error.clone()))
         }
 
         fn snapshot_guest_helper(
@@ -4133,9 +4896,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = private_paths(&temp);
         let probes = FakeProbes::default();
-        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
-            .unwrap()
-            .finish();
+        let report = diagnose(
+            &probes,
+            BackendKind::MacosLima,
+            "sandbox-guard",
+            &paths,
+            false,
+        )
+        .unwrap()
+        .finish();
         assert!(!report.ready);
         for (_, path) in paths.private_directories() {
             assert!(!path.exists());
@@ -4218,9 +4987,15 @@ mod tests {
             output(false, "", "missing"),
         );
 
-        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
-            .unwrap()
-            .finish();
+        let report = diagnose(
+            &probes,
+            BackendKind::MacosLima,
+            "sandbox-guard",
+            &paths,
+            false,
+        )
+        .unwrap()
+        .finish();
         let mount = report
             .checks
             .iter()
@@ -4261,9 +5036,15 @@ mod tests {
                 "",
             ),
         );
-        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
-            .unwrap()
-            .finish();
+        let report = diagnose(
+            &probes,
+            BackendKind::MacosLima,
+            "sandbox-guard",
+            &paths,
+            false,
+        )
+        .unwrap()
+        .finish();
         let mount = report
             .checks
             .iter()
@@ -4312,9 +5093,15 @@ mod tests {
             ),
             output(true, r#"{"status":"Stopped"}"#, ""),
         );
-        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
-            .unwrap()
-            .finish();
+        let report = diagnose(
+            &probes,
+            BackendKind::MacosLima,
+            "sandbox-guard",
+            &paths,
+            false,
+        )
+        .unwrap()
+        .finish();
         let mount = report
             .checks
             .iter()
@@ -4350,9 +5137,15 @@ mod tests {
             ),
             output(true, r#"{"status":"Stopped","config":{"mounts":[]}}"#, ""),
         );
-        let report = diagnose(&probes, BackendKind::MacosLima, "sandbox-guard", &paths)
-            .unwrap()
-            .finish();
+        let report = diagnose(
+            &probes,
+            BackendKind::MacosLima,
+            "sandbox-guard",
+            &paths,
+            false,
+        )
+        .unwrap()
+        .finish();
         assert!(!report.ready);
         assert!(
             probes
@@ -4410,6 +5203,9 @@ mod tests {
         let mut probes = FakeProbes {
             host_helper: Some(helper.clone()),
             openat2: true,
+            linux_namespace: true,
+            linux_cgroup: true,
+            glibc_version: Some("2.39".to_owned()),
             ..FakeProbes::default()
         };
         probes
@@ -4430,9 +5226,28 @@ mod tests {
                 "",
             ),
         );
-        let report = diagnose(&probes, BackendKind::LinuxBwrap, "sandbox-guard", &paths)
-            .unwrap()
-            .finish();
+        for (flag, path) in [("-x", HOST_ENV), ("-s", HOST_CA_BUNDLE), ("-x", HOST_GIT)] {
+            probes.outputs.insert(
+                command_key(
+                    Path::new(HOST_TEST),
+                    &[OsString::from(flag), OsString::from(path)],
+                ),
+                output(true, "", ""),
+            );
+        }
+        probes.outputs.insert(
+            command_key(Path::new(HOST_GIT), &[OsString::from("--version")]),
+            output(true, "git version 2.43.0\n", ""),
+        );
+        let report = diagnose(
+            &probes,
+            BackendKind::LinuxBwrap,
+            "sandbox-guard",
+            &paths,
+            false,
+        )
+        .unwrap()
+        .finish();
         assert!(report.ready);
         assert_eq!(report.exit_code(), 0);
         assert!(
@@ -4453,6 +5268,21 @@ mod tests {
                 .iter()
                 .any(|check| check.id == "linux.userns" && check.status == CheckStatus::Ok)
         );
+
+        probes.linux_cgroup_error = Some("systemd transport failed".to_owned());
+        let required = diagnose(
+            &probes,
+            BackendKind::LinuxBwrap,
+            "sandbox-guard",
+            &paths,
+            true,
+        )
+        .unwrap()
+        .finish();
+        assert_eq!(required.exit_code(), 3);
+        assert!(required.checks.iter().any(|check| {
+            check.id == "linux.cgroup-probe" && check.required && check.status == CheckStatus::Error
+        }));
     }
 
     // ---- explicit Lima instance creation ----
@@ -6050,6 +6880,17 @@ mod tests {
     #[test]
     fn clap_conflicts_create_instance_with_check() {
         assert!(Cli::try_parse_from(["guard", "setup", "--check"]).is_ok());
+        assert!(Cli::try_parse_from(["guard", "setup", "--check", "--require-cgroup"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "guard",
+                "setup",
+                "--install-linux-packages",
+                "--require-cgroup",
+                "--yes",
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["guard", "setup", "--create-instance", "--yes"]).is_ok());
         assert!(Cli::try_parse_from(["guard", "setup", "--start-instance", "--yes"]).is_ok());
         assert!(
@@ -6098,6 +6939,7 @@ mod tests {
             "--create-instance",
             "--start-instance",
             "--install-guest-packages",
+            "--install-linux-packages",
         ] {
             assert!(
                 Cli::try_parse_from([
@@ -6121,6 +6963,18 @@ mod tests {
             ])
             .is_err()
         );
+        for action in [
+            "--create-instance",
+            "--start-instance",
+            "--install-guest-packages",
+            "--install-guest-helper",
+        ] {
+            let mut argv = vec!["guard", "setup", action, "--install-linux-packages"];
+            if action == "--install-guest-helper" {
+                argv.extend(["guard-helper", "--guest-helper-sha256", HELPER_SHA256]);
+            }
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
         // `--yes` is deliberately inert without an explicit action, which lets future setup
         // actions reuse the confirmation flag without widening any current command path.
         assert!(Cli::try_parse_from(["guard", "setup", "--yes"]).is_ok());
@@ -7106,6 +7960,290 @@ mod tests {
         std::os::unix::fs::symlink(&target, &alias).unwrap();
         assert!(create_guest_tool_snapshot_in(b"artifact", b"receipt", &alias).is_err());
         assert!(fs::read_dir(&target).unwrap().next().is_none());
+    }
+
+    fn linux_package_probes() -> FakeProbes {
+        let mut probes = FakeProbes::default();
+        probes.files.insert(
+            PathBuf::from(HOST_OS_RELEASE),
+            "NAME=Ubuntu\nID=ubuntu\nVERSION_ID=\"24.04\"\n".to_owned(),
+        );
+        probes.files.insert(
+            PathBuf::from("/proc/sys/kernel/osrelease"),
+            "6.8.0-60-generic\n".to_owned(),
+        );
+        probes.files.insert(
+            PathBuf::from("/proc/1/cgroup"),
+            "0::/user.slice\n".to_owned(),
+        );
+        for (flag, path) in [
+            ("-x", HOST_BWRAP),
+            ("-x", HOST_GIT),
+            ("-s", HOST_CA_BUNDLE),
+            ("-x", HOST_TEST),
+            ("-x", HOST_SUDO),
+            ("-x", HOST_ENV),
+            ("-x", HOST_APT_GET),
+        ] {
+            probes.outputs.insert(
+                command_key(
+                    Path::new(HOST_TEST),
+                    &[OsString::from(flag), OsString::from(path)],
+                ),
+                output(true, "", ""),
+            );
+        }
+        probes
+    }
+
+    fn queue_linux_artifact(probes: &FakeProbes, flag: &str, path: &str, values: &[bool]) {
+        probes.queued_outputs.borrow_mut().insert(
+            command_key(
+                Path::new(HOST_TEST),
+                &[OsString::from(flag), OsString::from(path)],
+            ),
+            values
+                .iter()
+                .map(|success| output(*success, "", ""))
+                .collect(),
+        );
+    }
+
+    const APT_UPDATE_KEY: &str = "/usr/bin/sudo --non-interactive -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LANG=C.UTF-8 LC_ALL=C /usr/bin/apt-get update";
+    const APT_BWRAP_KEY: &str = "/usr/bin/sudo --non-interactive -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LANG=C.UTF-8 LC_ALL=C /usr/bin/apt-get install --yes --no-install-recommends --reinstall bubblewrap";
+
+    #[test]
+    fn complete_linux_package_set_is_an_idempotent_noop_before_confirmation() {
+        let probes = linux_package_probes();
+        assert_eq!(install_linux_packages(&probes, false, false).unwrap(), None);
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.starts_with(HOST_SUDO))
+        );
+    }
+
+    #[test]
+    fn missing_linux_subset_is_installed_with_fixed_host_argv_and_revalidated() {
+        let mut probes = linux_package_probes();
+        queue_linux_artifact(&probes, "-x", HOST_BWRAP, &[false, false, false, true]);
+        probes
+            .outputs
+            .insert(APT_UPDATE_KEY.to_owned(), output(true, "updated", ""));
+        probes
+            .outputs
+            .insert(APT_BWRAP_KEY.to_owned(), output(true, "installed", ""));
+
+        let action = install_linux_packages(&probes, true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            action,
+            "installed and verified Linux runtime packages: bubblewrap"
+        );
+        let calls = probes.calls.borrow();
+        assert_eq!(
+            calls.iter().filter(|call| *call == APT_UPDATE_KEY).count(),
+            1
+        );
+        assert_eq!(
+            calls.iter().filter(|call| *call == APT_BWRAP_KEY).count(),
+            1
+        );
+        assert!(calls.iter().all(|call| {
+            !call.contains(" sysctl")
+                && !call.contains(" setcap")
+                && !call.contains(" chmod u+s")
+                && !call.contains(" apparmor")
+                && !call.contains(" systemctl")
+                && !call.contains("guard-helper")
+        }));
+    }
+
+    #[test]
+    fn linux_distribution_race_after_update_aborts_before_install() {
+        let mut probes = linux_package_probes();
+        queue_linux_artifact(&probes, "-x", HOST_BWRAP, &[false, false]);
+        probes.queued_files.borrow_mut().insert(
+            PathBuf::from(HOST_OS_RELEASE),
+            [
+                "ID=ubuntu\nVERSION_ID=24.04\n",
+                "ID=ubuntu\nVERSION_ID=24.04\n",
+                "ID=debian\nVERSION_ID=12\n",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        );
+        probes
+            .outputs
+            .insert(APT_UPDATE_KEY.to_owned(), output(true, "updated", ""));
+
+        let error = install_linux_packages(&probes, true, false).unwrap_err();
+        assert!(format!("{error:#}").contains("Ubuntu 24.04"));
+        let calls = probes.calls.borrow();
+        assert!(calls.iter().any(|call| call == APT_UPDATE_KEY));
+        assert!(calls.iter().all(|call| !call.contains(" apt-get install ")));
+    }
+
+    #[test]
+    fn required_cgroup_failure_prevents_linux_package_mutation() {
+        let mut probes = linux_package_probes();
+        let helper = PathBuf::from("/opt/guard/guard-helper");
+        probes.host_helper = Some(helper.clone());
+        probes.outputs.insert(
+            command_key(&helper, &[OsString::from("--version")]),
+            output(
+                true,
+                &format!("guard-helper {}\n", env!("CARGO_PKG_VERSION")),
+                "",
+            ),
+        );
+        queue_linux_artifact(&probes, "-x", HOST_BWRAP, &[false]);
+
+        let error = install_linux_packages(&probes, true, true).unwrap_err();
+        assert!(format!("{error:#}").contains("will not install packages"));
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.starts_with(HOST_SUDO))
+        );
+    }
+
+    #[test]
+    fn required_cgroup_is_revalidated_around_linux_package_mutations() {
+        let mut probes = linux_package_probes();
+        let helper = PathBuf::from("/opt/guard/guard-helper");
+        probes.host_helper = Some(helper.clone());
+        probes.linux_cgroup = true;
+        probes.outputs.insert(
+            command_key(&helper, &[OsString::from("--version")]),
+            output(
+                true,
+                &format!("guard-helper {}\n", env!("CARGO_PKG_VERSION")),
+                "",
+            ),
+        );
+        queue_linux_artifact(&probes, "-x", HOST_BWRAP, &[false, false, false, true]);
+        probes
+            .outputs
+            .insert(APT_UPDATE_KEY.to_owned(), output(true, "updated", ""));
+        probes
+            .outputs
+            .insert(APT_BWRAP_KEY.to_owned(), output(true, "installed", ""));
+
+        install_linux_packages(&probes, true, true).unwrap();
+        assert_eq!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.as_str() == "linux-cgroup /opt/guard/guard-helper")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn host_apt_failure_is_terminal_safe_and_never_runs_install_or_cleanup() {
+        let mut probes = linux_package_probes();
+        queue_linux_artifact(&probes, "-x", HOST_BWRAP, &[false, false]);
+        probes.outputs.insert(
+            APT_UPDATE_KEY.to_owned(),
+            output(false, "", "failed\x1b]0;owned\x07\u{202e}"),
+        );
+
+        let error = install_linux_packages(&probes, true, false).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(probes.calls.borrow().iter().all(|call| {
+            !call.contains(" apt-get install ")
+                && !call.contains(" autoremove")
+                && !call.contains(" apt-get clean")
+        }));
+    }
+
+    #[test]
+    fn linux_package_target_and_environment_classification_fail_closed() {
+        for (backend, os, arch, uid) in [
+            (BackendKind::MacosLima, "linux", "x86_64", 501),
+            (BackendKind::LinuxBwrap, "macos", "aarch64", 501),
+            (BackendKind::LinuxBwrap, "linux", "riscv64", 501),
+            (BackendKind::LinuxBwrap, "linux", "x86_64", 0),
+        ] {
+            assert!(validate_linux_package_target(backend, os, arch, uid).is_err());
+        }
+
+        let mut wsl = linux_package_probes();
+        wsl.files.insert(
+            PathBuf::from("/proc/sys/kernel/osrelease"),
+            "5.15.0-microsoft-standard-WSL2".to_owned(),
+        );
+        assert!(require_supported_ubuntu(&wsl, "test").is_err());
+
+        let mut container = linux_package_probes();
+        container
+            .files
+            .insert(PathBuf::from("/.dockerenv"), String::new());
+        assert!(require_supported_ubuntu(&container, "test").is_err());
+
+        for document in [
+            "ID ubuntu\nVERSION_ID=24.04\n",
+            "ID=ubuntu\nID=ubuntu\nVERSION_ID=24.04\n",
+            "ID=\"ubuntu\nVERSION_ID=24.04\n",
+            "ID=ubuntu\nVERSION_ID='24.04'\n",
+        ] {
+            let mut probes = linux_package_probes();
+            probes
+                .files
+                .insert(PathBuf::from(HOST_OS_RELEASE), document.to_owned());
+            assert!(require_supported_ubuntu(&probes, "test").is_err());
+        }
+    }
+
+    #[test]
+    fn json_linux_install_without_yes_is_rejected_before_probing() {
+        let probes = FakeProbes::default();
+        let error =
+            run_install_linux_packages(&probes, BackendKind::LinuxBwrap, false, true, false)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("--yes"));
+        assert!(probes.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn required_cgroup_setup_policy_rejects_non_linux_backends() {
+        assert!(validate_setup_cgroup_target(BackendKind::LinuxBwrap, true).is_ok());
+        assert!(validate_setup_cgroup_target(BackendKind::MacosLima, false).is_ok());
+        assert!(validate_setup_cgroup_target(BackendKind::MacosLima, true).is_err());
+    }
+
+    #[test]
+    fn linux_package_confirmation_and_glibc_parsing_are_exact() {
+        assert!(linux_package_install_phrase_matches(
+            "INSTALL LINUX PACKAGES ubuntu-24.04\n"
+        ));
+        assert!(linux_package_install_phrase_matches(
+            "INSTALL LINUX PACKAGES ubuntu-24.04\r\n"
+        ));
+        for value in [
+            "yes\n",
+            "INSTALL LINUX PACKAGES\n",
+            " INSTALL LINUX PACKAGES ubuntu-24.04\n",
+            "INSTALL LINUX PACKAGES ubuntu-24.04 \n",
+        ] {
+            assert!(!linux_package_install_phrase_matches(value));
+        }
+        assert_eq!(parse_glibc_version("2.39"), Some((2, 39)));
+        assert_eq!(parse_glibc_version("2.38.1"), Some((2, 38)));
+        assert_eq!(parse_glibc_version("musl"), None);
     }
 
     #[test]

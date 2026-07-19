@@ -14,8 +14,8 @@ use crate::approval::ApprovalController;
 use crate::clipboard::{INBOX_DIRECTORY, SANDBOX_INBOX, read_clipboard_image, write_private_image};
 use crate::terminal::{ClipboardPaste, run_interactive};
 use crate::{
-    BackendKind, CgroupMode, CommandPlan, NetworkMode, RunOutcome, RunRequest, RunnerError,
-    path_is_within,
+    BackendKind, CgroupMode, CommandPlan, NetworkMode, ResourceLimits, RunOutcome, RunRequest,
+    RunnerError, path_is_within,
 };
 
 pub(crate) const GUEST_RUNTIME: &str = "/run/sandbox-guard";
@@ -34,6 +34,77 @@ const GUEST_CLEAN_ENV: &str = "/usr/bin/env";
 const GUEST_BWRAP: &str = "/usr/bin/bwrap";
 
 pub struct LinuxBwrapRunner;
+
+/// Exercise the namespace/root-filesystem portion of the production Bubblewrap boundary.
+///
+/// Presence and `--version` checks do not establish that unprivileged user namespaces actually
+/// work under the host's kernel and distribution policy. This probe deliberately uses the same
+/// fixed clean-environment launcher and the production namespace/capability/root construction,
+/// then executes only `/usr/bin/true` inside the disposable sandbox.
+pub fn linux_namespace_probe_available(bwrap: &Path) -> Result<bool, RunnerError> {
+    let args = linux_namespace_probe_args();
+    Command::new(HOST_CLEAN_ENV)
+        .arg("-i")
+        .arg(bwrap)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .map_err(|source| RunnerError::Execute {
+            program: PathBuf::from(HOST_CLEAN_ENV),
+            source,
+        })
+}
+
+fn linux_namespace_probe_args() -> Vec<OsString> {
+    let mut args = Vec::new();
+    for value in [
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+        "--unshare-net",
+    ] {
+        push(&mut args, value);
+    }
+    push(&mut args, "--hostname");
+    push(&mut args, "sandbox-guard-probe");
+    push(&mut args, "--cap-drop");
+    push(&mut args, "ALL");
+    push(&mut args, "--clearenv");
+    push(&mut args, "--tmpfs");
+    push(&mut args, "/");
+    push(&mut args, "--proc");
+    push(&mut args, "/proc");
+    push(&mut args, "--dev");
+    push(&mut args, "/dev");
+    push(&mut args, "--tmpfs");
+    push(&mut args, "/tmp");
+    for directory in ["/home", "/home/guard", "/opt", "/run"] {
+        push(&mut args, "--dir");
+        push(&mut args, directory);
+    }
+    bind_if_present(&mut args, "/usr", "/usr");
+    bind_if_present(&mut args, "/bin", "/bin");
+    bind_if_present(&mut args, "/lib", "/lib");
+    bind_if_present(&mut args, "/lib64", "/lib64");
+    bind_if_present(&mut args, "/etc/ssl", "/etc/ssl");
+    for (name, value) in [
+        ("HOME", "/home/guard"),
+        ("PATH", "/usr/bin:/bin"),
+        ("LANG", "C.UTF-8"),
+    ] {
+        push(&mut args, "--setenv");
+        push(&mut args, name);
+        push(&mut args, value);
+    }
+    push(&mut args, "/usr/bin/true");
+    args
+}
 
 impl LinuxBwrapRunner {
     pub fn plan(request: &RunRequest) -> Result<CommandPlan, RunnerError> {
@@ -726,11 +797,13 @@ fn wrap_in_systemd_scope(
 }
 
 fn systemd_scope_args(request: &RunRequest) -> Vec<OsString> {
-    systemd_scope_args_for_unit(request, &format!("sandbox-guard-{}", request.run_id))
+    systemd_scope_args_for_unit(
+        request.resource_limits,
+        &format!("sandbox-guard-{}", request.run_id),
+    )
 }
 
-fn systemd_scope_args_for_unit(request: &RunRequest, unit: &str) -> Vec<OsString> {
-    let limits = request.resource_limits;
+fn systemd_scope_args_for_unit(limits: ResourceLimits, unit: &str) -> Vec<OsString> {
     let mut args = Vec::new();
     for value in ["--user", "--scope", "--quiet", "--collect"] {
         push(&mut args, value);
@@ -749,20 +822,44 @@ fn systemd_scope_args_for_unit(request: &RunRequest, unit: &str) -> Vec<OsString
     args
 }
 
-pub(crate) fn cgroup_probe_args(request: &RunRequest, helper: &Path) -> Vec<OsString> {
+fn cgroup_probe_args_for_limits(limits: ResourceLimits, helper: &Path) -> Vec<OsString> {
     let unit = format!("sandbox-guard-probe-{}", uuid::Uuid::new_v4());
-    let mut args = systemd_scope_args_for_unit(request, &unit);
+    let mut args = systemd_scope_args_for_unit(limits, &unit);
     args.push(helper.as_os_str().to_owned());
     push(&mut args, "cgroup-probe");
     for (name, value) in [
-        ("--memory-bytes", request.resource_limits.memory_bytes),
-        ("--max-processes", request.resource_limits.max_processes),
-        ("--cpu-percent", request.resource_limits.cpu_percent),
+        ("--memory-bytes", limits.memory_bytes),
+        ("--max-processes", limits.max_processes),
+        ("--cpu-percent", limits.cpu_percent),
     ] {
         push(&mut args, name);
         args.push(value.to_string().into());
     }
     args
+}
+
+pub(crate) fn cgroup_probe_args(request: &RunRequest, helper: &Path) -> Vec<OsString> {
+    cgroup_probe_args_for_limits(request.resource_limits, helper)
+}
+
+/// Run the exact transient cgroup-v2 probe used by the Linux execution backend.
+///
+/// Setup uses this public seam rather than maintaining a diagnostic approximation. A false result
+/// means required mode must fail closed; callers may choose whether unavailability is optional.
+pub fn linux_cgroup_probe_available(
+    limits: ResourceLimits,
+    helper: &Path,
+) -> Result<bool, RunnerError> {
+    let Some(program) = which::which("systemd-run").ok() else {
+        return Ok(false);
+    };
+    Command::new(&program)
+        .args(cgroup_probe_args_for_limits(limits, helper))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .map_err(|source| RunnerError::Execute { program, source })
 }
 
 fn resolve_cgroup_mode(
@@ -775,17 +872,7 @@ fn resolve_cgroup_mode(
             vec!["cgroup enforcement disabled by request".to_owned()],
         ));
     }
-    let available = which::which("systemd-run")
-        .ok()
-        .and_then(|program| {
-            Command::new(program)
-                .args(cgroup_probe_args(request, helper))
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .ok()
-        })
-        .is_some_and(|status| status.success());
+    let available = linux_cgroup_probe_available(request.resource_limits, helper).unwrap_or(false);
     if available {
         Ok((true, Vec::new()))
     } else if request.cgroup_mode == CgroupMode::Required {
@@ -1145,6 +1232,34 @@ mod tests {
 
         let guest = wrap_guest_cgroup(&request, vec![OsString::from("--version")]);
         assert_eq!(guest.first(), Some(&OsString::from("systemd-run")));
+    }
+
+    #[test]
+    fn namespace_probe_matches_the_production_namespace_and_clean_environment_shape() {
+        let probe: Vec<_> = linux_namespace_probe_args()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        for required in [
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-user",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-cgroup",
+            "--unshare-net",
+            "--cap-drop",
+            "--clearenv",
+            "--proc",
+            "--dev",
+        ] {
+            assert!(probe.iter().any(|value| value == required));
+        }
+        assert_eq!(probe.last().map(String::as_str), Some("/usr/bin/true"));
+        assert!(probe.windows(2).any(|window| window == ["--tmpfs", "/"]));
+        assert!(probe.windows(2).any(|window| window == ["--proc", "/proc"]));
+        assert!(probe.windows(2).any(|window| window == ["--dev", "/dev"]));
     }
 
     fn rendered_strings(args: &[OsString]) -> Vec<String> {

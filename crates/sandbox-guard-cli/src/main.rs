@@ -284,7 +284,7 @@ struct SetupArgs {
     /// This is the only command path that creates a VM; it never starts or reconfigures one.
     #[arg(
         long,
-        conflicts_with_all = ["check", "start_instance", "install_guest_packages", "install_guest_helper", "install_guest_tool"]
+        conflicts_with_all = ["check", "start_instance", "install_guest_packages", "install_guest_helper", "install_guest_tool", "install_linux_packages"]
     )]
     create_instance: bool,
 
@@ -292,7 +292,7 @@ struct SetupArgs {
     /// The instance must already exist and declare no host mounts.
     #[arg(
         long,
-        conflicts_with_all = ["check", "create_instance", "install_guest_packages", "install_guest_helper", "install_guest_tool"]
+        conflicts_with_all = ["check", "create_instance", "install_guest_packages", "install_guest_helper", "install_guest_tool", "install_linux_packages"]
     )]
     start_instance: bool,
 
@@ -300,7 +300,7 @@ struct SetupArgs {
     /// This invokes passwordless sudo only inside the dedicated guest, never on the host.
     #[arg(
         long,
-        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_helper", "install_guest_tool"]
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_helper", "install_guest_tool", "install_linux_packages"]
     )]
     install_guest_packages: bool,
 
@@ -309,7 +309,7 @@ struct SetupArgs {
         long,
         value_name = "ARTIFACT",
         requires = "guest_helper_sha256",
-        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_tool"]
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_tool", "install_linux_packages"]
     )]
     install_guest_helper: Option<PathBuf>,
 
@@ -318,7 +318,7 @@ struct SetupArgs {
         long,
         value_name = "HEX",
         requires = "install_guest_helper",
-        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_tool"]
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_tool", "install_linux_packages"]
     )]
     guest_helper_sha256: Option<String>,
 
@@ -328,7 +328,7 @@ struct SetupArgs {
         long,
         value_name = "PROFILE",
         requires_all = ["guest_tool_root", "guest_tool_signer_sha256"],
-        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_helper"]
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_helper", "install_linux_packages"]
     )]
     install_guest_tool: Option<String>,
 
@@ -340,8 +340,21 @@ struct SetupArgs {
     #[arg(long, value_name = "HEX", requires = "install_guest_tool")]
     guest_tool_signer_sha256: Option<String>,
 
+    /// Install the fixed Linux runtime package set on a supported Ubuntu 24.04 host.
+    /// This is the only setup action that invokes host sudo.
+    #[arg(
+        long,
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_helper", "install_guest_tool"]
+    )]
+    install_linux_packages: bool,
+
+    /// Require the real transient cgroup-v2 probe to pass during Linux setup diagnostics.
+    /// Valid with --check and --install-linux-packages; never changes host cgroup policy.
+    #[arg(long)]
+    require_cgroup: bool,
+
     /// Confirm a mutating setup action without an interactive prompt. Required with
-    /// a Lima action under --json, and the only way to mutate Lima on a non-interactive host.
+    /// a mutating action under --json, and on any non-interactive host.
     #[arg(long)]
     yes: bool,
 

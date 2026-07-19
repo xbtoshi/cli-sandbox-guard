@@ -25,7 +25,7 @@ pub use approval::{
     RememberedEgressDecision, clear_remembered_egress_decisions, forget_remembered_egress_decision,
     list_remembered_egress_decisions,
 };
-pub use linux::LinuxBwrapRunner;
+pub use linux::{LinuxBwrapRunner, linux_cgroup_probe_available, linux_namespace_probe_available};
 pub use macos::MacosLimaRunner;
 pub use sandbox_guard_helper::ResourceLimits;
 
