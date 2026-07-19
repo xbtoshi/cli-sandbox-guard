@@ -39,10 +39,10 @@ const GUEST_CAT: &str = "/usr/bin/cat";
 const GUEST_OPT_DIRECTORY: &str = "/opt";
 const GUEST_GUARD_DIRECTORY: &str = "/opt/sandbox-guard";
 const GUEST_TOOL_DIRECTORY: &str = "/opt/sandbox-guard/tools";
-const GUEST_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
-const MAX_GUEST_HELPER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_GUEST_TOOL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_GUEST_TOOL_RECEIPT_BYTES: u64 = 64 * 1024;
+const GUEST_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+const MAX_GUEST_HELPER_BYTES: u64 = 128 * 1024 * 1024;
 const GUEST_PACKAGE_EXECUTABLES: &[(&str, &str)] = &[
     ("bubblewrap", GUEST_BWRAP),
     ("git", "/usr/bin/git"),

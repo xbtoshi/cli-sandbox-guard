@@ -46,6 +46,30 @@ configured APT repositories, package-manager configuration, and root-run maintai
 package versions are not pinned. It does not use the runtime egress broker, invoke host sudo, or
 automatically clean up a partial package-manager failure.
 
+The selected guest-tool setup action accepts only an exact artifact from Guard's owner-private
+verified-tool store under an owner-supplied signer fingerprint. The core verifier returns the exact
+authenticated bytes rather than reopening the installed path. Guard additionally requires a
+nonempty Linux AArch64 ELF64 artifact, creates read-only snapshots inside an atomically created
+mode-`0700` directory anchored by an open, validated real HOME descriptor, and uses an unguessable
+guest temporary name. It never downloads or executes the artifact.
+
+All pre-confirmation and setup-diagnostic guest-tool probes are unprivileged fixed absolute
+`test`, `stat`, `cat`, and `sha256sum` invocations. Failed positive existence checks are not treated
+as absence: both explicit nonexistence and nonsymlink tests must succeed. Receipt size is capped at
+64 KiB before reading; the artifact must be 1 byte through 512 MiB before hashing. `/opt`,
+`/opt/sandbox-guard`, and `/opt/sandbox-guard/tools` must each be a traversable, non-symlink,
+root-owned directory with no group/world write bits. Missing Guard directories are accepted only
+when every descendant is proven absent; they are created separately after confirmation and
+revalidated before staging and activation.
+
+Guest sudo appears only after confirmation and only around fixed absolute `install`, `mv`, and
+`rm` mutations. The staged and final artifact is root-owned, singly linked, regular, mode `0755`,
+and hash/size-verified. Its adjacent root-owned mode-`0644` receipt contains public identity—not a
+secret—and binds profile name, tool-manifest version, artifact hash/size, and signer fingerprint.
+Diagnostics read and verify that receipt and artifact without sudo or vendor execution. Two atomic
+renames cannot form a multi-file transaction, so a failure between artifact and receipt activation
+is reported as explicit partial state and never hidden by rollback claims.
+
 ## Staging invariants
 
 1. Built-in denies cannot be removed by user policy.

@@ -180,7 +180,7 @@ a compiled built-in profile; the guest destination comes only from that profile
 and cannot be supplied by the caller. Guard re-verifies the artifact signature
 and owner-pinned signer fingerprint, copies private snapshots into a unique
 running mountless guest, verifies copied/staged hash and size, then uses
-root-owned staging and atomic rename. A root-owned `0600` receipt beside the
+root-owned staging and atomic rename. A root-owned, public-identity `0644` receipt beside the
 `0755` artifact binds profile name, tool-manifest version, artifact hash/size,
 and signer fingerprint. Diagnostics verify receipt, artifact, and metadata
 without executing vendor code. Exact identity is a no-op; safe mismatches require

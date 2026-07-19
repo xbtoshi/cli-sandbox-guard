@@ -239,7 +239,7 @@ installed artifact, and requires a unique running declared/live mountless guest.
 It never downloads or executes the vendor binary. After the typed phrase
 `INSTALL GUEST TOOL grok sandbox-guard` (or `--yes`), Guard verifies copied and
 root-owned staged hash/size, then atomically renames the files. A root-owned
-`0600` receipt beside the `0755` artifact binds the compiled profile, local
+`0644` public-identity receipt beside the `0755` artifact binds the compiled profile, local
 manifest version, artifact hash/size, and signer fingerprint. Setup diagnostics
 re-check the receipt, metadata, and artifact hash without running the tool. An
 exact match is an unprompted no-op; a safe partial or different installation

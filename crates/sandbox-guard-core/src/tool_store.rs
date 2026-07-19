@@ -564,19 +564,19 @@ pub enum ToolStoreError {
     SignerMismatch { expected: String, observed: String },
     #[error("Ed25519 signature verification failed")]
     SignatureVerification,
-    #[error("verification input is not a singly-linked regular file within the size limit: {0}")]
+    #[error("verification input is not a singly-linked regular file within the size limit: {0:?}")]
     UnsafeInput(PathBuf),
-    #[error("verification input changed while it was being read: {0}")]
+    #[error("verification input changed while it was being read: {0:?}")]
     ConcurrentMutation(PathBuf),
-    #[error("tool version already exists and will not be overwritten: {0}")]
+    #[error("tool version already exists and will not be overwritten: {0:?}")]
     VersionExists(PathBuf),
-    #[error("unsafe tool installation directory: {0}")]
+    #[error("unsafe tool installation directory: {0:?}")]
     UnsafeInstallation(PathBuf),
-    #[error("installed artifact does not match its verified manifest: {0}")]
+    #[error("installed artifact does not match its verified manifest: {0:?}")]
     ArtifactChanged(PathBuf),
     #[error("installed tool identity mismatch: expected {expected}, observed {observed}")]
     IdentityMismatch { expected: String, observed: String },
-    #[error("installed tool directory has an unexpected file set: {0}")]
+    #[error("installed tool directory has an unexpected file set: {0:?}")]
     UnexpectedFileSet(PathBuf),
     #[error("unsupported tool manifest schema {0}")]
     UnsupportedSchema(u32),
@@ -584,11 +584,35 @@ pub enum ToolStoreError {
     Manifest(serde_json::Error),
     #[error("failed to serialize installed tool manifest: {0}")]
     Serialize(serde_json::Error),
-    #[error("failed to {operation} at {path}: {source}")]
+    #[error("failed to {operation} at {path:?}: {source}")]
     Io {
         operation: &'static str,
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+}
+
+impl ToolStoreError {
+    /// A source-free classification suitable for a terminal boundary where owner-selected paths
+    /// and nested parser/OS diagnostics must not be rendered verbatim.
+    pub fn safe_summary(&self) -> &'static str {
+        match self {
+            Self::InvalidComponent { .. } => "invalid tool manifest identity",
+            Self::InvalidEncoding(_) => "invalid verification metadata encoding",
+            Self::SignerMismatch { .. } => "signer fingerprint mismatch",
+            Self::SignatureVerification => "artifact signature verification failed",
+            Self::UnsafeInput(_) => "unsafe verification input",
+            Self::ConcurrentMutation(_) => "verification input changed concurrently",
+            Self::VersionExists(_) => "tool version already exists",
+            Self::UnsafeInstallation(_) => "unsafe tool-store installation",
+            Self::ArtifactChanged(_) => "installed artifact identity mismatch",
+            Self::IdentityMismatch { .. } => "tool manifest path identity mismatch",
+            Self::UnexpectedFileSet(_) => "unexpected tool-store file set",
+            Self::UnsupportedSchema(_) => "unsupported tool manifest schema",
+            Self::Manifest(_) => "invalid tool manifest",
+            Self::Serialize(_) => "tool manifest serialization failed",
+            Self::Io { .. } => "tool-store I/O verification failed",
+        }
+    }
 }
