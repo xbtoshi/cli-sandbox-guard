@@ -12,10 +12,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use sandbox_guard_core::{
-    ApplyAuthorization, ChangeKind, CompiledPolicy, ExportReport, ResourceLimitRecord, RunRecord,
-    Stage, StageOptions, apply_exported_changes, decode_change_path, default_staging_base,
+    ApplyAuthorization, ApprovalEventDecision, ChangeKind, CompiledPolicy, EventKind, EventRecord,
+    ExportReport, ResourceLimitRecord, RunRecord, Stage, StageOptions, append_events,
+    apply_exported_changes, decode_change_path, default_staging_base, events_from_audit,
     export_changes, garbage_collect, install_verified_tool, is_valid_candidate_path,
-    verify_installed_tool,
+    read_event_index, verify_installed_tool,
 };
 use sandbox_guard_helper::ProbeReport;
 use sandbox_guard_runner::{
@@ -58,6 +59,8 @@ enum Command {
     Policy(PolicyArgs),
     /// List or remove exact-host network choices remembered by native approval dialogs.
     Approvals(ApprovalArgs),
+    /// Read the bounded, privacy-reduced observational event index.
+    Events(EventArgs),
     /// Check host prerequisites without changing the system.
     Doctor(DoctorArgs),
     /// Check readiness, repair Guard-owned state, or explicitly create/start the mountless VM.
@@ -216,6 +219,21 @@ struct ApprovalArgs {
     /// Forget every remembered hostname choice.
     #[arg(long)]
     clear: bool,
+}
+
+#[derive(Debug, Args)]
+struct EventArgs {
+    /// Maximum records to print, newest first.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    limit: u16,
+
+    /// Print only records for this run UUID.
+    #[arg(long, value_name = "UUID")]
+    run: Option<uuid::Uuid>,
+
+    /// Emit one JSON array, with no partial output on error.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -435,6 +453,7 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Stage(args) => stage_command(args),
         Command::Policy(args) => policy_command(args),
         Command::Approvals(args) => approvals_command(args),
+        Command::Events(args) => events_command(args),
         Command::Doctor(args) => doctor_command(args),
         Command::Setup(args) => setup::setup_command(args),
         Command::Uninstall(args) => uninstall::uninstall_command(args),
@@ -478,6 +497,83 @@ fn approvals_command(args: ApprovalArgs) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+fn events_command(args: EventArgs) -> Result<i32> {
+    events_command_at(args, &default_events_dir()?)
+}
+
+fn events_command_at(args: EventArgs, events_dir: &Path) -> Result<i32> {
+    let index = read_event_index(events_dir).context("read private event index")?;
+    let records: Vec<&EventRecord> = index
+        .events
+        .iter()
+        .rev()
+        .filter(|event| args.run.is_none_or(|run_id| event.run_id == run_id))
+        .take(usize::from(args.limit))
+        .collect();
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&records)?);
+        return Ok(0);
+    }
+    for event in records {
+        match &event.event {
+            EventKind::RunRecorded {
+                included_files,
+                included_bytes,
+                excluded_paths,
+                exit_code,
+                success,
+            } => println!(
+                "{}\t{}\trun-recorded\tsuccess={} exit={} included-files={} included-bytes={} excluded-paths={}",
+                event.occurred_at.to_rfc3339(),
+                event.run_id,
+                success,
+                exit_code.map_or_else(|| "none".to_owned(), |code| code.to_string()),
+                included_files,
+                included_bytes,
+                excluded_paths
+            ),
+            EventKind::EgressTunnel { host, port } => println!(
+                "{}\t{}\tegress-tunnel\t{}:{}",
+                event.occurred_at.to_rfc3339(),
+                event.run_id,
+                host,
+                port
+            ),
+            EventKind::EgressApproval {
+                host,
+                port,
+                decision,
+            } => println!(
+                "{}\t{}\tegress-approval\t{}:{} {}",
+                event.occurred_at.to_rfc3339(),
+                event.run_id,
+                host,
+                port,
+                approval_decision_name(*decision)
+            ),
+            EventKind::ObservationTruncated {
+                dropped_audit_entries,
+            } => println!(
+                "{}\t{}\tobservation-truncated\tdropped-audit-entries={}",
+                event.occurred_at.to_rfc3339(),
+                event.run_id,
+                dropped_audit_entries
+            ),
+        }
+    }
+    Ok(0)
+}
+
+fn approval_decision_name(decision: ApprovalEventDecision) -> &'static str {
+    match decision {
+        ApprovalEventDecision::Deny => "deny",
+        ApprovalEventDecision::DenyAlways => "deny-always",
+        ApprovalEventDecision::AllowOnce => "allow-once",
+        ApprovalEventDecision::AllowSession => "allow-session",
+        ApprovalEventDecision::AllowAlways => "allow-always",
+    }
 }
 
 pub(crate) trait PersistentRunState {
@@ -1460,13 +1556,41 @@ fn persist_run_audit(
         default_audit_dir()?.join(format!("{timestamp}-{}.json", stage.manifest().run_id));
     stage.persist_audit(&destination)?;
     println!("audit: {}", destination.display());
+    persist_events_observational(stage.manifest());
     Ok(())
+}
+
+fn persist_events_observational(manifest: &sandbox_guard_core::AuditManifest) {
+    match default_events_dir() {
+        Ok(directory) => {
+            append_events_observational(&directory, &events_from_audit(manifest));
+        }
+        Err(_) => event_index_warning(),
+    }
+}
+
+fn append_events_observational(directory: &Path, events: &[EventRecord]) {
+    if append_events(directory, events).is_err() {
+        event_index_warning();
+    }
+}
+
+fn event_index_warning() {
+    // Deliberately omit paths, parser details, and event content. This index is observational:
+    // audit persistence and the sandbox/tool outcome remain authoritative.
+    eprintln!("warning: could not update the observational event index");
 }
 
 fn default_audit_dir() -> Result<PathBuf> {
     let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
         .ok_or_else(|| anyhow!("could not determine the user data directory"))?;
     Ok(project.data_local_dir().join("audit"))
+}
+
+fn default_events_dir() -> Result<PathBuf> {
+    let project = ProjectDirs::from("com", "xbtoshi", "sandbox-guard")
+        .ok_or_else(|| anyhow!("could not determine the user data directory"))?;
+    Ok(project.data_local_dir().join("events"))
 }
 
 fn default_pending_changes_dir() -> Result<PathBuf> {
@@ -1510,6 +1634,7 @@ fn print_stage_summary(stage: &Stage) {
 #[cfg(test)]
 mod change_risk_tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn mass_deletion_catches_full_small_trees_and_large_or_proportional_removal() {
@@ -1544,5 +1669,86 @@ mod change_risk_tests {
             }),
             "DELETE 37 FILES OF 37"
         );
+    }
+
+    #[test]
+    fn events_cli_validates_limits_and_run_ids() {
+        assert!(Cli::try_parse_from(["guard", "events", "--limit", "1"]).is_ok());
+        assert!(Cli::try_parse_from(["guard", "events", "--limit", "1000"]).is_ok());
+        assert!(Cli::try_parse_from(["guard", "events", "--limit", "0"]).is_err());
+        assert!(Cli::try_parse_from(["guard", "events", "--limit", "1001"]).is_err());
+        assert!(Cli::try_parse_from(["guard", "events", "--run", "not-a-uuid"]).is_err());
+    }
+
+    #[test]
+    fn events_filter_limit_and_missing_store_are_read_only() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            events_command_at(
+                EventArgs {
+                    limit: 10,
+                    run: None,
+                    json: true,
+                },
+                &root.path().join("missing")
+            )
+            .unwrap(),
+            0
+        );
+        let run = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let records: Vec<_> = [run, other, run]
+            .into_iter()
+            .enumerate()
+            .map(|(index, run_id)| EventRecord {
+                id: uuid::Uuid::new_v4(),
+                run_id,
+                occurred_at: Utc.timestamp_opt(index as i64, 0).unwrap(),
+                event: EventKind::RunRecorded {
+                    included_files: 0,
+                    included_bytes: 0,
+                    excluded_paths: 0,
+                    exit_code: Some(0),
+                    success: true,
+                },
+            })
+            .collect();
+        let directory = root.path().join("events");
+        append_events(&directory, &records).unwrap();
+        let index = read_event_index(&directory).unwrap();
+        let selected: Vec<_> = index
+            .events
+            .iter()
+            .rev()
+            .filter(|event| event.run_id == run)
+            .take(1)
+            .collect();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].occurred_at.timestamp(), 2);
+    }
+
+    #[test]
+    fn event_write_failure_is_observational() {
+        let root = tempfile::tempdir().unwrap();
+        let unsafe_directory = root.path().join("events");
+        fs::create_dir(&unsafe_directory).unwrap();
+        fs::set_permissions(&unsafe_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let outcome = 23;
+        append_events_observational(
+            &unsafe_directory,
+            &[EventRecord {
+                id: uuid::Uuid::new_v4(),
+                run_id: uuid::Uuid::new_v4(),
+                occurred_at: Utc::now(),
+                event: EventKind::RunRecorded {
+                    included_files: 0,
+                    included_bytes: 0,
+                    excluded_paths: 0,
+                    exit_code: Some(outcome),
+                    success: false,
+                },
+            }],
+        );
+        assert_eq!(outcome, 23);
     }
 }

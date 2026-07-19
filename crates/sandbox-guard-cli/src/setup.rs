@@ -147,6 +147,7 @@ pub(super) struct SetupPaths {
     pub(super) data: PathBuf,
     pub(super) config: PathBuf,
     audit: PathBuf,
+    events: PathBuf,
     pending_changes: PathBuf,
     tools: PathBuf,
 }
@@ -162,6 +163,7 @@ impl SetupPaths {
         Ok(Self {
             home: base.home_dir().to_path_buf(),
             audit: data.join("audit"),
+            events: data.join("events"),
             pending_changes: data.join("pending-changes"),
             tools: data.join("tools"),
             data,
@@ -169,11 +171,12 @@ impl SetupPaths {
         })
     }
 
-    fn private_directories(&self) -> [(&'static str, &Path); 5] {
+    fn private_directories(&self) -> [(&'static str, &Path); 6] {
         [
             ("state.data.private", &self.data),
             ("state.config.private", &self.config),
             ("state.audit.private", &self.audit),
+            ("state.events.private", &self.events),
             ("state.pending-changes.private", &self.pending_changes),
             ("state.tools.private", &self.tools),
         ]
@@ -2085,6 +2088,7 @@ mod tests {
             home: temp.path().to_path_buf(),
             config: temp.path().join("config"),
             audit: data.join("audit"),
+            events: data.join("events"),
             pending_changes: data.join("pending"),
             tools: data.join("tools"),
             data,
@@ -2107,7 +2111,7 @@ mod tests {
                 .collect(),
             actions_taken: Vec::new(),
         };
-        assert_eq!(apply_safe_repairs(&report, &paths).unwrap().len(), 5);
+        assert_eq!(apply_safe_repairs(&report, &paths).unwrap().len(), 6);
         for (_, path) in paths.private_directories() {
             let metadata = fs::symlink_metadata(path).unwrap();
             assert!(metadata.is_dir());

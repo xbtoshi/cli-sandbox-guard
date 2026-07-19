@@ -155,6 +155,31 @@ These controls constrain destinations, not information flow to an allowed destin
 does not inspect HTTP paths or encrypted payloads. A malicious tool can send all staged content and
 every intentionally forwarded credential to an allowlisted service.
 
+## Observational event-index invariants
+
+- The per-run audit is authoritative and is durably persisted before any event-index update is
+  attempted. Event persistence is observational: failure emits one generic warning and cannot
+  alter enforcement, audit persistence, or the tool's exit status.
+- The current event schema contains only run IDs, event IDs/times, staging counts, run outcome,
+  successful controlled-egress hostname/port pairs, and trusted native approval decisions. It
+  cannot represent workspace paths, staging-exclusion paths/reasons, tool commands or arguments,
+  environment names/values, URLs, headers, bodies, credentials, or clipboard details.
+- Staging exclusions are not described as violations. The current runtime does not yet observe
+  denied filesystem, environment, syscall, or resource attempts, so the index makes no claim that
+  it does.
+- Proxy and approval audit lines are accepted only through strict, bounded parsers: ASCII decimal
+  Unix seconds, a normalized exact hostname, port 443, an exact field count, and (for approvals)
+  one known decision name. Malformed lines produce no event.
+- One audit contributes at most 512 records; excess source entries produce an explicit
+  observation-truncated record with a count. The index is capped at 4096 records and 4 MiB. Oldest
+  records are evicted under a nonblocking advisory lock; contention drops the observational update
+  rather than delaying a completed tool. Publication uses a mode-`0600` temporary file, file sync,
+  atomic rename, and directory sync.
+- The event directory must be a real owner-owned mode-`0700` directory. The index and lock must be
+  no-follow, singly linked, owner-owned regular files with exact mode `0600` and fixed size bounds.
+  Unknown schema fields/variants or future schema versions fail closed. `guard events` performs no
+  repair and emits no partial JSON when validation fails.
+
 ## Grok adapter invariants
 
 - The adapter derives its runtime profile from the compiled built-in plus an optional owner-only

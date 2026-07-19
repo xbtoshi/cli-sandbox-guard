@@ -51,6 +51,7 @@ conflict-checked host code; the tool never receives access to the source tree or
   output reopened, policy-filtered, and validated by the trusted staging layer.
 - Offline Ed25519 verification against a pinned signer fingerprint before atomic tool install.
 - Hostile denied-network and controlled-proxy probes through the real backend with `guard test`.
+- A bounded, owner-private observational event index with read-only `guard events` inspection.
 - `guard setup` for idempotent owner-only state initialization plus actionable, machine-readable
   host and Lima readiness diagnostics. Explicit confirmed macOS actions can create/start the
   dedicated mountless VM and install its fixed package-name set; plain setup remains unprivileged.
@@ -374,6 +375,30 @@ instead of pretending to inspect encrypted request details.
 
 Proxy handshakes have wall-clock deadlines, established tunnels have idle timeouts, and both the
 trusted proxy and sandbox relay cap concurrent connections.
+
+## Observational events
+
+After the authoritative per-run audit has been persisted, Guard derives a small event index for
+quick inspection:
+
+    guard events
+    guard events --limit 25 --run 019f6389-2b2e-7b62-a650-2ff38c4b926e
+    guard events --json
+
+Results are newest first. `--limit` accepts 1 through 1000; a missing store is an empty result.
+The index records run counts/outcomes, successful controlled-egress hostname/port pairs, and
+trusted native approval decisions. It never copies workspace paths, tool commands or arguments,
+environment names or values, URLs, headers, bodies, credentials, clipboard paths, or policy
+staging exclusions. In particular, an excluded staging path is not labelled a violation: Guard
+does not yet observe denied filesystem or syscall attempts inside a running sandbox.
+
+One run contributes at most 512 records; excess audit entries produce an explicit truncation
+record. The index is capped at 4096 records and stored as `events/events.json` below Guard's
+platform data directory. The directory is owner-only (`0700`) and index/lock files are owner-only (`0600`);
+unsafe, corrupt, unknown-versioned, multiply linked, or oversized state makes `guard events` fail
+without emitting partial JSON. Lock contention is refused immediately rather than waiting.
+Index-update failure produces only a generic warning and never changes enforcement, audit
+persistence, or the tool's exit status.
 
 The tool must honor the standard HTTP proxy environment variables. Direct networking still fails.
 The proxy does not inspect HTTP paths or application payloads, and an allowed service can receive
