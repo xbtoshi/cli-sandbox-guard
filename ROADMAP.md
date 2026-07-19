@@ -84,14 +84,14 @@ We will not adopt these weaker postures:
   a running mountless guest, with revalidation around each guest package-manager mutation. The
   separate `guard setup --install-guest-helper ARTIFACT --guest-helper-sha256 HEX` action securely
   snapshots a caller-verified Linux AArch64 helper, verifies it before and after an atomic guest
-  install, and fails closed on unsafe guest state. The
-  generic `guard setup --install-guest-tool` path now re-verifies one exact local tool-store
+  install, and fails closed on unsafe guest state. The generic
+  `guard setup --install-guest-tool` path now re-verifies one exact local tool-store
   artifact under an owner-pinned signer fingerprint, derives its destination only from a compiled
   built-in profile, and installs a root-owned artifact plus identity receipt without downloading or
   executing vendor code. These actions are confirmed and never reconfigure/delete the VM. The
-  umbrella remains incomplete: xAI currently publishes
-  no qualified detached Grok artifact-signing identity, and no selected official artifact has the
-  required live mountless-Lima evidence.
+  umbrella remains incomplete: xAI currently publishes no qualified detached Grok
+  artifact-signing identity, and no selected official artifact has the required live
+  mountless-Lima evidence.
 - [ ] Install and verify the Linux runtime dependencies without silently weakening namespace or
   cgroup requirements.
 - [x] Add `guard setup --check` and actionable diagnostics for the host/backend components it

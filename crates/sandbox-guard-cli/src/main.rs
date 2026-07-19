@@ -321,6 +321,7 @@ struct SetupArgs {
         conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_tool"]
     )]
     guest_helper_sha256: Option<String>,
+
     /// Install one locally stored, signature-verified artifact at its compiled profile path in
     /// a running mountless Lima guest. Initially only the built-in `grok` profile is selectable.
     #[arg(

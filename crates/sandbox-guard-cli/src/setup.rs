@@ -2313,6 +2313,7 @@ fn validate_guest_tool_linux_aarch64_elf(bytes: &[u8]) -> Result<()> {
         || bytes[6] != 1
         || !matches!(u16::from_le_bytes([bytes[16], bytes[17]]), 2 | 3)
         || u16::from_le_bytes([bytes[18], bytes[19]]) != 183
+        || u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]) != 1
     {
         bail!("verified guest tool is not a nonempty Linux AArch64 ELF64 executable");
     }
@@ -6141,6 +6142,7 @@ mod tests {
         artifact[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
         artifact[16..18].copy_from_slice(&2_u16.to_le_bytes());
         artifact[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        artifact[20..24].copy_from_slice(&1_u32.to_le_bytes());
         let artifact_path = input.path().join("artifact");
         fs::write(&artifact_path, &artifact).unwrap();
         let signing_key = SigningKey::from_bytes(&[41_u8; 32]);
@@ -6419,6 +6421,38 @@ mod tests {
             ])
             .is_err()
         );
+        assert!(
+            Cli::try_parse_from([
+                "guard",
+                "setup",
+                "--install-guest-helper",
+                "guard-helper",
+                "--guest-helper-sha256",
+                HELPER_SHA256,
+                "--install-guest-tool",
+                "grok",
+                "--guest-tool-root",
+                "/private/store/grok/1.2.3",
+                "--guest-tool-signer-sha256",
+                "00",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn guest_tool_requires_a_nonempty_linux_aarch64_elf() {
+        let fixture = tool_fixture("grok");
+        validate_guest_tool_linux_aarch64_elf(&fixture.artifact).unwrap();
+
+        assert!(validate_guest_tool_linux_aarch64_elf(&[]).is_err());
+        let mut wrong_machine = fixture.artifact.clone();
+        wrong_machine[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        assert!(validate_guest_tool_linux_aarch64_elf(&wrong_machine).is_err());
+
+        let mut wrong_version = fixture.artifact;
+        wrong_version[20..24].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(validate_guest_tool_linux_aarch64_elf(&wrong_version).is_err());
     }
 
     #[test]
@@ -6479,7 +6513,26 @@ mod tests {
             .outputs
             .insert(copy_key.clone(), output(true, "", ""));
         lima_copy(&probes, Path::new(LIMACTL), "sandbox-guard", source, guest).unwrap();
-        assert_eq!(probes.calls.borrow().as_slice(), &[copy_key]);
+        assert_eq!(
+            probes.calls.borrow().as_slice(),
+            std::slice::from_ref(&copy_key)
+        );
+
+        let mut failed_copy = lima_probes();
+        failed_copy
+            .outputs
+            .insert(copy_key.clone(), output(false, "", "transport failed"));
+        assert!(
+            lima_copy(
+                &failed_copy,
+                Path::new(LIMACTL),
+                "sandbox-guard",
+                source,
+                guest,
+            )
+            .is_err()
+        );
+        assert_eq!(failed_copy.calls.borrow().as_slice(), &[copy_key]);
 
         let bytes = b"copied bytes";
         add_guest_metadata_output(
@@ -6916,6 +6969,40 @@ mod tests {
                     "regular file|0|0|644|1|{}\n",
                     MAX_GUEST_TOOL_RECEIPT_BYTES + 1
                 ),
+                "",
+            ),
+        );
+        assert!(
+            inspect_guest_tool(
+                &probes,
+                Path::new(LIMACTL),
+                "sandbox-guard",
+                "grok",
+                artifact_path,
+                receipt_path,
+                Some(&fixture.receipt),
+            )
+            .is_err()
+        );
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.contains(GUEST_CAT) && !call.contains(GUEST_SHA256SUM))
+        );
+
+        let mut probes = lima_probes();
+        add_exact_guest_tool_outputs(&mut probes, &fixture.receipt, &fixture.artifact);
+        probes.outputs.insert(
+            readonly_shell_key(
+                "sandbox-guard",
+                GUEST_STAT,
+                &["--format=%F|%u|%g|%a|%h|%s", "--", artifact_path],
+            ),
+            output(
+                true,
+                &format!("regular file|0|0|755|1|{}\n", MAX_GUEST_TOOL_BYTES + 1),
                 "",
             ),
         );
