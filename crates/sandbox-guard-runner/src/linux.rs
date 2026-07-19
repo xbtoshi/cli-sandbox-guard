@@ -118,8 +118,10 @@ impl LinuxBwrapRunner {
         let helper = resolve_host_helper(request)?;
         let workspace = canonical_workspace(request)?;
         let runtime = planned_runtime_path(request, &workspace);
-        let use_cgroup = request.cgroup_mode != CgroupMode::Disabled
-            && fixed_host_path_is_executable(Path::new(HOST_SYSTEMD_RUN));
+        let use_cgroup = planned_cgroup_usage(
+            request.cgroup_mode,
+            fixed_host_path_is_executable(Path::new(HOST_SYSTEMD_RUN)),
+        )?;
         Self::build_plan(request, bwrap, helper, &runtime, use_cgroup)
     }
 
@@ -228,6 +230,20 @@ fn fixed_host_path_is_executable(path: &Path) -> bool {
     fs::metadata(path)
         .ok()
         .is_some_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// Resolve the non-executing plan's cgroup route from fixed-launcher availability.
+///
+/// Planning cannot prove live user-manager delegation without launching the transient probe, but
+/// it must never render a silently weakened plan when the caller made cgroup enforcement
+/// mandatory. Execution performs the stronger active probe before building its final plan.
+fn planned_cgroup_usage(mode: CgroupMode, launcher_available: bool) -> Result<bool, RunnerError> {
+    match mode {
+        CgroupMode::Disabled => Ok(false),
+        CgroupMode::BestEffort => Ok(launcher_available),
+        CgroupMode::Required if launcher_available => Ok(true),
+        CgroupMode::Required => Err(RunnerError::CgroupUnavailable),
+    }
 }
 
 fn canonical_workspace(request: &RunRequest) -> Result<PathBuf, RunnerError> {
@@ -1248,6 +1264,19 @@ mod tests {
 
         let guest = wrap_guest_cgroup(&request, vec![OsString::from("--version")]);
         assert_eq!(guest.first(), Some(&OsString::from("systemd-run")));
+    }
+
+    #[test]
+    fn dry_run_plan_never_silently_weakens_required_cgroups() {
+        assert!(!planned_cgroup_usage(CgroupMode::Disabled, false).unwrap());
+        assert!(!planned_cgroup_usage(CgroupMode::Disabled, true).unwrap());
+        assert!(!planned_cgroup_usage(CgroupMode::BestEffort, false).unwrap());
+        assert!(planned_cgroup_usage(CgroupMode::BestEffort, true).unwrap());
+        assert!(matches!(
+            planned_cgroup_usage(CgroupMode::Required, false),
+            Err(RunnerError::CgroupUnavailable)
+        ));
+        assert!(planned_cgroup_usage(CgroupMode::Required, true).unwrap());
     }
 
     #[test]
