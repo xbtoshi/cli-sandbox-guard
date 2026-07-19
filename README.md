@@ -188,8 +188,14 @@ then verifies the installed digest, single-link regular-file metadata, and exact
 Every command uses fixed absolute guest executables and discrete argv; no shell or
 host sudo is used. Failure reports whether temporary files may remain and never
 rolls back an existing helper or changes the VM lifecycle/configuration. Obtain
-the artifact and checksum from the same signed, pinned Guard release; setup does
-not download or authenticate a release for you.
+the artifact from a maintainer-signed source tag and verify it against that
+release's `SHA256SUMS` and per-file manifest using the alpha verification process
+in the install guide. Individual binaries and archives are not independently
+signed, and setup does not download or authenticate a release for you. The
+snapshot lives under a newly created mode-0700 directory in a validated real,
+current-user-owned HOME. Because `limactl copy` accepts a path rather than an open
+descriptor, another process running as the same host user remains outside this
+boundary and could race that path before Lima opens it.
 
 `guard uninstall` is the matching non-mutating removal plan. Confirmed state
 removal requires `--remove` and the exact terminal phrase (or explicit

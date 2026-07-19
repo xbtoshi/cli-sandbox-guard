@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -203,6 +203,7 @@ struct ProbeOutput {
 struct GuestHelperSnapshot {
     path: PathBuf,
     _private_directory: Option<TempDir>,
+    _home_anchor: Option<File>,
 }
 
 trait SetupProbes {
@@ -258,7 +259,8 @@ impl SetupProbes for SystemProbes {
         artifact: &Path,
         expected_sha256: &[u8; 32],
     ) -> Result<GuestHelperSnapshot> {
-        create_guest_helper_snapshot(artifact, expected_sha256)
+        let base = BaseDirs::new().ok_or_else(|| anyhow!("could not determine HOME"))?;
+        create_guest_helper_snapshot_in(artifact, expected_sha256, base.home_dir())
     }
 
     fn guest_helper_temp_path(&self) -> String {
@@ -442,9 +444,10 @@ fn parse_sha256(value: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow!("guest helper SHA-256 must decode to exactly 32 bytes"))
 }
 
-fn create_guest_helper_snapshot(
+fn create_guest_helper_snapshot_in(
     artifact: &Path,
     expected_sha256: &[u8; 32],
+    home: &Path,
 ) -> Result<GuestHelperSnapshot> {
     let mut source = OpenOptions::new()
         .read(true)
@@ -453,7 +456,7 @@ fn create_guest_helper_snapshot(
         .with_context(|| {
             format!(
                 "open guest helper artifact without following symlinks: {}",
-                artifact.display()
+                safe_path_for_error(artifact)
             )
         })?;
     let before = source
@@ -461,12 +464,31 @@ fn create_guest_helper_snapshot(
         .context("inspect opened guest helper artifact")?;
     validate_guest_helper_artifact_metadata(&before)?;
 
+    let home_anchor = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(home)
+        .context("open HOME as a real directory without following symlinks")?;
+    let home_metadata = home_anchor
+        .metadata()
+        .context("inspect opened HOME anchor")?;
+    let home_path_metadata = fs::symlink_metadata(home).context("inspect HOME anchor path")?;
+    if !home_metadata.is_dir()
+        || home_metadata.uid() != current_uid()
+        || !home_path_metadata.is_dir()
+        || home_path_metadata.file_type().is_symlink()
+        || home_path_metadata.uid() != current_uid()
+        || home_metadata.dev() != home_path_metadata.dev()
+        || home_metadata.ino() != home_path_metadata.ino()
+    {
+        bail!("HOME is not a stable, real current-user-owned directory anchor");
+    }
+
     let private_directory = tempfile::Builder::new()
-        .prefix("sandbox-guard-helper-")
-        .tempdir()
+        .prefix(".sandbox-guard-helper-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(home)
         .context("create private guest helper snapshot directory")?;
-    fs::set_permissions(private_directory.path(), fs::Permissions::from_mode(0o700))
-        .context("secure private guest helper snapshot directory")?;
     let private_metadata = fs::symlink_metadata(private_directory.path())
         .context("verify private guest helper snapshot directory")?;
     if !private_metadata.is_dir()
@@ -546,7 +568,15 @@ fn create_guest_helper_snapshot(
     Ok(GuestHelperSnapshot {
         path: snapshot_path,
         _private_directory: Some(private_directory),
+        _home_anchor: Some(home_anchor),
     })
+}
+
+fn safe_path_for_error(path: &Path) -> String {
+    format!(
+        "{:?}",
+        sanitize_terminal_fragment(&path.as_os_str().to_string_lossy())
+    )
 }
 
 fn validate_guest_helper_artifact_metadata(metadata: &fs::Metadata) -> Result<()> {
@@ -2079,7 +2109,7 @@ fn diagnose_macos(
         helper_test,
         "guest runtime helper is executable",
         manual_repair(
-            "Install the Linux AArch64 guard-helper and exact SHA-256 from the same signed, pinned release as guard.",
+            "Install a Linux AArch64 guard-helper from a maintainer-signed source tag after verifying the release SHA256SUMS and per-file manifest; individual binaries are not independently signed.",
             &["confirmation", "verified-artifact"],
             &[&format!(
                 "guard setup --install-guest-helper <artifact> --guest-helper-sha256 <sha256> --backend macos-lima --lima-instance {shell_instance}"
@@ -2808,6 +2838,7 @@ mod tests {
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("/private/snapshot/artifact")),
                 _private_directory: None,
+                _home_anchor: None,
             })
         }
 
@@ -3946,6 +3977,73 @@ mod tests {
     }
 
     #[test]
+    fn root_temporary_helper_must_pass_exact_checks_before_activation() {
+        let mut probes = lima_probes();
+        seed_helper_install(&mut probes);
+        probes.outputs.insert(
+            helper_stat_key("sandbox-guard", HELPER_ROOT_TEMP),
+            output(true, "regular file:2:0:0:755\n", ""),
+        );
+        let error = install_lima_guest_helper(
+            &probes,
+            "sandbox-guard",
+            Path::new("artifact"),
+            HELPER_SHA256,
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("pre-activation check"));
+        let calls = probes.calls.borrow();
+        assert!(!calls.contains(&helper_activate_key("sandbox-guard")));
+        assert!(calls.contains(&helper_rm_key("sandbox-guard", HELPER_TEMP)));
+        assert!(calls.contains(&helper_rm_key("sandbox-guard", HELPER_ROOT_TEMP)));
+    }
+
+    #[test]
+    fn guest_state_race_immediately_before_activation_leaves_truthful_residuals() {
+        let mut probes = lima_probes();
+        seed_helper_install(&mut probes);
+        let running = output(
+            true,
+            r#"{"name":"sandbox-guard","status":"Running","config":{"mounts":[]}}"#,
+            "",
+        );
+        let stopped = output(
+            true,
+            r#"{"name":"sandbox-guard","status":"Stopped","config":{"mounts":[]}}"#,
+            "",
+        );
+        queue_outputs(
+            &probes,
+            list_key(None),
+            vec![
+                running.clone(),
+                running.clone(),
+                running.clone(),
+                running.clone(),
+                running,
+                stopped,
+            ],
+        );
+        let error = install_lima_guest_helper(
+            &probes,
+            "sandbox-guard",
+            Path::new("artifact"),
+            HELPER_SHA256,
+            true,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("artifacts may remain"));
+        assert!(rendered.contains(HELPER_TEMP));
+        assert!(rendered.contains(HELPER_ROOT_TEMP));
+        let calls = probes.calls.borrow();
+        assert!(!calls.contains(&helper_activate_key("sandbox-guard")));
+        assert!(!calls.contains(&helper_rm_key("sandbox-guard", HELPER_TEMP)));
+        assert_no_destructive_lifecycle_mutation(&probes);
+    }
+
+    #[test]
     fn wrong_copied_hash_is_cleaned_without_installing() {
         let mut probes = lima_probes();
         seed_helper_install(&mut probes);
@@ -4029,21 +4127,60 @@ mod tests {
         elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
         fs::write(&artifact, &elf).unwrap();
         let digest: [u8; 32] = Sha256::digest(&elf).into();
-        let snapshot = create_guest_helper_snapshot(&artifact, &digest).unwrap();
-        assert_eq!(fs::read(snapshot.path).unwrap(), elf);
+        let snapshot = create_guest_helper_snapshot_in(&artifact, &digest, temp.path()).unwrap();
+        assert_eq!(fs::read(&snapshot.path).unwrap(), elf);
+        let snapshot_parent = snapshot.path.parent().unwrap();
+        assert_eq!(
+            fs::symlink_metadata(snapshot_parent)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(snapshot_parent.starts_with(temp.path()));
 
         let wrong = [0_u8; 32];
-        assert!(create_guest_helper_snapshot(&artifact, &wrong).is_err());
+        assert!(create_guest_helper_snapshot_in(&artifact, &wrong, temp.path()).is_err());
         elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
         fs::write(&artifact, &elf).unwrap();
         let digest: [u8; 32] = Sha256::digest(&elf).into();
-        assert!(create_guest_helper_snapshot(&artifact, &digest).is_err());
+        assert!(create_guest_helper_snapshot_in(&artifact, &digest, temp.path()).is_err());
         let link = temp.path().join("link");
         std::os::unix::fs::symlink(&artifact, &link).unwrap();
-        assert!(create_guest_helper_snapshot(&link, &digest).is_err());
+        assert!(create_guest_helper_snapshot_in(&link, &digest, temp.path()).is_err());
         let hardlink = temp.path().join("hardlink");
         fs::hard_link(&artifact, &hardlink).unwrap();
-        assert!(create_guest_helper_snapshot(&artifact, &digest).is_err());
+        assert!(create_guest_helper_snapshot_in(&artifact, &digest, temp.path()).is_err());
+    }
+
+    #[test]
+    fn snapshot_rejects_symlinked_home_anchor_and_escapes_hostile_artifact_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let home_link = temp.path().join("home-link");
+        std::os::unix::fs::symlink(&home, &home_link).unwrap();
+        let missing = temp.path().join("bad\u{1b}]0;title\u{7}\u{202e}path");
+        let error = create_guest_helper_snapshot_in(&missing, &[0_u8; 32], &home_link).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.contains("\\\\u{1b}"));
+
+        let artifact = home.join("helper");
+        let mut elf = vec![0_u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        fs::write(&artifact, &elf).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&elf).into();
+        assert!(create_guest_helper_snapshot_in(&artifact, &digest, &home_link).is_err());
     }
 
     #[test]

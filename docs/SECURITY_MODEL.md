@@ -334,9 +334,15 @@ from this store and does not automatically re-verify them before every run.
   an owner-private read-only snapshot, and revalidates the unique running mountless guest around
   mutation. It verifies a root-owned mode-0755 single-link regular sibling before atomically
   renaming it into place, then repeats the hash, metadata, and exact-version checks. Setup does not
-  download or authenticate the release source; selecting a signed, pinned artifact and digest
-  remains the operator's responsibility. A failed activation is not rolled back, and diagnostics
-  truthfully identify possible guest temporary leftovers.
+  download or authenticate the release source; selecting an artifact built from a
+  maintainer-signed source tag and checking the verified release `SHA256SUMS` and per-file manifest
+  remains the operator's responsibility. Individual archives and binaries are not independently
+  signed. The snapshot directory is created atomically as mode 0700 under a validated real,
+  current-user-owned HOME rather than ambient `TMPDIR`. The later `limactl copy` interface is
+  path-based, so a process with the same host UID can still race that snapshot path before Lima
+  opens it; concurrent untrusted same-UID processes are outside this setup boundary. A failed
+  activation is not rolled back, and diagnostics truthfully identify possible guest temporary
+  leftovers.
 - Lima host-share detection fails closed when mount inspection cannot run but recognizes known
   share filesystem families by type. A new or manually configured sharing mechanism could require
   an updated check.

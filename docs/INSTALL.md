@@ -208,6 +208,12 @@ read-only snapshot from an owner-private temporary directory. The running Lima
 instance is revalidated as uniquely present, declared mountless, and live
 mountless around mutation.
 
+The snapshot directory is created atomically as mode 0700 beneath a real,
+current-user-owned HOME directory opened without following symlinks; ambient
+`TMPDIR` is not used. `limactl copy` is path-based, so another process with the
+same host UID remains able to race or replace that pathname before Lima opens it.
+Do not run setup concurrently with untrusted processes under the same host user.
+
 The guest copy is hashed before installation. Guard installs a unique root-owned
 mode-0755 sibling in `/usr/local/bin`, verifies its hash, regular/single-link
 metadata, and exact version, then atomically renames it to
