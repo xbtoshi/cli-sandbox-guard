@@ -175,6 +175,9 @@ every intentionally forwarded credential to an allowlisted service.
   records are evicted under a nonblocking advisory lock; contention drops the observational update
   rather than delaying a completed tool. Publication uses a mode-`0600` temporary file, file sync,
   atomic rename, and directory sync.
+- The complete index is ordered chronologically by observation time and then event ID before
+  eviction or query, so run completion order cannot evict newer records or invert newest-first
+  output.
 - The event directory must be a real owner-owned mode-`0700` directory. The index and lock must be
   no-follow, singly linked, owner-owned regular files with exact mode `0600` and fixed size bounds.
   Unknown schema fields/variants or future schema versions fail closed. `guard events` performs no

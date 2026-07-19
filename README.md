@@ -385,7 +385,9 @@ quick inspection:
     guard events --limit 25 --run 019f6389-2b2e-7b62-a650-2ff38c4b926e
     guard events --json
 
-Results are newest first. `--limit` accepts 1 through 1000; a missing store is an empty result.
+Results are newest first by observation time, with event ID as the deterministic equal-time
+tie-break. This ordering is maintained before oldest-record eviction even when concurrent runs
+finish out of order. `--limit` accepts 1 through 1000; a missing store is an empty result.
 The index records run counts/outcomes, successful controlled-egress hostname/port pairs, and
 trusted native approval decisions. It never copies workspace paths, tool commands or arguments,
 environment names or values, URLs, headers, bodies, credentials, clipboard paths, or policy

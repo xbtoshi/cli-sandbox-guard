@@ -25,8 +25,8 @@ pub use change_apply::{
 };
 pub use events::{
     ApprovalEventDecision, EVENT_INDEX_SCHEMA_VERSION, EventIndex, EventKind, EventRecord,
-    EventStoreError, MAX_EVENT_INDEX_BYTES, MAX_EVENTS, MAX_EVENTS_PER_AUDIT, append_events,
-    events_from_audit, read_event_index,
+    EventStoreError, MAX_EVENT_INDEX_BYTES, MAX_EVENT_QUERY_LIMIT, MAX_EVENTS,
+    MAX_EVENTS_PER_AUDIT, append_events, events_from_audit, read_event_index, select_events,
 };
 pub use export::{
     ChangeExportManifest, ChangeKind, ChangeRecord, ExportError, ExportReport, RejectedChange,

@@ -3,7 +3,12 @@
 //! Events are a privacy-reduced derivative of an already-persisted run audit. A failure in this
 //! module must be handled observationally by callers: it must never alter sandbox enforcement or
 //! the tool's exit status.
+//!
+//! The event directory is held and identity-checked, but child opens and publication are
+//! path-based. A same-UID process able to swap that directory during an operation is outside the
+//! threat model; the final identity check prevents a raced operation from reporting success.
 
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -20,6 +25,7 @@ use crate::AuditManifest;
 pub const EVENT_INDEX_SCHEMA_VERSION: u32 = 1;
 pub const MAX_EVENTS: usize = 4096;
 pub const MAX_EVENTS_PER_AUDIT: usize = 512;
+pub const MAX_EVENT_QUERY_LIMIT: usize = 1000;
 pub const MAX_EVENT_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 const INDEX_FILE: &str = "events.json";
 const LOCK_FILE: &str = ".lock";
@@ -170,16 +176,42 @@ pub fn read_event_index(events_dir: &Path) -> Result<EventIndex, EventStoreError
     Ok(index)
 }
 
+/// Select a validated newest-first view, independent of persisted or append order.
+pub fn select_events(
+    index: &EventIndex,
+    limit: usize,
+    run_id: Option<Uuid>,
+) -> Result<Vec<&EventRecord>, EventStoreError> {
+    if !(1..=MAX_EVENT_QUERY_LIMIT).contains(&limit) {
+        return Err(EventStoreError::InvalidQueryLimit(limit));
+    }
+    validate_index(index)?;
+    let mut selected: Vec<_> = index
+        .events
+        .iter()
+        .filter(|event| run_id.is_none_or(|run_id| event.run_id == run_id))
+        .collect();
+    selected.sort_by(|left, right| compare_events(left, right));
+    selected.reverse();
+    selected.truncate(limit);
+    Ok(selected)
+}
+
 /// Append records while holding the store lock, evicting the oldest records at the fixed bound,
 /// and atomically replacing the complete index.
 pub fn append_events(events_dir: &Path, records: &[EventRecord]) -> Result<(), EventStoreError> {
     if records.is_empty() {
         return Ok(());
     }
+    if records.len() > MAX_EVENTS_PER_AUDIT {
+        return Err(EventStoreError::TooManyAppendEvents(records.len()));
+    }
+    validate_records(records)?;
     let directory = prepare_private_directory(events_dir)?;
     let _lock = lock_store(events_dir)?;
     let mut index = read_index_file(events_dir)?;
     index.events.extend(records.iter().cloned());
+    sort_events(&mut index.events);
     if index.events.len() > MAX_EVENTS {
         index.events.drain(..index.events.len() - MAX_EVENTS);
     }
@@ -336,8 +368,9 @@ fn read_index_file(events_dir: &Path) -> Result<EventIndex, EventStoreError> {
     if bytes.len() as u64 > MAX_EVENT_INDEX_BYTES {
         return Err(EventStoreError::TooLarge(path));
     }
-    let index: EventIndex = serde_json::from_slice(&bytes).map_err(EventStoreError::Parse)?;
+    let mut index: EventIndex = serde_json::from_slice(&bytes).map_err(EventStoreError::Parse)?;
     validate_index(&index)?;
+    sort_events(&mut index.events);
     Ok(index)
 }
 
@@ -348,7 +381,15 @@ fn validate_index(index: &EventIndex) -> Result<(), EventStoreError> {
     if index.events.len() > MAX_EVENTS {
         return Err(EventStoreError::TooManyEvents(index.events.len()));
     }
-    for event in &index.events {
+    validate_records(&index.events)
+}
+
+fn validate_records(events: &[EventRecord]) -> Result<(), EventStoreError> {
+    let mut ids = BTreeSet::new();
+    for event in events {
+        if !ids.insert(event.id) {
+            return Err(EventStoreError::InvalidRecord);
+        }
         match &event.event {
             EventKind::EgressTunnel { host, port }
             | EventKind::EgressApproval { host, port, .. }
@@ -360,6 +401,16 @@ fn validate_index(index: &EventIndex) -> Result<(), EventStoreError> {
         }
     }
     Ok(())
+}
+
+fn sort_events(events: &mut [EventRecord]) {
+    events.sort_by(compare_events);
+}
+
+fn compare_events(left: &EventRecord, right: &EventRecord) -> std::cmp::Ordering {
+    left.occurred_at
+        .cmp(&right.occurred_at)
+        .then_with(|| left.id.cmp(&right.id))
 }
 
 fn validate_private_file(
@@ -455,6 +506,10 @@ pub enum EventStoreError {
     TooLarge(PathBuf),
     #[error("event index contains {0} records, exceeding its bound")]
     TooManyEvents(usize),
+    #[error("append contains {0} records, exceeding its per-operation bound")]
+    TooManyAppendEvents(usize),
+    #[error("event query limit {0} is outside 1..=1000")]
+    InvalidQueryLimit(usize),
     #[error("unsupported event-index schema version {0}")]
     UnsupportedSchema(u32),
     #[error("event index contains an invalid record")]
@@ -579,6 +634,45 @@ mod tests {
     }
 
     #[test]
+    fn selection_orders_interleaved_audit_kinds_newest_first() {
+        let mut manifest = manifest();
+        let run_id = manifest.run_id;
+        let run = manifest.run.as_mut().unwrap();
+        run.egress_audit = vec![
+            "100\tfirst.example:443".to_owned(),
+            "300\tthird.example:443".to_owned(),
+        ];
+        run.egress_approvals = vec![
+            "200\tsecond.example:443\tdeny".to_owned(),
+            "400\tfourth.example:443\tallow-once".to_owned(),
+        ];
+        let index = EventIndex {
+            schema_version: EVENT_INDEX_SCHEMA_VERSION,
+            events: events_from_audit(&manifest),
+        };
+        let selected = select_events(&index, 5, Some(run_id)).unwrap();
+        let timestamps: Vec<_> = selected
+            .iter()
+            .map(|event| event.occurred_at.timestamp())
+            .collect();
+        assert_eq!(&timestamps[1..], &[400, 300, 200, 100]);
+        assert!(matches!(
+            selected[1].event,
+            EventKind::EgressApproval { .. }
+        ));
+        assert!(matches!(selected[2].event, EventKind::EgressTunnel { .. }));
+        assert!(matches!(
+            selected[3].event,
+            EventKind::EgressApproval { .. }
+        ));
+        assert!(matches!(selected[4].event, EventKind::EgressTunnel { .. }));
+        assert!(matches!(
+            select_events(&index, 0, None),
+            Err(EventStoreError::InvalidQueryLimit(0))
+        ));
+    }
+
+    #[test]
     fn audit_parsers_are_strict_and_bounded() {
         assert!(parse_egress_audit("1700000000\ta.example:443").is_some());
         for bad in [
@@ -692,7 +786,9 @@ mod tests {
         let records: Vec<_> = (0..MAX_EVENTS + 3)
             .map(|number| event(run, number as i64))
             .collect();
-        append_events(&dir, &records).unwrap();
+        for chunk in records.chunks(MAX_EVENTS_PER_AUDIT) {
+            append_events(&dir, chunk).unwrap();
+        }
         let index = read_event_index(&dir).unwrap();
         assert_eq!(index.events.len(), MAX_EVENTS);
         assert_eq!(index.events[0].occurred_at.timestamp(), 3);
@@ -712,6 +808,68 @@ mod tests {
                 & 0o777,
             0o600
         );
+        append_events(&dir, &[event(Uuid::new_v4(), -1)]).unwrap();
+        assert_eq!(
+            read_event_index(&dir).unwrap(),
+            index,
+            "a late append of the chronologically oldest record must evict itself"
+        );
+    }
+
+    #[test]
+    fn append_order_across_runs_does_not_change_query_chronology() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("events");
+        let newer_run = Uuid::new_v4();
+        append_events(&dir, &[event(newer_run, 30), event(newer_run, 20)]).unwrap();
+        let older_run = Uuid::new_v4();
+        append_events(&dir, &[event(older_run, 10)]).unwrap();
+
+        let index = read_event_index(&dir).unwrap();
+        let stored: Vec<_> = index
+            .events
+            .iter()
+            .map(|event| event.occurred_at.timestamp())
+            .collect();
+        assert_eq!(stored, vec![10, 20, 30]);
+        let queried: Vec<_> = select_events(&index, 3, None)
+            .unwrap()
+            .iter()
+            .map(|event| event.occurred_at.timestamp())
+            .collect();
+        assert_eq!(queried, vec![30, 20, 10]);
+        assert_eq!(select_events(&index, 3, Some(older_run)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn equal_timestamps_use_event_id_as_a_deterministic_tie_break() {
+        let run = Uuid::new_v4();
+        let mut lower = event(run, 10);
+        lower.id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let mut higher = event(run, 10);
+        higher.id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let index = EventIndex {
+            schema_version: EVENT_INDEX_SCHEMA_VERSION,
+            events: vec![higher.clone(), lower.clone()],
+        };
+        let selected = select_events(&index, 2, None).unwrap();
+        assert_eq!(selected[0].id, higher.id);
+        assert_eq!(selected[1].id, lower.id);
+    }
+
+    #[test]
+    fn append_rejects_an_unbounded_input_before_creating_state() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("events");
+        let records: Vec<_> = (0..MAX_EVENTS_PER_AUDIT + 1)
+            .map(|number| event(Uuid::new_v4(), number as i64))
+            .collect();
+        assert!(matches!(
+            append_events(&dir, &records),
+            Err(EventStoreError::TooManyAppendEvents(count))
+                if count == MAX_EVENTS_PER_AUDIT + 1
+        ));
+        assert!(!dir.exists());
     }
 
     #[test]

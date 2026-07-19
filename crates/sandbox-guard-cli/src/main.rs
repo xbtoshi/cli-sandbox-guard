@@ -16,7 +16,7 @@ use sandbox_guard_core::{
     ExportReport, ResourceLimitRecord, RunRecord, Stage, StageOptions, append_events,
     apply_exported_changes, decode_change_path, default_staging_base, events_from_audit,
     export_changes, garbage_collect, install_verified_tool, is_valid_candidate_path,
-    read_event_index, verify_installed_tool,
+    read_event_index, select_events, verify_installed_tool,
 };
 use sandbox_guard_helper::ProbeReport;
 use sandbox_guard_runner::{
@@ -505,13 +505,7 @@ fn events_command(args: EventArgs) -> Result<i32> {
 
 fn events_command_at(args: EventArgs, events_dir: &Path) -> Result<i32> {
     let index = read_event_index(events_dir).context("read private event index")?;
-    let records: Vec<&EventRecord> = index
-        .events
-        .iter()
-        .rev()
-        .filter(|event| args.run.is_none_or(|run_id| event.run_id == run_id))
-        .take(usize::from(args.limit))
-        .collect();
+    let records = select_events(&index, usize::from(args.limit), args.run)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&records)?);
         return Ok(0);
