@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -28,6 +28,23 @@ pub struct InstalledTool {
     pub root: PathBuf,
     pub executable: PathBuf,
     pub manifest: ToolInstallManifest,
+}
+
+/// An installed tool and the exact artifact bytes authenticated during verification.
+///
+/// The bytes are intentionally exposed read-only. Callers that need to provision an artifact
+/// elsewhere can snapshot this value without reopening `InstalledTool::executable` after its
+/// signature and manifest have been checked.
+#[derive(Debug, Clone)]
+pub struct VerifiedToolSnapshot {
+    pub installed: InstalledTool,
+    artifact: Vec<u8>,
+}
+
+impl VerifiedToolSnapshot {
+    pub fn artifact(&self) -> &[u8] {
+        &self.artifact
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -66,31 +83,8 @@ pub fn install_verified_tool(
         .verify_strict(&artifact_bytes, &signature)
         .map_err(|_| ToolStoreError::SignatureVerification)?;
 
-    let store_root = prepare_store_root(store_root)?;
-    let name_root = store_root.join(name);
-    fs::create_dir_all(&name_root).map_err(|source| ToolStoreError::Io {
-        operation: "create tool name directory",
-        path: name_root.clone(),
-        source,
-    })?;
-    let name_metadata = fs::symlink_metadata(&name_root).map_err(|source| ToolStoreError::Io {
-        operation: "inspect tool name directory",
-        path: name_root.clone(),
-        source,
-    })?;
-    if !name_metadata.is_dir()
-        || name_metadata.file_type().is_symlink()
-        || name_metadata.uid() != current_uid()
-    {
-        return Err(ToolStoreError::UnsafeInstallation(name_root));
-    }
-    fs::set_permissions(&name_root, fs::Permissions::from_mode(0o700)).map_err(|source| {
-        ToolStoreError::Io {
-            operation: "secure tool name directory",
-            path: name_root.clone(),
-            source,
-        }
-    })?;
+    let (store_root, _store_directory) = prepare_private_directory(store_root, true)?;
+    let (name_root, name_directory) = prepare_private_directory(&store_root.join(name), false)?;
     let destination = name_root.join(version);
     if fs::symlink_metadata(&destination).is_ok() {
         return Err(ToolStoreError::VersionExists(destination));
@@ -134,12 +128,27 @@ pub fn install_verified_tool(
     write_private(&temp.path().join("manifest.json"), &manifest_bytes, 0o600)?;
     sync_directory(temp.path())?;
     let temporary = temp.keep();
-    fs::rename(&temporary, &destination).map_err(|source| ToolStoreError::Io {
-        operation: "publish verified tool installation",
-        path: destination.clone(),
-        source,
-    })?;
-    sync_directory(&name_root)?;
+    if let Err(errno) = rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        temporary.as_path(),
+        &name_directory,
+        version,
+        rustix::fs::RenameFlags::NOREPLACE,
+    ) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(ToolStoreError::Io {
+            operation: "publish verified tool installation",
+            path: destination.clone(),
+            source: std::io::Error::from(errno),
+        });
+    }
+    name_directory
+        .sync_all()
+        .map_err(|source| ToolStoreError::Io {
+            operation: "sync tool name directory",
+            path: name_root.clone(),
+            source,
+        })?;
     Ok(InstalledTool {
         executable: destination.join("tool"),
         root: destination,
@@ -151,24 +160,49 @@ pub fn verify_installed_tool(
     installation_root: &Path,
     expected_signer_fingerprint: &str,
 ) -> Result<InstalledTool, ToolStoreError> {
+    Ok(verify_installed_tool_snapshot(installation_root, expected_signer_fingerprint)?.installed)
+}
+
+/// Verify an installed tool and retain the bytes read through the verified file descriptor.
+///
+/// This has exactly the same validation semantics as [`verify_installed_tool`], while avoiding a
+/// verify-then-reopen race for callers that need the authenticated artifact contents.
+pub fn verify_installed_tool_snapshot(
+    installation_root: &Path,
+    expected_signer_fingerprint: &str,
+) -> Result<VerifiedToolSnapshot, ToolStoreError> {
+    let (directory, held) = open_private_directory(installation_root)?;
     let root = fs::canonicalize(installation_root).map_err(|source| ToolStoreError::Io {
         operation: "canonicalize installed tool",
         path: installation_root.to_path_buf(),
         source,
     })?;
-    let metadata = fs::symlink_metadata(&root).map_err(|source| ToolStoreError::Io {
-        operation: "inspect installed tool",
-        path: root.clone(),
-        source,
-    })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(ToolStoreError::UnsafeInstallation(root));
-    }
+    ensure_path_matches_directory(&root, &held)?;
+    validate_installed_file_set(&root)?;
     let manifest_bytes = read_stable_regular_file(&root.join("manifest.json"), 1024 * 1024)?;
     let manifest: ToolInstallManifest =
         serde_json::from_slice(&manifest_bytes).map_err(ToolStoreError::Manifest)?;
     if manifest.schema_version != 1 {
         return Err(ToolStoreError::UnsupportedSchema(manifest.schema_version));
+    }
+    validate_component("tool name", &manifest.name)?;
+    validate_component("tool version", &manifest.version)?;
+    let version_component = root.file_name().and_then(|value| value.to_str());
+    let name_component = root
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str());
+    if name_component != Some(manifest.name.as_str())
+        || version_component != Some(manifest.version.as_str())
+    {
+        return Err(ToolStoreError::IdentityMismatch {
+            expected: format!("{}/{}", manifest.name, manifest.version),
+            observed: format!(
+                "{}/{}",
+                name_component.unwrap_or("?"),
+                version_component.unwrap_or("?")
+            ),
+        });
     }
     let expected = decode_hex(expected_signer_fingerprint, 32, "signer fingerprint")?;
     let public_key_bytes = read_hex_file(&root.join("public-key.hex"), 32, "public key")?;
@@ -201,10 +235,15 @@ pub fn verify_installed_tool(
     verifying_key
         .verify_strict(&artifact, &signature)
         .map_err(|_| ToolStoreError::SignatureVerification)?;
-    Ok(InstalledTool {
-        root,
-        executable,
-        manifest,
+    ensure_path_matches_directory(&root, &held)?;
+    drop(directory);
+    Ok(VerifiedToolSnapshot {
+        installed: InstalledTool {
+            root,
+            executable,
+            manifest,
+        },
+        artifact,
     })
 }
 
@@ -223,35 +262,6 @@ fn validate_component(label: &'static str, value: &str) -> Result<(), ToolStoreE
     } else {
         Ok(())
     }
-}
-
-fn prepare_store_root(path: &Path) -> Result<PathBuf, ToolStoreError> {
-    fs::create_dir_all(path).map_err(|source| ToolStoreError::Io {
-        operation: "create tool store",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let root = fs::canonicalize(path).map_err(|source| ToolStoreError::Io {
-        operation: "canonicalize tool store",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let metadata = fs::symlink_metadata(&root).map_err(|source| ToolStoreError::Io {
-        operation: "inspect tool store",
-        path: root.clone(),
-        source,
-    })?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != current_uid() {
-        return Err(ToolStoreError::UnsafeInstallation(root));
-    }
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|source| {
-        ToolStoreError::Io {
-            operation: "secure tool store",
-            path: root.clone(),
-            source,
-        }
-    })?;
-    Ok(root)
 }
 
 fn read_hex_file(
@@ -297,12 +307,17 @@ fn read_stable_regular_file(path: &Path, limit: u64) -> Result<Vec<u8>, ToolStor
         return Err(ToolStoreError::UnsafeInput(path.to_path_buf()));
     }
     let mut bytes = Vec::with_capacity(before.len() as usize);
-    file.read_to_end(&mut bytes)
+    Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
         .map_err(|source| ToolStoreError::Io {
             operation: "read verification input",
             path: path.to_path_buf(),
             source,
         })?;
+    if bytes.len() as u64 > limit {
+        return Err(ToolStoreError::ConcurrentMutation(path.to_path_buf()));
+    }
     let after = file.metadata().map_err(|source| ToolStoreError::Io {
         operation: "reinspect verification input",
         path: path.to_path_buf(),
@@ -320,6 +335,184 @@ fn read_stable_regular_file(path: &Path, limit: u64) -> Result<Vec<u8>, ToolStor
         return Err(ToolStoreError::ConcurrentMutation(path.to_path_buf()));
     }
     Ok(bytes)
+}
+
+fn validate_installed_file_set(root: &Path) -> Result<(), ToolStoreError> {
+    let mut observed = fs::read_dir(root)
+        .map_err(|source| ToolStoreError::Io {
+            operation: "list installed tool directory",
+            path: root.to_path_buf(),
+            source,
+        })?
+        .map(|entry| {
+            entry
+                .map_err(|source| ToolStoreError::Io {
+                    operation: "read installed tool directory entry",
+                    path: root.to_path_buf(),
+                    source,
+                })?
+                .file_name()
+                .into_string()
+                .map_err(|_| ToolStoreError::UnexpectedFileSet(root.to_path_buf()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    observed.sort();
+    let mut expected = vec![
+        "manifest.json".to_owned(),
+        "public-key.hex".to_owned(),
+        "signature.hex".to_owned(),
+        "tool".to_owned(),
+    ];
+    expected.sort();
+    if observed != expected {
+        return Err(ToolStoreError::UnexpectedFileSet(root.to_path_buf()));
+    }
+    for (name, mode) in [
+        ("manifest.json", 0o600),
+        ("public-key.hex", 0o600),
+        ("signature.hex", 0o600),
+        ("tool", 0o700),
+    ] {
+        let path = root.join(name);
+        let metadata = fs::symlink_metadata(&path).map_err(|source| ToolStoreError::Io {
+            operation: "inspect installed tool file",
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.nlink() != 1
+            || metadata.uid() != current_uid()
+            || metadata.permissions().mode() & 0o777 != mode
+        {
+            return Err(ToolStoreError::UnsafeInstallation(path));
+        }
+    }
+    Ok(())
+}
+
+fn open_private_directory(path: &Path) -> Result<(File, fs::Metadata), ToolStoreError> {
+    let initial = fs::symlink_metadata(path).map_err(|source| ToolStoreError::Io {
+        operation: "inspect tool store directory",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if initial.file_type().is_symlink() {
+        return Err(ToolStoreError::UnsafeInstallation(path.to_path_buf()));
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|source| ToolStoreError::Io {
+            operation: "open tool store directory",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = directory.metadata().map_err(|source| ToolStoreError::Io {
+        operation: "inspect opened tool store directory",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.dev() != initial.dev()
+        || metadata.ino() != initial.ino()
+    {
+        return Err(ToolStoreError::UnsafeInstallation(path.to_path_buf()));
+    }
+    Ok((directory, metadata))
+}
+
+fn ensure_path_matches_directory(path: &Path, held: &fs::Metadata) -> Result<(), ToolStoreError> {
+    let current = fs::symlink_metadata(path).map_err(|source| ToolStoreError::Io {
+        operation: "reinspect tool store directory",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if current.file_type().is_symlink()
+        || current.dev() != held.dev()
+        || current.ino() != held.ino()
+    {
+        return Err(ToolStoreError::ConcurrentMutation(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn prepare_private_directory(
+    path: &Path,
+    recursive: bool,
+) -> Result<(PathBuf, File), ToolStoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ToolStoreError::UnsafeInstallation(path.to_path_buf()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(recursive).mode(0o700);
+            builder.create(path).map_err(|source| ToolStoreError::Io {
+                operation: "create tool store directory",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        Err(source) => {
+            return Err(ToolStoreError::Io {
+                operation: "inspect tool store directory",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    let (directory, _) = open_owned_directory(path)?;
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|source| ToolStoreError::Io {
+            operation: "secure tool store directory",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = directory.metadata().map_err(|source| ToolStoreError::Io {
+        operation: "reinspect tool store directory",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir()
+        || metadata.uid() != current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(ToolStoreError::UnsafeInstallation(path.to_path_buf()));
+    }
+    let canonical = fs::canonicalize(path).map_err(|source| ToolStoreError::Io {
+        operation: "canonicalize tool store directory",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    ensure_path_matches_directory(&canonical, &metadata)?;
+    Ok((canonical, directory))
+}
+
+fn open_owned_directory(path: &Path) -> Result<(File, fs::Metadata), ToolStoreError> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|source| ToolStoreError::Io {
+            operation: "open tool store directory",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let metadata = directory.metadata().map_err(|source| ToolStoreError::Io {
+        operation: "inspect opened tool store directory",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_dir() || metadata.uid() != current_uid() {
+        return Err(ToolStoreError::UnsafeInstallation(path.to_path_buf()));
+    }
+    Ok((directory, metadata))
 }
 
 fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<(), ToolStoreError> {
@@ -381,6 +574,10 @@ pub enum ToolStoreError {
     UnsafeInstallation(PathBuf),
     #[error("installed artifact does not match its verified manifest: {0}")]
     ArtifactChanged(PathBuf),
+    #[error("installed tool identity mismatch: expected {expected}, observed {observed}")]
+    IdentityMismatch { expected: String, observed: String },
+    #[error("installed tool directory has an unexpected file set: {0}")]
+    UnexpectedFileSet(PathBuf),
     #[error("unsupported tool manifest schema {0}")]
     UnsupportedSchema(u32),
     #[error("failed to parse installed tool manifest: {0}")]

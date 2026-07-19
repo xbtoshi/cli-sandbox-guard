@@ -61,6 +61,6 @@ pub use staging::{
     is_valid_candidate_path,
 };
 pub use tool_store::{
-    InstalledTool, ToolInstallManifest, ToolStoreError, install_verified_tool,
-    verify_installed_tool,
+    InstalledTool, ToolInstallManifest, ToolStoreError, VerifiedToolSnapshot,
+    install_verified_tool, verify_installed_tool, verify_installed_tool_snapshot,
 };

@@ -170,9 +170,27 @@ and verifies exact executable paths plus the CA bundle afterward. This invokes
 passwordless sudo only inside the guest. The package names are fixed, but their
 versions come from—and therefore trust—the guest's configured APT repositories,
 package-manager configuration, and root-run hooks/scripts. It never invokes host
-sudo or starts, reconfigures, stops, or deletes the VM. The selected vendor tool
-remains manual. As with the other mutating setup actions, `--json`
-requires `--yes`.
+sudo or starts, reconfigures, stops, or deletes the VM. As with the other
+mutating setup actions, `--json` requires `--yes`.
+
+`guard setup --install-guest-tool grok --guest-tool-root ROOT
+--guest-tool-signer-sha256 HEX --backend macos-lima` provisions only an exact
+artifact already installed in Guard's local verified-tool store. `grok` must be
+a compiled built-in profile; the guest destination comes only from that profile
+and cannot be supplied by the caller. Guard re-verifies the artifact signature
+and owner-pinned signer fingerprint, copies private snapshots into a unique
+running mountless guest, verifies copied/staged hash and size, then uses
+root-owned staging and atomic rename. A root-owned `0600` receipt beside the
+`0755` artifact binds profile name, tool-manifest version, artifact hash/size,
+and signer fingerprint. Diagnostics verify receipt, artifact, and metadata
+without executing vendor code. Exact identity is a no-op; safe mismatches require
+confirmed replacement, and no action downloads or changes VM lifecycle state.
+
+The owner must establish and pin the real artifact signer's SHA-256 public-key
+fingerprint. As of July 19, 2026, xAI publishes no detached Grok CLI artifact
+signature with a stable signing identity suitable for this mechanism. Guard does
+not invent or retrieve one, so the Grok Phase 1 qualification remains open until
+such provenance and live mountless-Lima evidence exist.
 
 `guard setup --install-guest-helper ARTIFACT --guest-helper-sha256 HEX` is the
 separate verified-helper action. `ARTIFACT` must be a current-user-owned,

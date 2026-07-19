@@ -187,9 +187,8 @@ The package names are fixed, but versions come from—and therefore trust—the
 guest's configured APT repositories, package-manager configuration, and root-run
 hooks/scripts. This action does not use Guard's runtime egress broker. A partial
 failure is reported and left for inspection or an idempotent retry—Guard never
-runs package cleanup or stops/deletes the VM. The selected vendor tool remains a
-manual trusted operation: everything placed inside the guest joins the trusted
-computing base. Machine-readable `--json` mode requires `--yes`.
+runs package cleanup or stops/deletes the VM. Machine-readable `--json` mode
+requires `--yes`.
 
 Install the packaged Linux ARM64 helper with its exact digest from the verified
 release manifest (the guest distribution needs glibc 2.39 or newer, e.g. Ubuntu
@@ -224,8 +223,37 @@ postcondition fails, the diagnostic states whether guest temporary artifacts may
 remain. Guard does not restore an earlier helper and never starts, stops,
 reconfigures, or deletes the VM as part of this action.
 
-Install the AI CLI you intend to confine inside the guest as well (for Grok:
-`/opt/sandbox-guard/tools/grok`). Then validate:
+Provision a selected vendor tool only from an exact installation already in
+Guard's local verified-tool store. For the currently compiled `grok` profile:
+
+    guard setup --install-guest-tool grok \
+      --guest-tool-root '/exact/root/reported/by/guard/tool/install' \
+      --guest-tool-signer-sha256 '<64-hex-owner-pinned-fingerprint>' \
+      --backend macos-lima
+
+This accepts only a compiled built-in profile and derives the destination solely
+from that profile (`/opt/sandbox-guard/tools/grok`); there is no guest destination
+option. Guard re-verifies the stored detached Ed25519 signature and owner-supplied
+signer fingerprint, snapshots the authenticated bytes without reopening the
+installed artifact, and requires a unique running declared/live mountless guest.
+It never downloads or executes the vendor binary. After the typed phrase
+`INSTALL GUEST TOOL grok sandbox-guard` (or `--yes`), Guard verifies copied and
+root-owned staged hash/size, then atomically renames the files. A root-owned
+`0600` receipt beside the `0755` artifact binds the compiled profile, local
+manifest version, artifact hash/size, and signer fingerprint. Setup diagnostics
+re-check the receipt, metadata, and artifact hash without running the tool. An
+exact match is an unprompted no-op; a safe partial or different installation
+requires confirmed replacement, with partial state reported on failure.
+
+The signer fingerprint is a trust decision made by the machine owner, not a
+value Guard discovers or downloads. As of July 19, 2026, xAI's public Grok CLI
+release materials do not publish a detached artifact-signing identity suitable
+for this flow. Do not substitute a checksum, repository commit signer, TLS
+certificate, or key invented by Guard. Until xAI supplies a qualified detached
+signature and stable public-key identity (or the owner independently establishes
+equivalent trusted distribution), this Phase 1 item remains incomplete.
+
+Then validate:
 
     guard setup --backend macos-lima
     guard setup --check --backend macos-lima

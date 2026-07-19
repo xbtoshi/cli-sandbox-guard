@@ -9,9 +9,11 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::{BaseDirs, ProjectDirs};
-use sandbox_guard_core::CompiledPolicy;
+use sandbox_guard_core::{
+    CompiledPolicy, VendorProfile, builtin_vendor_profile, verify_installed_tool_snapshot,
+};
 use sandbox_guard_runner::BackendKind;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -33,8 +35,14 @@ const GUEST_MV: &str = "/usr/bin/mv";
 const GUEST_RM: &str = "/usr/bin/rm";
 const GUEST_SHA256SUM: &str = "/usr/bin/sha256sum";
 const GUEST_STAT: &str = "/usr/bin/stat";
+const GUEST_CAT: &str = "/usr/bin/cat";
+const GUEST_OPT_DIRECTORY: &str = "/opt";
+const GUEST_GUARD_DIRECTORY: &str = "/opt/sandbox-guard";
+const GUEST_TOOL_DIRECTORY: &str = "/opt/sandbox-guard/tools";
 const GUEST_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 const MAX_GUEST_HELPER_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_GUEST_TOOL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_GUEST_TOOL_RECEIPT_BYTES: u64 = 64 * 1024;
 const GUEST_PACKAGE_EXECUTABLES: &[(&str, &str)] = &[
     ("bubblewrap", GUEST_BWRAP),
     ("git", "/usr/bin/git"),
@@ -206,6 +214,14 @@ struct GuestHelperSnapshot {
     _home_anchor: Option<File>,
 }
 
+#[derive(Debug)]
+struct GuestToolHostSnapshot {
+    artifact: PathBuf,
+    receipt: PathBuf,
+    _private_directory: Option<TempDir>,
+    _home_anchor: Option<File>,
+}
+
 trait SetupProbes {
     fn which(&self, name: &str) -> Option<PathBuf>;
     fn host_helper_path(&self) -> Option<PathBuf>;
@@ -218,6 +234,9 @@ trait SetupProbes {
         expected_sha256: &[u8; 32],
     ) -> Result<GuestHelperSnapshot>;
     fn guest_helper_temp_path(&self) -> String;
+    fn snapshot_guest_tool(&self, artifact: &[u8], receipt: &[u8])
+    -> Result<GuestToolHostSnapshot>;
+    fn guest_tool_nonce(&self) -> String;
 }
 
 struct SystemProbes;
@@ -266,6 +285,19 @@ impl SetupProbes for SystemProbes {
     fn guest_helper_temp_path(&self) -> String {
         format!("/tmp/guard-helper.{}", Uuid::new_v4().simple())
     }
+
+    fn snapshot_guest_tool(
+        &self,
+        artifact: &[u8],
+        receipt: &[u8],
+    ) -> Result<GuestToolHostSnapshot> {
+        let base = BaseDirs::new().ok_or_else(|| anyhow!("could not determine HOME"))?;
+        create_guest_tool_snapshot_in(artifact, receipt, base.home_dir())
+    }
+
+    fn guest_tool_nonce(&self) -> String {
+        Uuid::new_v4().simple().to_string()
+    }
 }
 
 pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
@@ -308,6 +340,27 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
             &args.lima_instance,
             artifact,
             checksum,
+            args.yes,
+            args.json,
+        )? {
+            actions.push(action);
+        }
+    } else if let Some(profile) = args.install_guest_tool.as_deref() {
+        let root = args
+            .guest_tool_root
+            .as_deref()
+            .ok_or_else(|| anyhow!("--install-guest-tool requires --guest-tool-root"))?;
+        let signer = args
+            .guest_tool_signer_sha256
+            .as_deref()
+            .ok_or_else(|| anyhow!("--install-guest-tool requires --guest-tool-signer-sha256"))?;
+        if let Some(action) = run_install_guest_tool(
+            &probes,
+            backend,
+            &args.lima_instance,
+            profile,
+            root,
+            signer,
             args.yes,
             args.json,
         )? {
@@ -432,6 +485,33 @@ fn run_install_guest_helper(
     }
     validate_instance_action_target("--install-guest-helper", backend, std::env::consts::OS)?;
     install_lima_guest_helper(probes, instance, artifact, checksum, assume_yes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_install_guest_tool(
+    probes: &dyn SetupProbes,
+    backend: BackendKind,
+    instance: &str,
+    profile_name: &str,
+    installation_root: &Path,
+    signer_fingerprint: &str,
+    assume_yes: bool,
+    json: bool,
+) -> Result<Option<String>> {
+    if json && !assume_yes {
+        bail!(
+            "--install-guest-tool with --json requires --yes so machine-readable output is never mixed with an interactive prompt"
+        );
+    }
+    validate_instance_action_target("--install-guest-tool", backend, std::env::consts::OS)?;
+    install_lima_guest_tool(
+        probes,
+        instance,
+        profile_name,
+        installation_root,
+        signer_fingerprint,
+        assume_yes,
+    )
 }
 
 fn parse_sha256(value: &str) -> Result<[u8; 32]> {
@@ -1691,6 +1771,1000 @@ fn cleanup_guest_helper_temp(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestToolReceipt {
+    schema_version: u32,
+    profile_name: String,
+    tool_manifest_version: String,
+    artifact_sha256: String,
+    artifact_bytes: u64,
+    signer_fingerprint_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuestFileMetadata {
+    kind: String,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    links: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuestToolState {
+    Missing,
+    Partial { detail: String, identity: String },
+    Mismatch { detail: String, identity: String },
+    Exact,
+}
+
+impl GuestToolState {
+    fn replacement_detail(&self) -> &'static str {
+        match self {
+            Self::Missing => "no existing installation",
+            Self::Partial { .. } => "a partial existing installation",
+            Self::Mismatch { .. } => "a different existing installation",
+            Self::Exact => "the exact installed artifact and receipt",
+        }
+    }
+}
+
+/// Provision one already-verified local store artifact to the fixed path compiled into its
+/// built-in profile. No vendor code is executed and no network or VM lifecycle operation occurs.
+fn install_lima_guest_tool(
+    probes: &dyn SetupProbes,
+    instance: &str,
+    profile_name: &str,
+    installation_root: &Path,
+    signer_fingerprint: &str,
+    assume_yes: bool,
+) -> Result<Option<String>> {
+    validate_lima_instance(instance)?;
+    let profile = builtin_vendor_profile(profile_name).ok_or_else(|| {
+        anyhow!("guest tool profile {profile_name:?} is not a selectable compiled built-in profile")
+    })?;
+    profile
+        .validate()
+        .with_context(|| format!("validate compiled profile {profile_name:?}"))?;
+    if profile.name != profile_name {
+        bail!("compiled profile name did not match the selected profile");
+    }
+    let destination = compiled_guest_tool_destination(&profile)?;
+    let receipt_path = format!("{destination}.receipt.json");
+
+    // This retains the exact bytes read through the descriptor whose metadata, manifest hash,
+    // signer, and detached signature were checked. The installed tool path is never reopened.
+    let snapshot =
+        verify_installed_tool_snapshot(installation_root, signer_fingerprint).map_err(|error| {
+            anyhow!(
+                "selected local tool-store verification failed: {}",
+                error.safe_summary()
+            )
+        })?;
+    if snapshot.installed.manifest.name != profile.name {
+        bail!(
+            "verified tool manifest name {:?} does not match selected compiled profile {:?}",
+            sanitize_terminal_fragment(&snapshot.installed.manifest.name),
+            profile.name
+        );
+    }
+    validate_manifest_component(
+        "tool manifest version",
+        &snapshot.installed.manifest.version,
+    )?;
+    validate_guest_tool_linux_aarch64_elf(snapshot.artifact())?;
+    let receipt = GuestToolReceipt {
+        schema_version: 1,
+        profile_name: profile.name.clone(),
+        tool_manifest_version: snapshot.installed.manifest.version.clone(),
+        artifact_sha256: snapshot.installed.manifest.artifact_sha256.clone(),
+        artifact_bytes: snapshot.installed.manifest.artifact_bytes,
+        signer_fingerprint_sha256: snapshot
+            .installed
+            .manifest
+            .signer_fingerprint_sha256
+            .clone(),
+    };
+
+    let Some(limactl) = probes.which("limactl") else {
+        bail!("limactl was not found on PATH; install Lima before provisioning a guest tool");
+    };
+    require_safe_package_target(probes, &limactl, instance, "before guest tool inspection")?;
+    let initial = inspect_guest_tool(
+        probes,
+        &limactl,
+        instance,
+        profile_name,
+        &destination,
+        &receipt_path,
+        Some(&receipt),
+    )?;
+    if initial == GuestToolState::Exact {
+        eprintln!(
+            "Lima instance {instance:?} already contains the exact verified {profile_name:?} artifact and receipt"
+        );
+        return Ok(None);
+    }
+
+    confirm_guest_tool_install(instance, profile_name, &initial, assume_yes)?;
+    require_safe_package_target(
+        probes,
+        &limactl,
+        instance,
+        "immediately before guest tool snapshot copy",
+    )?;
+    let rechecked = inspect_guest_tool(
+        probes,
+        &limactl,
+        instance,
+        profile_name,
+        &destination,
+        &receipt_path,
+        Some(&receipt),
+    )?;
+    if rechecked != initial {
+        bail!("guest tool state changed after confirmation; nothing was copied or replaced");
+    }
+
+    let mut receipt_bytes = serde_json::to_vec_pretty(&receipt)?;
+    receipt_bytes.push(b'\n');
+    if receipt_bytes.len() as u64 > MAX_GUEST_TOOL_RECEIPT_BYTES {
+        bail!("internal guest tool receipt exceeds its fixed byte limit");
+    }
+    let host_snapshot = probes
+        .snapshot_guest_tool(snapshot.artifact(), &receipt_bytes)
+        .context("create private held-home guest tool snapshots")?;
+
+    let nonce = probes.guest_tool_nonce();
+    validate_guest_tool_nonce(&nonce)?;
+    let guest_artifact = format!("/tmp/.sandbox-guard-{profile_name}-{nonce}.artifact");
+    let guest_receipt = format!("/tmp/.sandbox-guard-{profile_name}-{nonce}.receipt");
+    let stage_artifact = format!("{GUEST_TOOL_DIRECTORY}/.{profile_name}-{nonce}.stage");
+    let stage_receipt = format!("{GUEST_TOOL_DIRECTORY}/.{profile_name}-{nonce}.receipt.stage");
+
+    lima_copy(
+        probes,
+        &limactl,
+        instance,
+        &host_snapshot.artifact,
+        &guest_artifact,
+    )
+    .context("copy verified artifact snapshot into guest; final installation is unchanged")?;
+    lima_copy(
+        probes,
+        &limactl,
+        instance,
+        &host_snapshot.receipt,
+        &guest_receipt,
+    ).context(
+        "copy verified receipt snapshot into guest; the artifact temp may remain, and final installation is unchanged",
+    )?;
+    verify_guest_copied_file(
+        probes,
+        &limactl,
+        instance,
+        &guest_artifact,
+        receipt.artifact_bytes,
+        &receipt.artifact_sha256,
+    )
+    .context("copied guest artifact identity verification failed; guest temp files may remain")?;
+    verify_guest_copied_file(
+        probes,
+        &limactl,
+        instance,
+        &guest_receipt,
+        receipt_bytes.len() as u64,
+        &hex::encode(Sha256::digest(&receipt_bytes)),
+    )
+    .context("copied guest receipt identity verification failed; guest temp files may remain")?;
+    require_safe_package_target(
+        probes,
+        &limactl,
+        instance,
+        "after snapshot copy and before root-owned guest staging",
+    )
+    .context("guest temp snapshots may remain; final installation is unchanged")?;
+    let before_staging = inspect_guest_tool(
+        probes,
+        &limactl,
+        instance,
+        profile_name,
+        &destination,
+        &receipt_path,
+        Some(&receipt),
+    )?;
+    if before_staging != initial {
+        bail!(
+            "guest tool state changed after snapshot copy; guest temp snapshots may remain, and final installation was not replaced"
+        );
+    }
+
+    ensure_guest_tool_directories(probes, &limactl, instance).context(
+        "fixed guest directories may be partial; no artifact or receipt was staged or replaced",
+    )?;
+    let after_directory_creation = inspect_guest_tool(
+        probes,
+        &limactl,
+        instance,
+        profile_name,
+        &destination,
+        &receipt_path,
+        Some(&receipt),
+    )?;
+    if after_directory_creation != initial {
+        bail!(
+            "guest tool state changed while fixed directories were created; no artifact or receipt was staged or replaced"
+        );
+    }
+    run_guest_root(
+        probes,
+        &limactl,
+        instance,
+        GUEST_INSTALL,
+        &[
+            "--owner=0",
+            "--group=0",
+            "--mode=0755",
+            "--no-target-directory",
+            "--",
+            &guest_artifact,
+            &stage_artifact,
+        ],
+        "create root-owned artifact staging file",
+    )
+    .context("guest temp snapshots or a root-owned staging file may remain; final installation is unchanged")?;
+    run_guest_root(
+        probes,
+        &limactl,
+        instance,
+        GUEST_INSTALL,
+        &[
+            "--owner=0",
+            "--group=0",
+            "--mode=0644",
+            "--no-target-directory",
+            "--",
+            &guest_receipt,
+            &stage_receipt,
+        ],
+        "create root-owned receipt staging file",
+    )
+    .context("root-owned artifact staging and guest temp files may remain; final installation is unchanged")?;
+
+    verify_guest_file(
+        probes,
+        &limactl,
+        instance,
+        &stage_artifact,
+        0o755,
+        receipt.artifact_bytes,
+        &receipt.artifact_sha256,
+    )
+    .context(
+        "artifact staging verification failed; root-owned staging and guest temp files may remain",
+    )?;
+    verify_guest_file(
+        probes,
+        &limactl,
+        instance,
+        &stage_receipt,
+        0o644,
+        receipt_bytes.len() as u64,
+        &hex::encode(Sha256::digest(&receipt_bytes)),
+    )
+    .context(
+        "receipt staging verification failed; root-owned staging and guest temp files may remain",
+    )?;
+
+    run_guest_root(
+        probes,
+        &limactl,
+        instance,
+        GUEST_RM,
+        &["--force", "--", &guest_artifact, &guest_receipt],
+        "remove guest copy temporaries",
+    )
+    .context("verified root-owned staging remains; final installation is unchanged")?;
+    require_safe_package_target(
+        probes,
+        &limactl,
+        instance,
+        "immediately before atomic rename",
+    )
+    .context("verified root-owned staging remains; final installation is unchanged")?;
+    let before_rename = inspect_guest_tool(
+        probes,
+        &limactl,
+        instance,
+        profile_name,
+        &destination,
+        &receipt_path,
+        Some(&receipt),
+    )?;
+    if before_rename != initial {
+        bail!(
+            "guest tool state changed before atomic rename; verified root-owned staging remains and final installation was not replaced"
+        );
+    }
+
+    run_guest_root(
+        probes,
+        &limactl,
+        instance,
+        GUEST_MV,
+        &[
+            "--force",
+            "--no-target-directory",
+            "--",
+            &stage_artifact,
+            &destination,
+        ],
+        "atomically replace guest tool artifact",
+    )
+    .context("artifact rename failed; root-owned staging may remain and the previous final artifact was preserved")?;
+    run_guest_root(
+        probes,
+        &limactl,
+        instance,
+        GUEST_MV,
+        &[
+            "--force",
+            "--no-target-directory",
+            "--",
+            &stage_receipt,
+            &receipt_path,
+        ],
+        "atomically replace guest tool receipt",
+    )
+    .context("artifact was replaced but receipt rename failed; the guest installation is partial and must be retried")?;
+
+    require_safe_package_target(probes, &limactl, instance, "after guest tool replacement")
+        .context(
+            "guest artifact and receipt were renamed but the final guest safety check failed",
+        )?;
+    let final_state = inspect_guest_tool(
+        probes,
+        &limactl,
+        instance,
+        profile_name,
+        &destination,
+        &receipt_path,
+        Some(&receipt),
+    )?;
+    if final_state != GuestToolState::Exact {
+        bail!(
+            "guest artifact and receipt were renamed but final identity verification failed: {}",
+            describe_guest_tool_state(&final_state)
+        );
+    }
+    Ok(Some(format!(
+        "installed and verified {profile_name} {} at {destination} in {instance}",
+        receipt.tool_manifest_version
+    )))
+}
+
+fn ensure_guest_tool_directories(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+) -> Result<()> {
+    let opt = guest_metadata(probes, limactl, instance, GUEST_OPT_DIRECTORY)?
+        .ok_or_else(|| anyhow!("required guest /opt directory is missing"))?;
+    validate_guest_tool_directory(&opt, GUEST_OPT_DIRECTORY)?;
+
+    let guard = guest_metadata(probes, limactl, instance, GUEST_GUARD_DIRECTORY)?;
+    if let Some(metadata) = guard {
+        validate_guest_tool_directory(&metadata, GUEST_GUARD_DIRECTORY)?;
+    } else {
+        run_guest_root(
+            probes,
+            limactl,
+            instance,
+            GUEST_INSTALL,
+            &[
+                "--directory",
+                "--owner=0",
+                "--group=0",
+                "--mode=0755",
+                "--",
+                GUEST_GUARD_DIRECTORY,
+            ],
+            "create fixed guest Guard directory",
+        )?;
+        let created = guest_metadata(probes, limactl, instance, GUEST_GUARD_DIRECTORY)?
+            .ok_or_else(|| anyhow!("created guest Guard directory is missing"))?;
+        validate_guest_tool_directory(&created, GUEST_GUARD_DIRECTORY)?;
+    }
+
+    let tools = guest_metadata(probes, limactl, instance, GUEST_TOOL_DIRECTORY)?;
+    if let Some(metadata) = tools {
+        validate_guest_tool_directory(&metadata, GUEST_TOOL_DIRECTORY)?;
+    } else {
+        run_guest_root(
+            probes,
+            limactl,
+            instance,
+            GUEST_INSTALL,
+            &[
+                "--directory",
+                "--owner=0",
+                "--group=0",
+                "--mode=0755",
+                "--",
+                GUEST_TOOL_DIRECTORY,
+            ],
+            "create fixed guest tool directory",
+        )?;
+        let created = guest_metadata(probes, limactl, instance, GUEST_TOOL_DIRECTORY)?
+            .ok_or_else(|| anyhow!("created guest tool directory is missing"))?;
+        validate_guest_tool_directory(&created, GUEST_TOOL_DIRECTORY)?;
+    }
+    Ok(())
+}
+
+fn compiled_guest_tool_destination(profile: &VendorProfile) -> Result<String> {
+    let destination = profile
+        .tool
+        .guest_executable
+        .to_str()
+        .ok_or_else(|| anyhow!("compiled guest executable path is not UTF-8"))?;
+    if profile.tool.guest_executable.parent() != Some(Path::new(GUEST_TOOL_DIRECTORY)) {
+        bail!("compiled guest executable is outside the fixed Guard tool directory");
+    }
+    Ok(destination.to_owned())
+}
+
+fn validate_manifest_component(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || matches!(value, "." | "..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("invalid {label} {:?}", sanitize_terminal_fragment(value));
+    }
+    Ok(())
+}
+
+fn create_guest_tool_snapshot_in(
+    artifact: &[u8],
+    receipt: &[u8],
+    home: &Path,
+) -> Result<GuestToolHostSnapshot> {
+    let home_path_metadata = fs::symlink_metadata(home).context("inspect HOME anchor path")?;
+    if home_path_metadata.file_type().is_symlink() {
+        bail!("HOME is not a stable, real current-user-owned directory anchor");
+    }
+    let home_anchor = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(home)
+        .context("open HOME as a real directory without following symlinks")?;
+    let held = home_anchor
+        .metadata()
+        .context("inspect opened HOME anchor")?;
+    if !held.is_dir()
+        || held.uid() != current_uid()
+        || held.dev() != home_path_metadata.dev()
+        || held.ino() != home_path_metadata.ino()
+    {
+        bail!("HOME is not a stable, real current-user-owned directory anchor");
+    }
+    let private_directory = tempfile::Builder::new()
+        .prefix(".sandbox-guard-tool-")
+        .tempdir_in(home)
+        .context("atomically create private guest tool snapshot directory")?;
+    fs::set_permissions(private_directory.path(), fs::Permissions::from_mode(0o700))
+        .context("secure guest tool snapshot directory")?;
+    let directory_metadata = private_directory
+        .path()
+        .symlink_metadata()
+        .context("verify guest tool snapshot directory")?;
+    if !directory_metadata.is_dir()
+        || directory_metadata.file_type().is_symlink()
+        || directory_metadata.uid() != current_uid()
+        || directory_metadata.permissions().mode() & 0o777 != 0o700
+    {
+        bail!("guest tool snapshot directory is not owner-private");
+    }
+    let artifact_path = private_directory.path().join("artifact");
+    let receipt_path = private_directory.path().join("receipt.json");
+    write_immutable_snapshot(&artifact_path, artifact)?;
+    write_immutable_snapshot(&receipt_path, receipt)?;
+    Ok(GuestToolHostSnapshot {
+        artifact: artifact_path,
+        receipt: receipt_path,
+        _private_directory: Some(private_directory),
+        _home_anchor: Some(home_anchor),
+    })
+}
+
+fn write_immutable_snapshot(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .context("create private snapshot file")?;
+    file.write_all(bytes)
+        .context("write private snapshot file")?;
+    file.sync_all().context("sync private snapshot file")
+}
+
+fn validate_guest_tool_nonce(value: &str) -> Result<()> {
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("internal guest tool temporary name is not 128-bit hexadecimal");
+    }
+    Ok(())
+}
+
+fn validate_guest_tool_linux_aarch64_elf(bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_GUEST_TOOL_BYTES {
+        bail!("verified guest tool must contain 1 byte through 512 MiB");
+    }
+    if bytes.len() < 64
+        || &bytes[..4] != b"\x7fELF"
+        || bytes[4] != 2
+        || bytes[5] != 1
+        || bytes[6] != 1
+        || !matches!(u16::from_le_bytes([bytes[16], bytes[17]]), 2 | 3)
+        || u16::from_le_bytes([bytes[18], bytes[19]]) != 183
+    {
+        bail!("verified guest tool is not a nonempty Linux AArch64 ELF64 executable");
+    }
+    Ok(())
+}
+
+fn confirm_guest_tool_install(
+    instance: &str,
+    profile: &str,
+    current: &GuestToolState,
+    assume_yes: bool,
+) -> Result<()> {
+    if assume_yes {
+        return Ok(());
+    }
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        bail!(
+            "guest tool installation requires an interactive terminal or --yes; nothing was changed"
+        );
+    }
+    let phrase = format!("INSTALL GUEST TOOL {profile} {instance}");
+    eprintln!(
+        "This installs a locally stored, signature-verified artifact for compiled profile {profile:?} inside mountless Lima guest {instance:?}, replacing {}. It does not download or execute the vendor artifact.",
+        current.replacement_detail()
+    );
+    print!("Type {phrase} to confirm: ");
+    io::stdout()
+        .flush()
+        .context("flush guest tool installation confirmation prompt")?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0 || answer.trim_end_matches(['\r', '\n']) != phrase {
+        bail!("guest tool installation was not confirmed; nothing was changed");
+    }
+    Ok(())
+}
+
+fn lima_copy(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    source: &Path,
+    guest_destination: &str,
+) -> Result<()> {
+    let target = format!("{instance}:{guest_destination}");
+    let args = [
+        OsString::from("copy"),
+        OsString::from("--"),
+        source.as_os_str().to_owned(),
+        OsString::from(target),
+    ];
+    let output = probes
+        .output(limactl, &args)
+        .map_err(|error| anyhow!("failed to run limactl copy: {error}"))?;
+    if !output.success {
+        bail!("limactl copy failed: {}", concise_failure(&output));
+    }
+    Ok(())
+}
+
+fn run_guest_root(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    executable: &str,
+    arguments: &[&str],
+    phase: &str,
+) -> Result<ProbeOutput> {
+    let mut command = vec![
+        GUEST_SUDO,
+        "--non-interactive",
+        "--",
+        GUEST_ENV,
+        "-i",
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME=/root",
+        executable,
+    ];
+    command.extend_from_slice(arguments);
+    let output = lima_shell(probes, limactl, instance, &command)
+        .map_err(|error| anyhow!("failed to {phase}: {error}"))?;
+    if !output.success {
+        bail!("failed to {phase}: {}", concise_failure(&output));
+    }
+    Ok(output)
+}
+
+fn inspect_guest_tool(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    profile_name: &str,
+    artifact_path: &str,
+    receipt_path: &str,
+    expected: Option<&GuestToolReceipt>,
+) -> Result<GuestToolState> {
+    let opt = guest_metadata(probes, limactl, instance, GUEST_OPT_DIRECTORY)?;
+    let Some(opt) = opt else {
+        bail!("required guest /opt directory is missing; Guard will not create it");
+    };
+    validate_guest_tool_directory(&opt, GUEST_OPT_DIRECTORY)?;
+    let guard = guest_metadata(probes, limactl, instance, GUEST_GUARD_DIRECTORY)?;
+    let Some(guard) = guard else {
+        let directory = guest_metadata(probes, limactl, instance, GUEST_TOOL_DIRECTORY)?;
+        let artifact = guest_metadata(probes, limactl, instance, artifact_path)?;
+        let receipt_meta = guest_metadata(probes, limactl, instance, receipt_path)?;
+        if directory.is_none() && artifact.is_none() && receipt_meta.is_none() {
+            return Ok(GuestToolState::Missing);
+        }
+        bail!("guest Guard directory is missing while a descendant was reported present");
+    };
+    validate_guest_tool_directory(&guard, GUEST_GUARD_DIRECTORY)?;
+    let directory = guest_metadata(probes, limactl, instance, GUEST_TOOL_DIRECTORY)?;
+    let Some(directory) = directory else {
+        let artifact = guest_metadata(probes, limactl, instance, artifact_path)?;
+        let receipt_meta = guest_metadata(probes, limactl, instance, receipt_path)?;
+        if artifact.is_none() && receipt_meta.is_none() {
+            return Ok(GuestToolState::Missing);
+        }
+        bail!("guest tool directory is missing while a child path was reported present");
+    };
+    validate_guest_tool_directory(&directory, GUEST_TOOL_DIRECTORY)?;
+    let artifact = guest_metadata(probes, limactl, instance, artifact_path)?;
+    let receipt_meta = guest_metadata(probes, limactl, instance, receipt_path)?;
+    if artifact.as_ref().is_some_and(|metadata| {
+        metadata.kind != "regular file"
+            || metadata.uid != 0
+            || metadata.gid != 0
+            || metadata.links != 1
+    }) {
+        bail!("unsafe existing guest tool artifact metadata; Guard will not replace it");
+    }
+    if receipt_meta.as_ref().is_some_and(|metadata| {
+        metadata.kind != "regular file"
+            || metadata.uid != 0
+            || metadata.gid != 0
+            || metadata.links != 1
+    }) {
+        bail!("unsafe existing guest tool receipt metadata; Guard will not replace it");
+    }
+    match (&artifact, &receipt_meta) {
+        (None, None) => return Ok(GuestToolState::Missing),
+        (Some(_), None) => {
+            return Ok(GuestToolState::Partial {
+                detail: "receipt is missing".to_owned(),
+                identity: format!("artifact:{:?}", artifact),
+            });
+        }
+        (None, Some(_)) => {
+            return Ok(GuestToolState::Partial {
+                detail: "artifact is missing".to_owned(),
+                identity: format!("receipt:{:?}", receipt_meta),
+            });
+        }
+        (Some(_), Some(_)) => {}
+    }
+    let artifact = artifact.expect("matched Some above");
+    let receipt_meta = receipt_meta.expect("matched Some above");
+    if artifact.bytes == 0 || artifact.bytes > MAX_GUEST_TOOL_BYTES {
+        bail!("guest tool artifact is empty or exceeds the fixed 512 MiB limit");
+    }
+    if receipt_meta.bytes == 0 || receipt_meta.bytes > MAX_GUEST_TOOL_RECEIPT_BYTES {
+        bail!("guest tool receipt is empty or exceeds the fixed 64 KiB limit");
+    }
+    if artifact.mode != 0o755 || receipt_meta.mode != 0o644 {
+        return Ok(GuestToolState::Mismatch {
+            detail: "artifact or receipt permissions differ from 0755/0644".to_owned(),
+            identity: format!("artifact:{artifact:?}|receipt:{receipt_meta:?}"),
+        });
+    }
+    let receipt_output = run_guest_readonly(
+        probes,
+        limactl,
+        instance,
+        GUEST_CAT,
+        &["--", receipt_path],
+        "read guest tool receipt",
+    )?;
+    let receipt_hash = hex::encode(Sha256::digest(&receipt_output.stdout));
+    let artifact_hash = guest_sha256(probes, limactl, instance, artifact_path)?;
+    let identity = format!(
+        "artifact:{artifact:?}|receipt:{receipt_meta:?}|artifact-sha256:{artifact_hash}|receipt-sha256:{receipt_hash}"
+    );
+    if receipt_meta.bytes != receipt_output.stdout.len() as u64
+        || guest_sha256(probes, limactl, instance, receipt_path)? != receipt_hash
+    {
+        return Ok(GuestToolState::Mismatch {
+            detail: "receipt bytes changed during verification".to_owned(),
+            identity,
+        });
+    }
+    let observed: GuestToolReceipt = match serde_json::from_slice(&receipt_output.stdout) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            return Ok(GuestToolState::Mismatch {
+                detail: "receipt is not valid schema JSON".to_owned(),
+                identity,
+            });
+        }
+    };
+    if !valid_receipt(&observed) {
+        return Ok(GuestToolState::Mismatch {
+            detail: "receipt fields are invalid".to_owned(),
+            identity,
+        });
+    }
+    if observed.profile_name != profile_name {
+        return Ok(GuestToolState::Mismatch {
+            detail: "receipt names a different compiled profile".to_owned(),
+            identity,
+        });
+    }
+    if artifact.bytes != observed.artifact_bytes || artifact_hash != observed.artifact_sha256 {
+        return Ok(GuestToolState::Mismatch {
+            detail: "artifact does not match its root-owned receipt".to_owned(),
+            identity,
+        });
+    }
+    if expected.is_some_and(|expected| expected != &observed) {
+        return Ok(GuestToolState::Mismatch {
+            detail: "receipt identifies a different verified artifact".to_owned(),
+            identity,
+        });
+    }
+    Ok(GuestToolState::Exact)
+}
+
+fn validate_guest_tool_directory(metadata: &GuestFileMetadata, path: &str) -> Result<()> {
+    if metadata.kind != "directory"
+        || metadata.uid != 0
+        || metadata.gid != 0
+        || metadata.mode & 0o022 != 0
+        || metadata.mode & 0o005 != 0o005
+    {
+        bail!(
+            "unsafe metadata for required guest directory {path}; expected a traversable non-symlink root-owned directory with no group/world write bits"
+        );
+    }
+    Ok(())
+}
+
+fn valid_receipt(receipt: &GuestToolReceipt) -> bool {
+    receipt.schema_version == 1
+        && builtin_vendor_profile(&receipt.profile_name).is_some()
+        && validate_manifest_component("receipt tool version", &receipt.tool_manifest_version)
+            .is_ok()
+        && decode_sha256(&receipt.artifact_sha256)
+        && decode_sha256(&receipt.signer_fingerprint_sha256)
+}
+
+fn decode_sha256(value: &str) -> bool {
+    value.len() == 64 && hex::decode(value).is_ok_and(|bytes| bytes.len() == 32)
+}
+
+fn guest_metadata(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    path: &str,
+) -> Result<Option<GuestFileMetadata>> {
+    let exists = run_guest_readonly_allow_failure(
+        probes,
+        limactl,
+        instance,
+        GUEST_TEST,
+        &["-e", path],
+        "inspect guest path existence",
+    )?;
+    if !exists.success {
+        let symlink = run_guest_readonly_allow_failure(
+            probes,
+            limactl,
+            instance,
+            GUEST_TEST,
+            &["-L", path],
+            "inspect guest symlink existence",
+        )?;
+        if !symlink.success {
+            let absent = run_guest_readonly_allow_failure(
+                probes,
+                limactl,
+                instance,
+                GUEST_TEST,
+                &["!", "-e", path],
+                "prove guest path absence",
+            )?;
+            let not_symlink = run_guest_readonly_allow_failure(
+                probes,
+                limactl,
+                instance,
+                GUEST_TEST,
+                &["!", "-L", path],
+                "prove guest symlink absence",
+            )?;
+            if absent.success && not_symlink.success {
+                return Ok(None);
+            }
+            bail!(
+                "guest path existence was indeterminate; positive and negative tests did not agree"
+            );
+        }
+    }
+    let output = run_guest_readonly(
+        probes,
+        limactl,
+        instance,
+        GUEST_STAT,
+        &["--format=%F|%u|%g|%a|%h|%s", "--", path],
+        "inspect guest path metadata",
+    )?;
+    let line = std::str::from_utf8(&output.stdout)
+        .map_err(|_| anyhow!("guest stat produced non-UTF-8 output"))?
+        .trim();
+    let fields = line.split('|').collect::<Vec<_>>();
+    if fields.len() != 6 {
+        bail!("guest stat produced malformed metadata");
+    }
+    Ok(Some(GuestFileMetadata {
+        kind: fields[0].to_owned(),
+        uid: fields[1]
+            .parse()
+            .map_err(|_| anyhow!("guest stat produced invalid uid"))?,
+        gid: fields[2]
+            .parse()
+            .map_err(|_| anyhow!("guest stat produced invalid gid"))?,
+        mode: u32::from_str_radix(fields[3], 8)
+            .map_err(|_| anyhow!("guest stat produced invalid mode"))?,
+        links: fields[4]
+            .parse()
+            .map_err(|_| anyhow!("guest stat produced invalid link count"))?,
+        bytes: fields[5]
+            .parse()
+            .map_err(|_| anyhow!("guest stat produced invalid byte count"))?,
+    }))
+}
+
+fn run_guest_readonly_allow_failure(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    executable: &str,
+    arguments: &[&str],
+    phase: &str,
+) -> Result<ProbeOutput> {
+    let mut command = vec![executable];
+    command.extend_from_slice(arguments);
+    lima_shell(probes, limactl, instance, &command)
+        .map_err(|error| anyhow!("failed to {phase}: {error}"))
+}
+
+fn run_guest_readonly(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    executable: &str,
+    arguments: &[&str],
+    phase: &str,
+) -> Result<ProbeOutput> {
+    let output =
+        run_guest_readonly_allow_failure(probes, limactl, instance, executable, arguments, phase)?;
+    if !output.success {
+        bail!("failed to {phase}: {}", concise_failure(&output));
+    }
+    Ok(output)
+}
+
+fn guest_sha256(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    path: &str,
+) -> Result<String> {
+    let output = run_guest_readonly(
+        probes,
+        limactl,
+        instance,
+        GUEST_SHA256SUM,
+        &["--", path],
+        "hash guest tool file",
+    )?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| anyhow!("guest sha256sum produced non-UTF-8 output"))?;
+    let hash = text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("guest sha256sum produced no digest"))?;
+    if !decode_sha256(hash) {
+        bail!("guest sha256sum produced an invalid digest");
+    }
+    Ok(hash.to_ascii_lowercase())
+}
+
+fn verify_guest_file(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    path: &str,
+    mode: u32,
+    bytes: u64,
+    sha256: &str,
+) -> Result<()> {
+    let metadata = guest_metadata(probes, limactl, instance, path)?
+        .ok_or_else(|| anyhow!("guest staging file is missing"))?;
+    if metadata.kind != "regular file"
+        || metadata.uid != 0
+        || metadata.gid != 0
+        || metadata.mode != mode
+        || metadata.links != 1
+        || metadata.bytes != bytes
+    {
+        bail!("guest staging file metadata did not match the required root-owned regular file");
+    }
+    if guest_sha256(probes, limactl, instance, path)? != sha256 {
+        bail!("guest staging file digest did not match the verified snapshot");
+    }
+    Ok(())
+}
+
+fn verify_guest_copied_file(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    path: &str,
+    bytes: u64,
+    sha256: &str,
+) -> Result<()> {
+    let metadata = guest_metadata(probes, limactl, instance, path)?
+        .ok_or_else(|| anyhow!("copied guest snapshot is missing"))?;
+    if metadata.kind != "regular file" || metadata.links != 1 || metadata.bytes != bytes {
+        bail!("copied guest snapshot metadata did not match the private host snapshot");
+    }
+    if guest_sha256(probes, limactl, instance, path)? != sha256 {
+        bail!("copied guest snapshot digest did not match the private host snapshot");
+    }
+    Ok(())
+}
+
+fn describe_guest_tool_state(state: &GuestToolState) -> String {
+    match state {
+        GuestToolState::Missing => "artifact and receipt are missing".to_owned(),
+        GuestToolState::Partial { detail, .. } => {
+            format!(
+                "partial installation: {}",
+                sanitize_terminal_fragment(detail)
+            )
+        }
+        GuestToolState::Mismatch { detail, .. } => {
+            format!("identity mismatch: {}", sanitize_terminal_fragment(detail))
+        }
+        GuestToolState::Exact => "exact verified identity".to_owned(),
+    }
+}
+
 fn is_host_sharing_mount(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     ["9p", "virtiofs", "sshfs", "reverse-sshfs"]
@@ -2131,6 +3205,75 @@ fn diagnose_macos(
             env!("CARGO_PKG_VERSION"),
         ));
     }
+    for profile_name in sandbox_guard_core::BUILTIN_VENDOR_PROFILE_NAMES {
+        let Some(profile) = builtin_vendor_profile(profile_name) else {
+            checks.push(error_check(
+                &format!("lima.guest.tool.{profile_name}"),
+                "lima-guest-tool",
+                true,
+                "compiled profile name list and resolver disagree".to_owned(),
+            ));
+            continue;
+        };
+        let destination = match compiled_guest_tool_destination(&profile) {
+            Ok(path) => path,
+            Err(error) => {
+                checks.push(error_check(
+                    &format!("lima.guest.tool.{profile_name}"),
+                    "lima-guest-tool",
+                    true,
+                    format!("compiled guest tool path is invalid: {error:#}"),
+                ));
+                continue;
+            }
+        };
+        let receipt_path = format!("{destination}.receipt.json");
+        let state = inspect_guest_tool(
+            probes,
+            &limactl,
+            instance,
+            profile_name,
+            &destination,
+            &receipt_path,
+            None,
+        );
+        checks.push(match state {
+            Ok(GuestToolState::Exact) => ok_check(
+                &format!("lima.guest.tool.{profile_name}"),
+                "lima-guest-tool",
+                true,
+                format!(
+                    "root-owned artifact and receipt agree at {destination}; vendor code was not executed"
+                ),
+            ),
+            Ok(state) => SetupCheck {
+                id: format!("lima.guest.tool.{profile_name}"),
+                component: "lima-guest-tool".to_owned(),
+                required: true,
+                status: match state {
+                    GuestToolState::Missing => CheckStatus::Missing,
+                    GuestToolState::Partial { .. } | GuestToolState::Mismatch { .. } => {
+                        CheckStatus::Mismatch
+                    }
+                    GuestToolState::Exact => unreachable!(),
+                },
+                detail: describe_guest_tool_state(&state),
+                path: Some(PathBuf::from(destination)),
+                repair: Some(manual_repair(
+                    "Select an exact local verified-tool installation and supply the artifact signer's owner-trusted SHA-256 fingerprint to --install-guest-tool.",
+                    &["owner signer trust", "confirmation"],
+                    &[],
+                )),
+            },
+            Err(error) => error_check(
+                &format!("lima.guest.tool.{profile_name}"),
+                "lima-guest-tool",
+                true,
+                format!("could not verify guest artifact and receipt: {error:#}"),
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -2767,6 +3910,8 @@ fn probe_openat2() -> std::result::Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use sandbox_guard_core::install_verified_tool;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::ffi::OsStr;
@@ -2784,6 +3929,10 @@ mod tests {
         snapshot_path: Option<PathBuf>,
         snapshot_error: Option<String>,
         helper_temp_path: Option<String>,
+        tool_snapshot_artifact: Option<PathBuf>,
+        tool_snapshot_receipt: Option<PathBuf>,
+        tool_snapshot_error: Option<String>,
+        tool_nonce: Option<String>,
     }
 
     impl SetupProbes for FakeProbes {
@@ -2846,6 +3995,37 @@ mod tests {
             self.helper_temp_path
                 .clone()
                 .unwrap_or_else(|| "/tmp/guard-helper.0123456789abcdef0123456789abcdef".to_owned())
+        }
+
+        fn snapshot_guest_tool(
+            &self,
+            _artifact: &[u8],
+            _receipt: &[u8],
+        ) -> Result<GuestToolHostSnapshot> {
+            self.calls
+                .borrow_mut()
+                .push("snapshot guest tool".to_owned());
+            if let Some(error) = &self.tool_snapshot_error {
+                bail!("{error}");
+            }
+            Ok(GuestToolHostSnapshot {
+                artifact: self
+                    .tool_snapshot_artifact
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("/private/snapshot/tool")),
+                receipt: self
+                    .tool_snapshot_receipt
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("/private/snapshot/receipt")),
+                _private_directory: None,
+                _home_anchor: None,
+            })
+        }
+
+        fn guest_tool_nonce(&self) -> String {
+            self.tool_nonce
+                .clone()
+                .unwrap_or_else(|| "0123456789abcdef0123456789abcdef".to_owned())
         }
     }
 
@@ -3331,6 +4511,27 @@ mod tests {
         ];
         args.extend(command.iter().map(OsString::from));
         command_key(Path::new(LIMACTL), &args)
+    }
+
+    fn root_shell_key(instance: &str, executable: &str, arguments: &[&str]) -> String {
+        let mut command = vec![
+            GUEST_SUDO,
+            "--non-interactive",
+            "--",
+            GUEST_ENV,
+            "-i",
+            "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME=/root",
+            executable,
+        ];
+        command.extend_from_slice(arguments);
+        shell_key(instance, &command)
+    }
+
+    fn readonly_shell_key(instance: &str, executable: &str, arguments: &[&str]) -> String {
+        let mut command = vec![executable];
+        command.extend_from_slice(arguments);
+        shell_key(instance, &command)
     }
 
     fn mount_inspection_key(instance: &str) -> String {
@@ -4922,6 +6123,902 @@ mod tests {
         // `--yes` is deliberately inert without an explicit action, which lets future setup
         // actions reuse the confirmation flag without widening any current command path.
         assert!(Cli::try_parse_from(["guard", "setup", "--yes"]).is_ok());
+    }
+
+    struct ToolFixture {
+        _input: TempDir,
+        _store: TempDir,
+        root: PathBuf,
+        fingerprint: String,
+        receipt: GuestToolReceipt,
+        artifact: Vec<u8>,
+    }
+
+    fn tool_fixture(name: &str) -> ToolFixture {
+        let input = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let mut artifact = vec![0_u8; 64];
+        artifact[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        artifact[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        artifact[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        let artifact_path = input.path().join("artifact");
+        fs::write(&artifact_path, &artifact).unwrap();
+        let signing_key = SigningKey::from_bytes(&[41_u8; 32]);
+        let public_key = signing_key.verifying_key().to_bytes();
+        let fingerprint = hex::encode(Sha256::digest(public_key));
+        fs::write(input.path().join("key"), hex::encode(public_key)).unwrap();
+        fs::write(
+            input.path().join("signature"),
+            hex::encode(signing_key.sign(&artifact).to_bytes()),
+        )
+        .unwrap();
+        let installed = install_verified_tool(
+            &artifact_path,
+            &input.path().join("signature"),
+            &input.path().join("key"),
+            &fingerprint,
+            store.path(),
+            name,
+            "1.2.3",
+        )
+        .unwrap();
+        let receipt = GuestToolReceipt {
+            schema_version: 1,
+            profile_name: name.to_owned(),
+            tool_manifest_version: installed.manifest.version.clone(),
+            artifact_sha256: installed.manifest.artifact_sha256.clone(),
+            artifact_bytes: installed.manifest.artifact_bytes,
+            signer_fingerprint_sha256: installed.manifest.signer_fingerprint_sha256.clone(),
+        };
+        ToolFixture {
+            _input: input,
+            _store: store,
+            root: installed.root,
+            fingerprint,
+            receipt,
+            artifact,
+        }
+    }
+
+    fn add_exact_guest_tool_outputs(
+        probes: &mut FakeProbes,
+        receipt: &GuestToolReceipt,
+        artifact: &[u8],
+    ) {
+        let instance = "sandbox-guard";
+        let artifact_path = "/opt/sandbox-guard/tools/grok";
+        let receipt_path = "/opt/sandbox-guard/tools/grok.receipt.json";
+        let mut receipt_bytes = serde_json::to_vec_pretty(receipt).unwrap();
+        receipt_bytes.push(b'\n');
+        for path in [
+            GUEST_OPT_DIRECTORY,
+            GUEST_GUARD_DIRECTORY,
+            GUEST_TOOL_DIRECTORY,
+            artifact_path,
+            receipt_path,
+        ] {
+            probes.outputs.insert(
+                readonly_shell_key(instance, GUEST_TEST, &["-e", path]),
+                output(true, "", ""),
+            );
+        }
+        for path in [GUEST_OPT_DIRECTORY, GUEST_GUARD_DIRECTORY] {
+            probes.outputs.insert(
+                readonly_shell_key(
+                    instance,
+                    GUEST_STAT,
+                    &["--format=%F|%u|%g|%a|%h|%s", "--", path],
+                ),
+                output(true, "directory|0|0|755|2|4096\n", ""),
+            );
+        }
+        probes.outputs.insert(
+            readonly_shell_key(
+                instance,
+                GUEST_STAT,
+                &["--format=%F|%u|%g|%a|%h|%s", "--", GUEST_TOOL_DIRECTORY],
+            ),
+            output(true, "directory|0|0|755|2|4096\n", ""),
+        );
+        probes.outputs.insert(
+            readonly_shell_key(
+                instance,
+                GUEST_STAT,
+                &["--format=%F|%u|%g|%a|%h|%s", "--", artifact_path],
+            ),
+            output(
+                true,
+                &format!("regular file|0|0|755|1|{}\n", artifact.len()),
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            readonly_shell_key(
+                instance,
+                GUEST_STAT,
+                &["--format=%F|%u|%g|%a|%h|%s", "--", receipt_path],
+            ),
+            output(
+                true,
+                &format!("regular file|0|0|644|1|{}\n", receipt_bytes.len()),
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            readonly_shell_key(instance, GUEST_CAT, &["--", receipt_path]),
+            ProbeOutput {
+                success: true,
+                stdout: receipt_bytes.clone(),
+                stderr: Vec::new(),
+            },
+        );
+        probes.outputs.insert(
+            readonly_shell_key(instance, GUEST_SHA256SUM, &["--", receipt_path]),
+            output(
+                true,
+                &format!(
+                    "{}  {receipt_path}\n",
+                    hex::encode(Sha256::digest(&receipt_bytes))
+                ),
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            readonly_shell_key(instance, GUEST_SHA256SUM, &["--", artifact_path]),
+            output(
+                true,
+                &format!(
+                    "{}  {artifact_path}\n",
+                    hex::encode(Sha256::digest(artifact))
+                ),
+                "",
+            ),
+        );
+    }
+
+    fn add_guest_metadata_output(probes: &mut FakeProbes, path: &str, stat_line: &str) {
+        probes.outputs.insert(
+            readonly_shell_key("sandbox-guard", GUEST_TEST, &["-e", path]),
+            output(true, "", ""),
+        );
+        probes.outputs.insert(
+            readonly_shell_key(
+                "sandbox-guard",
+                GUEST_STAT,
+                &["--format=%F|%u|%g|%a|%h|%s", "--", path],
+            ),
+            output(true, &format!("{stat_line}\n"), ""),
+        );
+    }
+
+    #[test]
+    fn exact_guest_tool_receipt_is_an_idempotent_noop_and_never_executes_vendor_code() {
+        let fixture = tool_fixture("grok");
+        let mut probes = lima_probes();
+        probes.outputs.insert(
+            list_key(None),
+            output(
+                true,
+                r#"{"name":"sandbox-guard","status":"Running","config":{"mounts":[]}}"#,
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            mount_inspection_key("sandbox-guard"),
+            output(true, "/ ext4\n", ""),
+        );
+        add_exact_guest_tool_outputs(&mut probes, &fixture.receipt, &fixture.artifact);
+
+        assert!(
+            install_lima_guest_tool(
+                &probes,
+                "sandbox-guard",
+                "grok",
+                &fixture.root,
+                &fixture.fingerprint,
+                true,
+            )
+            .unwrap()
+            .is_none()
+        );
+        let calls = probes.calls.borrow();
+        assert!(calls.iter().any(|call| call.contains(GUEST_STAT)));
+        assert!(calls.iter().any(|call| call.contains(GUEST_SHA256SUM)));
+        assert!(calls.iter().all(|call| !call.contains(" copy ")));
+        assert!(calls.iter().all(|call| !call.contains(GUEST_MV)));
+        assert!(calls.iter().all(|call| !call.contains(GUEST_SUDO)));
+        assert!(calls.iter().all(|call| {
+            !call.contains("shell sandbox-guard -- /opt/sandbox-guard/tools/grok")
+        }));
+    }
+
+    #[test]
+    fn guest_tool_selection_and_local_verification_fail_before_lima() {
+        let fixture = tool_fixture("grok");
+        let probes = lima_probes();
+        assert!(
+            install_lima_guest_tool(
+                &probes,
+                "sandbox-guard",
+                "not-compiled",
+                &fixture.root,
+                &fixture.fingerprint,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            install_lima_guest_tool(
+                &probes,
+                "sandbox-guard",
+                "grok",
+                &fixture.root,
+                &"00".repeat(32),
+                true,
+            )
+            .is_err()
+        );
+        let wrong_name = tool_fixture("other");
+        let error = install_lima_guest_tool(
+            &probes,
+            "sandbox-guard",
+            "grok",
+            &wrong_name.root,
+            &wrong_name.fingerprint,
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("does not match"));
+        assert!(probes.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn guest_tool_json_gate_and_cli_option_relationships_fail_closed() {
+        let probes = lima_probes();
+        let error = run_install_guest_tool(
+            &probes,
+            BackendKind::MacosLima,
+            "sandbox-guard",
+            "grok",
+            Path::new("missing"),
+            &"00".repeat(32),
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("--yes"));
+        assert!(probes.calls.borrow().is_empty());
+
+        let complete = [
+            "guard",
+            "setup",
+            "--install-guest-tool",
+            "grok",
+            "--guest-tool-root",
+            "/private/store/grok/1.2.3",
+            "--guest-tool-signer-sha256",
+            "00",
+            "--yes",
+        ];
+        assert!(Cli::try_parse_from(complete).is_ok());
+        assert!(Cli::try_parse_from(["guard", "setup", "--install-guest-tool", "grok"]).is_err());
+        assert!(
+            Cli::try_parse_from(["guard", "setup", "--guest-tool-root", "/tmp/tool",]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "guard",
+                "setup",
+                "--check",
+                "--install-guest-tool",
+                "grok",
+                "--guest-tool-root",
+                "/tmp/tool",
+                "--guest-tool-signer-sha256",
+                "00",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn guest_tool_helpers_use_fixed_discrete_argv_and_sanitize_failures() {
+        let mut probes = lima_probes();
+        let key = root_shell_key(
+            "sandbox-guard",
+            GUEST_MV,
+            &[
+                "--force",
+                "--no-target-directory",
+                "--",
+                "/opt/sandbox-guard/tools/.grok.stage",
+                "/opt/sandbox-guard/tools/grok",
+            ],
+        );
+        probes.outputs.insert(
+            key.clone(),
+            output(false, "", "rename failed\u{1b}]0;bad\u{7}\u{202e}hidden"),
+        );
+        let error = run_guest_root(
+            &probes,
+            Path::new(LIMACTL),
+            "sandbox-guard",
+            GUEST_MV,
+            &[
+                "--force",
+                "--no-target-directory",
+                "--",
+                "/opt/sandbox-guard/tools/.grok.stage",
+                "/opt/sandbox-guard/tools/grok",
+            ],
+            "atomically replace guest tool artifact",
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert_eq!(probes.calls.borrow().as_slice(), &[key]);
+    }
+
+    #[test]
+    fn guest_copy_and_copied_identity_checks_use_exact_argv_and_fail_closed() {
+        let mut probes = lima_probes();
+        let source = Path::new("/private/snapshot/artifact");
+        let guest = "/tmp/.sandbox-guard-grok-fixed.artifact";
+        let copy_key = command_key(
+            Path::new(LIMACTL),
+            &[
+                OsString::from("copy"),
+                OsString::from("--"),
+                source.as_os_str().to_owned(),
+                OsString::from(format!("sandbox-guard:{guest}")),
+            ],
+        );
+        probes
+            .outputs
+            .insert(copy_key.clone(), output(true, "", ""));
+        lima_copy(&probes, Path::new(LIMACTL), "sandbox-guard", source, guest).unwrap();
+        assert_eq!(probes.calls.borrow().as_slice(), &[copy_key]);
+
+        let bytes = b"copied bytes";
+        add_guest_metadata_output(
+            &mut probes,
+            guest,
+            &format!("regular file|501|20|600|1|{}", bytes.len()),
+        );
+        let sha_key = readonly_shell_key("sandbox-guard", GUEST_SHA256SUM, &["--", guest]);
+        probes.outputs.insert(
+            sha_key.clone(),
+            output(
+                true,
+                &format!("{}  {guest}\n", hex::encode(Sha256::digest(bytes))),
+                "",
+            ),
+        );
+        verify_guest_copied_file(
+            &probes,
+            Path::new(LIMACTL),
+            "sandbox-guard",
+            guest,
+            bytes.len() as u64,
+            &hex::encode(Sha256::digest(bytes)),
+        )
+        .unwrap();
+        probes.outputs.insert(
+            sha_key,
+            output(true, &format!("{}  {guest}\n", "00".repeat(32)), ""),
+        );
+        assert!(
+            verify_guest_copied_file(
+                &probes,
+                Path::new(LIMACTL),
+                "sandbox-guard",
+                guest,
+                bytes.len() as u64,
+                &hex::encode(Sha256::digest(bytes)),
+            )
+            .is_err()
+        );
+    }
+
+    fn seed_absent_then_present(probes: &mut FakeProbes, path: &str, absent_reads: usize) {
+        let positive = readonly_shell_key("sandbox-guard", GUEST_TEST, &["-e", path]);
+        queue_outputs(
+            probes,
+            positive.clone(),
+            (0..absent_reads)
+                .map(|_| output(false, "", "missing"))
+                .collect(),
+        );
+        probes.outputs.insert(positive, output(true, "", ""));
+        probes.outputs.insert(
+            readonly_shell_key("sandbox-guard", GUEST_TEST, &["-L", path]),
+            output(false, "", "missing"),
+        );
+        for predicate in [["!", "-e", path], ["!", "-L", path]] {
+            probes.outputs.insert(
+                readonly_shell_key("sandbox-guard", GUEST_TEST, &predicate),
+                output(true, "", ""),
+            );
+        }
+    }
+
+    #[test]
+    fn verified_guest_tool_full_transaction_pins_every_gate_and_never_executes_vendor_code() {
+        let fixture = tool_fixture("grok");
+        let mut receipt_bytes = serde_json::to_vec_pretty(&fixture.receipt).unwrap();
+        receipt_bytes.push(b'\n');
+        let mut probes = lima_probes();
+        probes.outputs.insert(
+            list_key(None),
+            output(
+                true,
+                r#"{"name":"sandbox-guard","status":"Running","config":{"mounts":[]}}"#,
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            mount_inspection_key("sandbox-guard"),
+            output(true, "/ ext4\n", ""),
+        );
+        add_exact_guest_tool_outputs(&mut probes, &fixture.receipt, &fixture.artifact);
+
+        let artifact_path = "/opt/sandbox-guard/tools/grok";
+        let receipt_path = "/opt/sandbox-guard/tools/grok.receipt.json";
+        seed_absent_then_present(&mut probes, artifact_path, 5);
+        seed_absent_then_present(&mut probes, receipt_path, 5);
+
+        const NONCE: &str = "0123456789abcdef0123456789abcdef";
+        let guest_artifact = format!("/tmp/.sandbox-guard-grok-{NONCE}.artifact");
+        let guest_receipt = format!("/tmp/.sandbox-guard-grok-{NONCE}.receipt");
+        let stage_artifact = format!("{GUEST_TOOL_DIRECTORY}/.grok-{NONCE}.stage");
+        let stage_receipt = format!("{GUEST_TOOL_DIRECTORY}/.grok-{NONCE}.receipt.stage");
+        probes.outputs.insert(
+            command_key(
+                Path::new(LIMACTL),
+                &[
+                    OsString::from("copy"),
+                    OsString::from("--"),
+                    OsString::from("/private/snapshot/tool"),
+                    OsString::from(format!("sandbox-guard:{guest_artifact}")),
+                ],
+            ),
+            output(true, "", ""),
+        );
+        probes.outputs.insert(
+            command_key(
+                Path::new(LIMACTL),
+                &[
+                    OsString::from("copy"),
+                    OsString::from("--"),
+                    OsString::from("/private/snapshot/receipt"),
+                    OsString::from(format!("sandbox-guard:{guest_receipt}")),
+                ],
+            ),
+            output(true, "", ""),
+        );
+        for (path, mode, bytes, digest) in [
+            (
+                guest_artifact.as_str(),
+                "600",
+                fixture.artifact.len(),
+                hex::encode(Sha256::digest(&fixture.artifact)),
+            ),
+            (
+                guest_receipt.as_str(),
+                "600",
+                receipt_bytes.len(),
+                hex::encode(Sha256::digest(&receipt_bytes)),
+            ),
+            (
+                stage_artifact.as_str(),
+                "755",
+                fixture.artifact.len(),
+                hex::encode(Sha256::digest(&fixture.artifact)),
+            ),
+            (
+                stage_receipt.as_str(),
+                "644",
+                receipt_bytes.len(),
+                hex::encode(Sha256::digest(&receipt_bytes)),
+            ),
+        ] {
+            add_guest_metadata_output(
+                &mut probes,
+                path,
+                &format!("regular file|0|0|{mode}|1|{bytes}"),
+            );
+            probes.outputs.insert(
+                readonly_shell_key("sandbox-guard", GUEST_SHA256SUM, &["--", path]),
+                output(true, &format!("{digest}  {path}\n"), ""),
+            );
+        }
+        let artifact_install = root_shell_key(
+            "sandbox-guard",
+            GUEST_INSTALL,
+            &[
+                "--owner=0",
+                "--group=0",
+                "--mode=0755",
+                "--no-target-directory",
+                "--",
+                &guest_artifact,
+                &stage_artifact,
+            ],
+        );
+        let receipt_install = root_shell_key(
+            "sandbox-guard",
+            GUEST_INSTALL,
+            &[
+                "--owner=0",
+                "--group=0",
+                "--mode=0644",
+                "--no-target-directory",
+                "--",
+                &guest_receipt,
+                &stage_receipt,
+            ],
+        );
+        let cleanup = root_shell_key(
+            "sandbox-guard",
+            GUEST_RM,
+            &["--force", "--", &guest_artifact, &guest_receipt],
+        );
+        let artifact_rename = root_shell_key(
+            "sandbox-guard",
+            GUEST_MV,
+            &[
+                "--force",
+                "--no-target-directory",
+                "--",
+                &stage_artifact,
+                artifact_path,
+            ],
+        );
+        let receipt_rename = root_shell_key(
+            "sandbox-guard",
+            GUEST_MV,
+            &[
+                "--force",
+                "--no-target-directory",
+                "--",
+                &stage_receipt,
+                receipt_path,
+            ],
+        );
+        for key in [
+            artifact_install.clone(),
+            receipt_install.clone(),
+            cleanup.clone(),
+            artifact_rename.clone(),
+            receipt_rename.clone(),
+        ] {
+            probes.outputs.insert(key, output(true, "", ""));
+        }
+
+        let action = install_lima_guest_tool(
+            &probes,
+            "sandbox-guard",
+            "grok",
+            &fixture.root,
+            &fixture.fingerprint,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(action.contains("installed and verified grok 1.2.3"));
+        let calls = probes.calls.borrow();
+        assert_eq!(
+            calls.iter().filter(|call| *call == &list_key(None)).count(),
+            5
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| *call == &mount_inspection_key("sandbox-guard"))
+                .count(),
+            5
+        );
+        for key in [
+            &artifact_install,
+            &receipt_install,
+            &cleanup,
+            &artifact_rename,
+            &receipt_rename,
+        ] {
+            assert!(calls.contains(key), "missing exact command: {key}");
+        }
+        let first_rename = calls
+            .iter()
+            .position(|call| call == &artifact_rename)
+            .unwrap();
+        let second_rename = calls
+            .iter()
+            .position(|call| call == &receipt_rename)
+            .unwrap();
+        assert!(first_rename < second_rename);
+        assert!(calls.iter().all(|call| {
+            if call.contains(GUEST_SUDO) {
+                call.contains(GUEST_INSTALL) || call.contains(GUEST_MV) || call.contains(GUEST_RM)
+            } else {
+                true
+            }
+        }));
+        assert!(calls.iter().all(|call| {
+            !call.contains("shell sandbox-guard -- /opt/sandbox-guard/tools/grok")
+                && !call.contains(" start ")
+                && !call.contains(" stop ")
+                && !call.contains(" delete")
+        }));
+    }
+
+    #[test]
+    fn unsafe_partial_guest_tool_and_invalid_receipt_are_rejected_or_mismatched() {
+        let mut probes = lima_probes();
+        let artifact_path = "/opt/sandbox-guard/tools/grok";
+        let receipt_path = "/opt/sandbox-guard/tools/grok.receipt.json";
+        add_guest_metadata_output(&mut probes, GUEST_OPT_DIRECTORY, "directory|0|0|755|2|4096");
+        add_guest_metadata_output(
+            &mut probes,
+            GUEST_GUARD_DIRECTORY,
+            "directory|0|0|755|2|4096",
+        );
+        add_guest_metadata_output(
+            &mut probes,
+            GUEST_TOOL_DIRECTORY,
+            "directory|0|0|755|2|4096",
+        );
+        add_guest_metadata_output(&mut probes, artifact_path, "symbolic link|0|0|777|1|4");
+        probes.outputs.insert(
+            readonly_shell_key("sandbox-guard", GUEST_TEST, &["-e", receipt_path]),
+            output(false, "", "missing"),
+        );
+        probes.outputs.insert(
+            readonly_shell_key("sandbox-guard", GUEST_TEST, &["-L", receipt_path]),
+            output(false, "", "missing"),
+        );
+        for predicate in [["!", "-e", receipt_path], ["!", "-L", receipt_path]] {
+            probes.outputs.insert(
+                readonly_shell_key("sandbox-guard", GUEST_TEST, &predicate),
+                output(true, "", ""),
+            );
+        }
+        assert!(
+            inspect_guest_tool(
+                &probes,
+                Path::new(LIMACTL),
+                "sandbox-guard",
+                "grok",
+                artifact_path,
+                receipt_path,
+                None,
+            )
+            .is_err()
+        );
+
+        let fixture = tool_fixture("grok");
+        let mut probes = lima_probes();
+        add_exact_guest_tool_outputs(&mut probes, &fixture.receipt, &fixture.artifact);
+        let invalid = b"{not-json}\n";
+        probes.outputs.insert(
+            readonly_shell_key("sandbox-guard", GUEST_CAT, &["--", receipt_path]),
+            ProbeOutput {
+                success: true,
+                stdout: invalid.to_vec(),
+                stderr: Vec::new(),
+            },
+        );
+        probes.outputs.insert(
+            readonly_shell_key(
+                "sandbox-guard",
+                GUEST_STAT,
+                &["--format=%F|%u|%g|%a|%h|%s", "--", receipt_path],
+            ),
+            output(
+                true,
+                &format!("regular file|0|0|644|1|{}\n", invalid.len()),
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            readonly_shell_key("sandbox-guard", GUEST_SHA256SUM, &["--", receipt_path]),
+            output(
+                true,
+                &format!("{}  {receipt_path}\n", hex::encode(Sha256::digest(invalid))),
+                "",
+            ),
+        );
+        assert!(matches!(
+            inspect_guest_tool(
+                &probes,
+                Path::new(LIMACTL),
+                "sandbox-guard",
+                "grok",
+                artifact_path,
+                receipt_path,
+                Some(&fixture.receipt),
+            )
+            .unwrap(),
+            GuestToolState::Mismatch { .. }
+        ));
+
+        assert_ne!(
+            GuestToolState::Mismatch {
+                detail: "same classification".to_owned(),
+                identity: "before".to_owned(),
+            },
+            GuestToolState::Mismatch {
+                detail: "same classification".to_owned(),
+                identity: "after".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn guest_tool_diagnostics_require_proven_absence_and_never_use_sudo() {
+        let probes = lima_probes();
+        assert!(
+            guest_metadata(
+                &probes,
+                Path::new(LIMACTL),
+                "sandbox-guard",
+                "/opt/sandbox-guard/tools/grok",
+            )
+            .is_err()
+        );
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.contains(GUEST_SUDO))
+        );
+
+        let mut probes = lima_probes();
+        let path = "/opt/sandbox-guard/tools/missing";
+        for predicate in [&["-e", path][..], &["-L", path][..], &["!", "-e", path][..]] {
+            probes.outputs.insert(
+                readonly_shell_key("sandbox-guard", GUEST_TEST, predicate),
+                output(false, "", "indeterminate"),
+            );
+        }
+        probes.outputs.insert(
+            readonly_shell_key("sandbox-guard", GUEST_TEST, &["!", "-L", path]),
+            output(true, "", ""),
+        );
+        assert!(guest_metadata(&probes, Path::new(LIMACTL), "sandbox-guard", path,).is_err());
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.contains(GUEST_SUDO))
+        );
+    }
+
+    #[test]
+    fn oversized_receipt_and_symlinked_ancestor_fail_before_cat_or_hash() {
+        let fixture = tool_fixture("grok");
+        let artifact_path = "/opt/sandbox-guard/tools/grok";
+        let receipt_path = "/opt/sandbox-guard/tools/grok.receipt.json";
+        let mut probes = lima_probes();
+        add_exact_guest_tool_outputs(&mut probes, &fixture.receipt, &fixture.artifact);
+        probes.outputs.insert(
+            readonly_shell_key(
+                "sandbox-guard",
+                GUEST_STAT,
+                &["--format=%F|%u|%g|%a|%h|%s", "--", receipt_path],
+            ),
+            output(
+                true,
+                &format!(
+                    "regular file|0|0|644|1|{}\n",
+                    MAX_GUEST_TOOL_RECEIPT_BYTES + 1
+                ),
+                "",
+            ),
+        );
+        assert!(
+            inspect_guest_tool(
+                &probes,
+                Path::new(LIMACTL),
+                "sandbox-guard",
+                "grok",
+                artifact_path,
+                receipt_path,
+                Some(&fixture.receipt),
+            )
+            .is_err()
+        );
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.contains(GUEST_CAT) && !call.contains(GUEST_SHA256SUM))
+        );
+
+        let mut probes = lima_probes();
+        add_guest_metadata_output(
+            &mut probes,
+            GUEST_OPT_DIRECTORY,
+            "symbolic link|0|0|777|1|4",
+        );
+        assert!(
+            inspect_guest_tool(
+                &probes,
+                Path::new(LIMACTL),
+                "sandbox-guard",
+                "grok",
+                artifact_path,
+                receipt_path,
+                None,
+            )
+            .is_err()
+        );
+        assert_eq!(probes.calls.borrow().len(), 2);
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.contains(GUEST_SUDO))
+        );
+    }
+
+    #[test]
+    fn local_tool_verifier_errors_do_not_render_owner_paths_or_nested_sources() {
+        let probes = lima_probes();
+        let hostile = Path::new("/private/owner\n\u{1b}]0;secret/tool");
+        let error = install_lima_guest_tool(
+            &probes,
+            "sandbox-guard",
+            "grok",
+            hostile,
+            &"00".repeat(32),
+            true,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("tool-store verification failed"));
+        assert!(!rendered.contains("owner"));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(probes.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn guest_tool_snapshot_is_anchored_in_held_real_home_and_read_only() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let snapshot = create_guest_tool_snapshot_in(b"artifact", b"receipt", &home).unwrap();
+        let directory = snapshot.artifact.parent().unwrap();
+        assert_eq!(
+            fs::symlink_metadata(directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for (path, expected) in [
+            (&snapshot.artifact, b"artifact".as_slice()),
+            (&snapshot.receipt, b"receipt".as_slice()),
+        ] {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert!(metadata.is_file());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+            assert_eq!(fs::read(path).unwrap(), expected);
+        }
+
+        let target = root.path().join("elsewhere");
+        fs::create_dir(&target).unwrap();
+        let alias = root.path().join("home-link");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        assert!(create_guest_tool_snapshot_in(b"artifact", b"receipt", &alias).is_err());
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
     }
 
     #[test]

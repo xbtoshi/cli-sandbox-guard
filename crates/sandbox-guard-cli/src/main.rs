@@ -284,7 +284,7 @@ struct SetupArgs {
     /// This is the only command path that creates a VM; it never starts or reconfigures one.
     #[arg(
         long,
-        conflicts_with_all = ["check", "start_instance", "install_guest_packages", "install_guest_helper"]
+        conflicts_with_all = ["check", "start_instance", "install_guest_packages", "install_guest_helper", "install_guest_tool"]
     )]
     create_instance: bool,
 
@@ -292,7 +292,7 @@ struct SetupArgs {
     /// The instance must already exist and declare no host mounts.
     #[arg(
         long,
-        conflicts_with_all = ["check", "create_instance", "install_guest_packages", "install_guest_helper"]
+        conflicts_with_all = ["check", "create_instance", "install_guest_packages", "install_guest_helper", "install_guest_tool"]
     )]
     start_instance: bool,
 
@@ -300,7 +300,7 @@ struct SetupArgs {
     /// This invokes passwordless sudo only inside the dedicated guest, never on the host.
     #[arg(
         long,
-        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_helper"]
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_helper", "install_guest_tool"]
     )]
     install_guest_packages: bool,
 
@@ -309,7 +309,7 @@ struct SetupArgs {
         long,
         value_name = "ARTIFACT",
         requires = "guest_helper_sha256",
-        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages"]
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_tool"]
     )]
     install_guest_helper: Option<PathBuf>,
 
@@ -318,9 +318,26 @@ struct SetupArgs {
         long,
         value_name = "HEX",
         requires = "install_guest_helper",
-        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages"]
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_tool"]
     )]
     guest_helper_sha256: Option<String>,
+    /// Install one locally stored, signature-verified artifact at its compiled profile path in
+    /// a running mountless Lima guest. Initially only the built-in `grok` profile is selectable.
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        requires_all = ["guest_tool_root", "guest_tool_signer_sha256"],
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages", "install_guest_helper"]
+    )]
+    install_guest_tool: Option<String>,
+
+    /// Exact local verified-tool installation root (the directory containing manifest.json).
+    #[arg(long, value_name = "ROOT", requires = "install_guest_tool")]
+    guest_tool_root: Option<PathBuf>,
+
+    /// Owner-supplied SHA-256 fingerprint of the artifact signing public key.
+    #[arg(long, value_name = "HEX", requires = "install_guest_tool")]
+    guest_tool_signer_sha256: Option<String>,
 
     /// Confirm a mutating setup action without an interactive prompt. Required with
     /// a Lima action under --json, and the only way to mutate Lima on a non-interactive host.
