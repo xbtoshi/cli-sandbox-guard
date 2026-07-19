@@ -49,6 +49,7 @@ const HOST_TEST: &str = "/usr/bin/test";
 const HOST_SUDO: &str = "/usr/bin/sudo";
 const HOST_APT_GET: &str = "/usr/bin/apt-get";
 const HOST_BWRAP: &str = "/usr/bin/bwrap";
+const HOST_SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 const HOST_GIT: &str = "/usr/bin/git";
 const HOST_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 const HOST_OS_RELEASE: &str = "/etc/os-release";
@@ -592,6 +593,7 @@ fn install_linux_packages(
     if missing.is_empty() {
         return Ok(None);
     }
+    let authorized = missing.clone();
     require_linux_installer_prerequisites(probes)?;
     require_linux_cgroup_for_install(probes, require_cgroup, "before confirmation")?;
     confirm_linux_package_install(&missing, assume_yes)?;
@@ -600,6 +602,7 @@ fn install_linux_packages(
     require_linux_installer_prerequisites(probes)?;
     require_linux_cgroup_for_install(probes, require_cgroup, "immediately before apt-get update")?;
     let missing = missing_linux_runtime_artifacts(probes)?;
+    require_missing_subset(&authorized, &missing, "before apt-get update")?;
     if missing.is_empty() {
         return Ok(None);
     }
@@ -609,6 +612,7 @@ fn install_linux_packages(
     require_linux_installer_prerequisites(probes)?;
     require_linux_cgroup_for_install(probes, require_cgroup, "between update and install")?;
     let missing = missing_linux_runtime_artifacts(probes)?;
+    require_missing_subset(&authorized, &missing, "after apt-get update")?;
     let packages: Vec<_> = missing.iter().map(|artifact| artifact.package).collect();
     if packages.is_empty() {
         return Ok(Some(
@@ -636,6 +640,26 @@ fn install_linux_packages(
         "installed and verified Linux runtime packages: {}",
         packages.join(", ")
     )))
+}
+
+fn require_missing_subset(
+    authorized: &[MissingLinuxArtifact],
+    current: &[MissingLinuxArtifact],
+    phase: &str,
+) -> Result<()> {
+    let authorized: BTreeSet<_> = authorized.iter().map(|artifact| artifact.package).collect();
+    let added: Vec<_> = current
+        .iter()
+        .map(|artifact| artifact.package)
+        .filter(|package| !authorized.contains(package))
+        .collect();
+    if !added.is_empty() {
+        bail!(
+            "the missing Linux package subset grew after confirmation ({}) {phase}; no further package mutation was attempted. Rerun setup and reconfirm the new exact subset",
+            added.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn require_supported_ubuntu(probes: &dyn SetupProbes, phase: &str) -> Result<()> {
@@ -710,7 +734,7 @@ fn refuse_wsl_or_container(probes: &dyn SetupProbes, phase: &str) -> Result<()> 
     let lower = kernel.to_ascii_lowercase();
     if lower.contains("microsoft") || lower.contains("wsl") {
         bail!(
-            "--install-linux-packages refuses WSL hosts because their namespace/cgroup policy is not the qualified Ubuntu 24.04 host boundary {phase}"
+            "--install-linux-packages detected common WSL kernel markers and refuses this host because it is not the qualified Ubuntu 24.04 boundary {phase}"
         );
     }
     let cgroup = probes
@@ -876,9 +900,15 @@ fn run_linux_apt(probes: &dyn SetupProbes, packages: &[&str]) -> Result<()> {
     ];
     if install {
         args.extend(
-            ["install", "--yes", "--no-install-recommends", "--reinstall"]
-                .into_iter()
-                .map(OsString::from),
+            [
+                "install",
+                "--yes",
+                "--no-install-recommends",
+                "--no-remove",
+                "--reinstall",
+            ]
+            .into_iter()
+            .map(OsString::from),
         );
         args.extend(packages.iter().copied().map(OsString::from));
     } else {
@@ -3210,15 +3240,6 @@ fn diagnose(
     require_cgroup: bool,
 ) -> Result<SetupReport> {
     let mut checks = Vec::new();
-    checks.push(executable_check(
-        probes,
-        "host.git",
-        "host",
-        "git",
-        true,
-        platform_install_repair("git"),
-    ));
-
     let policy = CompiledPolicy::builtin();
     checks.push(match policy {
         Ok(policy) => ok_check(
@@ -3242,6 +3263,14 @@ fn diagnose(
     match backend {
         BackendKind::LinuxBwrap => diagnose_linux(probes, &mut checks, require_cgroup),
         BackendKind::MacosLima => {
+            checks.push(executable_check(
+                probes,
+                "host.git",
+                "host",
+                "git",
+                true,
+                platform_install_repair("git"),
+            ));
             diagnose_macos(probes, &mut checks, lima_instance)?;
         }
         BackendKind::Auto => unreachable!("backend is resolved before diagnosis"),
@@ -3258,15 +3287,16 @@ fn diagnose(
 }
 
 fn diagnose_linux(probes: &dyn SetupProbes, checks: &mut Vec<SetupCheck>, require_cgroup: bool) {
-    let bwrap = probes.which("bwrap");
-    checks.push(executable_check(
-        probes,
+    let bwrap_fixed = fixed_host_artifact_available(probes, HOST_BWRAP, "-x");
+    checks.push(fixed_host_artifact_check_from(
         "linux.bwrap",
         "linux-host",
-        "bwrap",
+        HOST_BWRAP,
         true,
+        "fixed Bubblewrap runtime is executable",
+        bwrap_fixed.clone(),
         manual_repair(
-            "Install Bubblewrap from the system package manager; Guard never invokes sudo.",
+            "Install Bubblewrap at the supported distribution path; Guard never uses a PATH fallback for the sandbox boundary.",
             &["sudo", "network"],
             &["sudo apt-get update && sudo apt-get install -y bubblewrap"],
         ),
@@ -3296,50 +3326,65 @@ fn diagnose_linux(probes: &dyn SetupProbes, checks: &mut Vec<SetupCheck>, requir
     ));
     checks.push(fixed_git_check(probes));
     checks.push(glibc_check(probes));
-    let namespace_probe = bwrap
-        .as_deref()
-        .map(|path| probes.linux_namespace_available(path));
-    checks.push(match (bwrap.as_deref(), namespace_probe) {
-        (Some(path), Some(Ok(true))) => ok_path_check(
-            "linux.bwrap.namespace-probe",
-            "linux-kernel",
-            true,
-            "production-like Bubblewrap namespace probe succeeded".to_owned(),
-            path.to_path_buf(),
-        ),
-        (Some(path), Some(Ok(false))) => SetupCheck {
+    checks.push(if !require_cgroup {
+        SetupCheck {
             id: "linux.bwrap.namespace-probe".to_owned(),
             component: "linux-kernel".to_owned(),
-            required: true,
-            status: CheckStatus::Misconfigured,
-            detail: "Bubblewrap is present but the production-like unprivileged namespace probe failed; Guard will not fall back to weaker isolation".to_owned(),
-            path: Some(path.to_path_buf()),
-            repair: Some(manual_repair(
-                "Restore unprivileged Bubblewrap operation under the distribution's kernel/AppArmor policy; Guard will not change sysctls, setuid bits, or AppArmor policy.",
-                &["sudo", "confirmation"],
-                &[],
-            )),
-        },
-        (Some(path), Some(Err(error))) => error_check(
-            "linux.bwrap.namespace-probe",
-            "linux-kernel",
-            true,
-            format!(
-                "could not execute the production-like Bubblewrap namespace probe through {}: {}",
-                safe_path_for_error(path),
-                sanitize_terminal_fragment(&error)
+            required: false,
+            status: CheckStatus::Unverifiable,
+            detail: "active namespace launch was not requested; use --require-cgroup to run the disposable Bubblewrap and cgroup probes".to_owned(),
+            path: Some(PathBuf::from(HOST_BWRAP)),
+            repair: None,
+        }
+    } else {
+        match bwrap_fixed {
+            Ok(true) => match probes.linux_namespace_available(Path::new(HOST_BWRAP)) {
+                Ok(true) => ok_path_check(
+                    "linux.bwrap.namespace-probe",
+                    "linux-kernel",
+                    true,
+                    "production-like Bubblewrap namespace probe succeeded".to_owned(),
+                    PathBuf::from(HOST_BWRAP),
+                ),
+                Ok(false) => SetupCheck {
+                    id: "linux.bwrap.namespace-probe".to_owned(),
+                    component: "linux-kernel".to_owned(),
+                    required: true,
+                    status: CheckStatus::Misconfigured,
+                    detail: "Bubblewrap is present but the production-like unprivileged namespace probe failed; Guard will not fall back to weaker isolation".to_owned(),
+                    path: Some(PathBuf::from(HOST_BWRAP)),
+                    repair: Some(manual_repair(
+                        "Restore unprivileged Bubblewrap operation under the distribution's kernel/AppArmor policy; Guard will not change sysctls, setuid bits, or AppArmor policy.",
+                        &["sudo", "confirmation"],
+                        &[],
+                    )),
+                },
+                Err(error) => error_check(
+                    "linux.bwrap.namespace-probe",
+                    "linux-kernel",
+                    true,
+                    format!(
+                        "could not execute the production-like Bubblewrap namespace probe through {HOST_BWRAP}: {}",
+                        sanitize_terminal_fragment(&error)
+                    ),
+                ),
+            },
+            Ok(false) => SetupCheck {
+                id: "linux.bwrap.namespace-probe".to_owned(),
+                component: "linux-kernel".to_owned(),
+                required: true,
+                status: CheckStatus::Missing,
+                detail: "Bubblewrap is absent, so the required namespace probe could not run".to_owned(),
+                path: Some(PathBuf::from(HOST_BWRAP)),
+                repair: Some(platform_install_repair("bubblewrap")),
+            },
+            Err(error) => error_check(
+                "linux.bwrap.namespace-probe",
+                "linux-kernel",
+                true,
+                format!("could not inspect {HOST_BWRAP} before the namespace probe: {error}"),
             ),
-        ),
-        (None, None) => SetupCheck {
-            id: "linux.bwrap.namespace-probe".to_owned(),
-            component: "linux-kernel".to_owned(),
-            required: true,
-            status: CheckStatus::Missing,
-            detail: "Bubblewrap is absent, so the required namespace probe could not run".to_owned(),
-            path: None,
-            repair: Some(platform_install_repair("bubblewrap")),
-        },
-        _ => unreachable!("namespace probe presence follows the bwrap path"),
+        }
     });
     checks.push(match probes.openat2_available() {
         Ok(true) => ok_check(
@@ -3408,60 +3453,98 @@ fn diagnose_linux(probes: &dyn SetupProbes, checks: &mut Vec<SetupCheck>, requir
         ),
     });
 
-    let cgroup_required = require_cgroup;
-    let cgroup_helper = probes.host_helper_path();
-    let cgroup_probe = cgroup_helper
-        .as_deref()
-        .map(|helper| probes.linux_cgroup_available(helper));
-    checks.push(match (cgroup_helper, cgroup_probe) {
-        (Some(helper), Some(Ok(true))) => ok_path_check(
-            "linux.cgroup-probe",
-            "linux-cgroup",
-            cgroup_required,
-            "transient cgroup-v2 probe enforced the production resource properties".to_owned(),
-            helper,
+    let systemd_fixed = fixed_host_artifact_available(probes, HOST_SYSTEMD_RUN, "-x");
+    checks.push(fixed_host_artifact_check_from(
+        "linux.systemd-run.fixed",
+        "linux-cgroup",
+        HOST_SYSTEMD_RUN,
+        require_cgroup,
+        "fixed transient cgroup launcher is executable",
+        systemd_fixed.clone(),
+        manual_repair(
+            "Install systemd-run at the supported distribution path when cgroup-required mode is needed; Guard will not use a PATH fallback.",
+            &["sudo", "network"],
+            &[],
         ),
-        (Some(_), Some(Ok(false))) => SetupCheck {
+    ));
+    checks.push(if !require_cgroup {
+        SetupCheck {
             id: "linux.cgroup-probe".to_owned(),
             component: "linux-cgroup".to_owned(),
-            required: cgroup_required,
-            status: CheckStatus::Missing,
-            detail: if cgroup_required {
-                "required cgroup-v2 user delegation probe failed; Guard will not downgrade to best-effort".to_owned()
-            } else {
-                "cgroup-v2 user delegation probe is unavailable; default runs retain rlimits and seccomp, while --cgroup required will fail closed".to_owned()
+            required: false,
+            status: CheckStatus::Unverifiable,
+            detail: "active transient cgroup probe was not requested; use --require-cgroup to launch it and make it readiness-blocking".to_owned(),
+            path: Some(PathBuf::from(HOST_SYSTEMD_RUN)),
+            repair: None,
+        }
+    } else {
+        match systemd_fixed {
+            Ok(true) => match probes.host_helper_path() {
+                Some(helper) => match probes.linux_cgroup_available(&helper) {
+                    Ok(true) => ok_path_check(
+                        "linux.cgroup-probe",
+                        "linux-cgroup",
+                        true,
+                        "transient cgroup-v2 probe enforced the production resource properties"
+                            .to_owned(),
+                        PathBuf::from(HOST_SYSTEMD_RUN),
+                    ),
+                    Ok(false) => SetupCheck {
+                        id: "linux.cgroup-probe".to_owned(),
+                        component: "linux-cgroup".to_owned(),
+                        required: true,
+                        status: CheckStatus::Missing,
+                        detail: "required cgroup-v2 user delegation probe failed; Guard will not downgrade to best-effort".to_owned(),
+                        path: Some(PathBuf::from(HOST_SYSTEMD_RUN)),
+                        repair: Some(manual_repair(
+                            "Enable a delegated user systemd instance and verify it with guard test --require-cgroup; Guard will not change cgroup policy.",
+                            &["sudo", "confirmation"],
+                            &[],
+                        )),
+                    },
+                    Err(error) => error_check(
+                        "linux.cgroup-probe",
+                        "linux-cgroup",
+                        true,
+                        format!(
+                            "could not execute the production cgroup probe with {HOST_SYSTEMD_RUN}: {}",
+                            sanitize_terminal_fragment(&error)
+                        ),
+                    ),
+                },
+                None => SetupCheck {
+                    id: "linux.cgroup-probe".to_owned(),
+                    component: "linux-cgroup".to_owned(),
+                    required: true,
+                    status: CheckStatus::Missing,
+                    detail: "guard-helper is absent, so the production cgroup probe could not run"
+                        .to_owned(),
+                    path: None,
+                    repair: Some(manual_repair(
+                        "Install the matching guard-helper, then rerun guard setup --check --require-cgroup.",
+                        &["confirmation"],
+                        &[],
+                    )),
+                },
             },
-            path: None,
-            repair: Some(manual_repair(
-                "Enable a delegated user systemd instance and verify it with guard test --require-cgroup; Guard will not change cgroup policy.",
-                &["sudo", "confirmation"],
-                &[],
-            )),
-        },
-        (Some(helper), Some(Err(error))) => error_check(
-            "linux.cgroup-probe",
-            "linux-cgroup",
-            cgroup_required,
-            format!(
-                "could not execute the production cgroup probe through {}: {}",
-                safe_path_for_error(&helper),
-                sanitize_terminal_fragment(&error)
+            Ok(false) => SetupCheck {
+                id: "linux.cgroup-probe".to_owned(),
+                component: "linux-cgroup".to_owned(),
+                required: true,
+                status: CheckStatus::Missing,
+                detail: format!(
+                    "{HOST_SYSTEMD_RUN} is absent, so the required cgroup probe could not run"
+                ),
+                path: Some(PathBuf::from(HOST_SYSTEMD_RUN)),
+                repair: None,
+            },
+            Err(error) => error_check(
+                "linux.cgroup-probe",
+                "linux-cgroup",
+                true,
+                format!("could not inspect {HOST_SYSTEMD_RUN} before cgroup probing: {error}"),
             ),
-        ),
-        (None, None) => SetupCheck {
-            id: "linux.cgroup-probe".to_owned(),
-            component: "linux-cgroup".to_owned(),
-            required: cgroup_required,
-            status: CheckStatus::Missing,
-            detail: "guard-helper is absent, so the production cgroup probe could not run".to_owned(),
-            path: None,
-            repair: Some(manual_repair(
-                "Install the matching guard-helper, then rerun guard setup --check.",
-                &["confirmation"],
-                &[],
-            )),
-        },
-        _ => unreachable!("cgroup probe presence follows the helper path"),
+        }
     });
     checks.push(executable_check(
         probes,
@@ -3868,19 +3951,50 @@ fn fixed_host_artifact_check(
     ok_detail: &str,
     repair: Repair,
 ) -> SetupCheck {
+    fixed_host_artifact_check_from(
+        id,
+        component,
+        path,
+        true,
+        ok_detail,
+        fixed_host_artifact_available(probes, path, test_flag),
+        repair,
+    )
+}
+
+fn fixed_host_artifact_available(
+    probes: &dyn SetupProbes,
+    path: &str,
+    test_flag: &str,
+) -> std::result::Result<bool, String> {
     let args = [OsString::from(test_flag), OsString::from(path)];
     match probes.output(Path::new(HOST_TEST), &args) {
-        Ok(output) if output.success => ok_path_check(
+        Ok(output) => Ok(output.success),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn fixed_host_artifact_check_from(
+    id: &str,
+    component: &str,
+    path: &str,
+    required: bool,
+    ok_detail: &str,
+    available: std::result::Result<bool, String>,
+    repair: Repair,
+) -> SetupCheck {
+    match available {
+        Ok(true) => ok_path_check(
             id,
             component,
-            true,
+            required,
             ok_detail.to_owned(),
             PathBuf::from(path),
         ),
-        Ok(_) => SetupCheck {
+        Ok(false) => SetupCheck {
             id: id.to_owned(),
             component: component.to_owned(),
-            required: true,
+            required,
             status: CheckStatus::Missing,
             detail: format!("required fixed host artifact {path} is unavailable"),
             path: Some(PathBuf::from(path)),
@@ -3889,7 +4003,7 @@ fn fixed_host_artifact_check(
         Err(error) => error_check(
             id,
             component,
-            true,
+            required,
             format!("could not inspect required fixed host artifact {path}: {error}"),
         ),
     }
@@ -5210,10 +5324,14 @@ mod tests {
         };
         probes
             .executables
-            .insert("git".to_owned(), PathBuf::from("/usr/bin/git"));
+            .insert("git".to_owned(), PathBuf::from("/tmp/hostile/git"));
         probes
             .executables
-            .insert("bwrap".to_owned(), PathBuf::from("/usr/bin/bwrap"));
+            .insert("bwrap".to_owned(), PathBuf::from("/tmp/hostile/bwrap"));
+        probes.executables.insert(
+            "systemd-run".to_owned(),
+            PathBuf::from("/tmp/hostile/systemd-run"),
+        );
         probes.files.insert(
             PathBuf::from("/proc/sys/user/max_user_namespaces"),
             "1024\n".to_owned(),
@@ -5226,7 +5344,13 @@ mod tests {
                 "",
             ),
         );
-        for (flag, path) in [("-x", HOST_ENV), ("-s", HOST_CA_BUNDLE), ("-x", HOST_GIT)] {
+        for (flag, path) in [
+            ("-x", HOST_ENV),
+            ("-x", HOST_BWRAP),
+            ("-x", HOST_SYSTEMD_RUN),
+            ("-s", HOST_CA_BUNDLE),
+            ("-x", HOST_GIT),
+        ] {
             probes.outputs.insert(
                 command_key(
                     Path::new(HOST_TEST),
@@ -5250,6 +5374,9 @@ mod tests {
         .finish();
         assert!(report.ready);
         assert_eq!(report.exit_code(), 0);
+        assert!(probes.calls.borrow().iter().all(|call| {
+            !call.starts_with("linux-namespace ") && !call.starts_with("linux-cgroup ")
+        }));
         assert!(
             report
                 .checks
@@ -5283,6 +5410,13 @@ mod tests {
         assert!(required.checks.iter().any(|check| {
             check.id == "linux.cgroup-probe" && check.required && check.status == CheckStatus::Error
         }));
+        let calls = probes.calls.borrow();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call == "linux-namespace /usr/bin/bwrap")
+        );
+        assert!(calls.iter().all(|call| !call.contains("/tmp/hostile")));
     }
 
     // ---- explicit Lima instance creation ----
@@ -8010,7 +8144,7 @@ mod tests {
     }
 
     const APT_UPDATE_KEY: &str = "/usr/bin/sudo --non-interactive -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LANG=C.UTF-8 LC_ALL=C /usr/bin/apt-get update";
-    const APT_BWRAP_KEY: &str = "/usr/bin/sudo --non-interactive -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LANG=C.UTF-8 LC_ALL=C /usr/bin/apt-get install --yes --no-install-recommends --reinstall bubblewrap";
+    const APT_BWRAP_KEY: &str = "/usr/bin/sudo --non-interactive -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none LANG=C.UTF-8 LC_ALL=C /usr/bin/apt-get install --yes --no-install-recommends --no-remove --reinstall bubblewrap";
 
     #[test]
     fn complete_linux_package_set_is_an_idempotent_noop_before_confirmation() {
@@ -8086,6 +8220,25 @@ mod tests {
         let calls = probes.calls.borrow();
         assert!(calls.iter().any(|call| call == APT_UPDATE_KEY));
         assert!(calls.iter().all(|call| !call.contains(" apt-get install ")));
+    }
+
+    #[test]
+    fn package_subset_growth_after_confirmation_requires_fresh_consent() {
+        let probes = linux_package_probes();
+        queue_linux_artifact(&probes, "-x", HOST_BWRAP, &[false, false]);
+        queue_linux_artifact(&probes, "-x", HOST_GIT, &[true, false]);
+
+        let error = install_linux_packages(&probes, true, false).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("subset grew after confirmation (git)"));
+        assert!(rendered.contains("Rerun setup and reconfirm"));
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.starts_with(HOST_SUDO))
+        );
     }
 
     #[test]

@@ -95,7 +95,8 @@ We will not adopt these weaker postures:
 - [ ] Install and verify the Linux runtime dependencies without silently weakening namespace or
   cgroup requirements. Partial: setup now diagnoses fixed `/usr/bin/env`, the CA bundle, glibc
   2.39+, a real production-like Bubblewrap namespace launch, and the runner's exact transient
-  cgroup-v2 probe (`--require-cgroup` makes it readiness-blocking). The explicit Ubuntu 24.04-only
+  cgroup-v2 probe (`--require-cgroup` explicitly launches both disposable active probes and makes
+  them readiness-blocking; default setup-check remains presence/static only). The explicit Ubuntu 24.04-only
   `--install-linux-packages` action installs and revalidates only the missing `bubblewrap`, `git`,
   and `ca-certificates` subset without changing namespace/AppArmor/setuid/cgroup policy. The box
   remains open pending live release-artifact qualification on both Linux architectures; Phase 5's

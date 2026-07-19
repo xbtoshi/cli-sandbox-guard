@@ -348,8 +348,8 @@ struct SetupArgs {
     )]
     install_linux_packages: bool,
 
-    /// Require the real transient cgroup-v2 probe to pass during Linux setup diagnostics.
-    /// Valid with --check and --install-linux-packages; never changes host cgroup policy.
+    /// Launch and require the disposable namespace and transient cgroup-v2 setup probes.
+    /// Valid with --check and --install-linux-packages; performs no sudo or persistent change.
     #[arg(long)]
     require_cgroup: bool,
 

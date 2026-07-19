@@ -102,7 +102,8 @@ state and inspect every prerequisite before validating the live boundary:
     guard setup --check
     guard test
 
-On a native, non-containerized Ubuntu 24.04 x86-64 or ARM64 host, Guard can
+On a native Ubuntu 24.04 x86-64 or ARM64 host whose common WSL/container markers
+are absent, Guard can
 install only the missing fixed runtime package subset after explicit consent:
 
     guard setup --install-linux-packages
@@ -111,18 +112,25 @@ Review the exact action, then type `INSTALL LINUX PACKAGES ubuntu-24.04`, or add
 `--yes` for an already-reviewed noninteractive invocation. The command uses
 fixed absolute `/usr/bin/sudo --non-interactive -- /usr/bin/env -i ...
 /usr/bin/apt-get` argv and only the package names `bubblewrap`, `git`, and
-`ca-certificates`. Versions, repository metadata, package-manager configuration,
+`ca-certificates`; APT is passed `--no-remove`. The missing subset shown before
+confirmation is an upper bound: if later revalidation adds a package, Guard aborts
+and requires a fresh confirmation. Versions, repository metadata, package-manager configuration,
 and root-run package hooks come from and therefore trust the host's configured
-Ubuntu APT sources. Guard refuses root, WSL and detected container execution, other distro
+Ubuntu APT sources. Guard refuses root, detected common WSL/container environments, other distro
 versions, and unsupported architectures. It does not change sysctls, AppArmor,
 setuid bits, systemd/cgroup policy, Guard binaries, or `guard-helper`, and it
 does not clean up partial APT state automatically.
 
-When cgroup enforcement is required for deployment, make the exact runtime
-probe part of setup readiness and then run the complete hostile probe:
+When cgroup enforcement is required for deployment, explicitly launch the
+disposable namespace and exact transient-cgroup probes as part of setup readiness,
+then run the complete hostile probe:
 
     guard setup --check --require-cgroup
     guard test --require-cgroup
+
+Without `--require-cgroup`, `guard setup --check` runs presence/static diagnostics
+only. The explicit probe flag invokes no sudo or repair and makes no persistent
+host-policy change.
 
 Plain `guard setup` is intentionally unprivileged: it creates or tightens only
 Guard-owned directories below the current user's data/configuration roots and

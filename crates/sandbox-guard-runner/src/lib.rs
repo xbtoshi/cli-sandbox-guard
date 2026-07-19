@@ -527,6 +527,8 @@ pub enum RunnerError {
     InvalidEgressDecisionStore(PathBuf),
     #[error("required cgroup v2 delegation through systemd-run is unavailable")]
     CgroupUnavailable,
+    #[error("required fixed dependency {name} is unavailable at {path}")]
+    FixedDependencyMissing { name: &'static str, path: PathBuf },
     #[error("runtime helper failed before the sandbox started: {0}")]
     HelperFailed(String),
     #[error("failed to inspect {path}: {source}")]

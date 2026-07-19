@@ -27,6 +27,12 @@ const GUEST_HELPER: &str = "/opt/sandbox-guard/helper";
 /// the path (rather than a PATH lookup) guarantees no PATH-selected `env` runs before the
 /// environment is cleared. See the launcher-scrub guarantee in `docs/SECURITY_MODEL.md`.
 const HOST_CLEAN_ENV: &str = "/usr/bin/env";
+/// Fixed distribution path for the Linux Bubblewrap runtime. The supported release host is
+/// Ubuntu 24.04; accepting a PATH-selected wrapper here would execute owner-controlled bytes
+/// before the sandbox boundary exists.
+const HOST_BWRAP: &str = "/usr/bin/bwrap";
+/// Fixed distribution path for the transient user-cgroup launcher.
+const HOST_SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
 /// Same fixed `env` inside the managed Lima guest.
 const GUEST_CLEAN_ENV: &str = "/usr/bin/env";
 /// Canonical apt-installed `bwrap` location inside the managed Lima guest. The setup diagnostic
@@ -108,15 +114,12 @@ fn linux_namespace_probe_args() -> Vec<OsString> {
 
 impl LinuxBwrapRunner {
     pub fn plan(request: &RunRequest) -> Result<CommandPlan, RunnerError> {
-        let bwrap = which::which("bwrap").map_err(|source| RunnerError::DependencyMissing {
-            name: "bwrap",
-            source,
-        })?;
+        let bwrap = fixed_host_executable(HOST_BWRAP, "bwrap")?;
         let helper = resolve_host_helper(request)?;
         let workspace = canonical_workspace(request)?;
         let runtime = planned_runtime_path(request, &workspace);
-        let use_cgroup =
-            request.cgroup_mode != CgroupMode::Disabled && which::which("systemd-run").is_ok();
+        let use_cgroup = request.cgroup_mode != CgroupMode::Disabled
+            && fixed_host_path_is_executable(Path::new(HOST_SYSTEMD_RUN));
         Self::build_plan(request, bwrap, helper, &runtime, use_cgroup)
     }
 
@@ -152,10 +155,7 @@ impl LinuxBwrapRunner {
     }
 
     pub fn run(request: &RunRequest) -> Result<RunOutcome, RunnerError> {
-        let bwrap = which::which("bwrap").map_err(|source| RunnerError::DependencyMissing {
-            name: "bwrap",
-            source,
-        })?;
+        let bwrap = fixed_host_executable(HOST_BWRAP, "bwrap")?;
         let helper = resolve_host_helper(request)?;
         let workspace = canonical_workspace(request)?;
         prepare_workspace_inbox(&workspace)?;
@@ -213,6 +213,21 @@ impl LinuxBwrapRunner {
             clipboard_imports,
         })
     }
+}
+
+fn fixed_host_executable(path: &str, name: &'static str) -> Result<PathBuf, RunnerError> {
+    let path = PathBuf::from(path);
+    if fixed_host_path_is_executable(&path) {
+        Ok(path)
+    } else {
+        Err(RunnerError::FixedDependencyMissing { name, path })
+    }
+}
+
+fn fixed_host_path_is_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 fn canonical_workspace(request: &RunRequest) -> Result<PathBuf, RunnerError> {
@@ -793,7 +808,7 @@ fn wrap_in_systemd_scope(
     push(&mut args, "-i");
     args.push(bwrap.into_os_string());
     args.extend(bwrap_args);
-    (PathBuf::from("systemd-run"), args)
+    (PathBuf::from(HOST_SYSTEMD_RUN), args)
 }
 
 fn systemd_scope_args(request: &RunRequest) -> Vec<OsString> {
@@ -850,9 +865,10 @@ pub fn linux_cgroup_probe_available(
     limits: ResourceLimits,
     helper: &Path,
 ) -> Result<bool, RunnerError> {
-    let Some(program) = which::which("systemd-run").ok() else {
+    let program = PathBuf::from(HOST_SYSTEMD_RUN);
+    if !fixed_host_path_is_executable(&program) {
         return Ok(false);
-    };
+    }
     Command::new(&program)
         .args(cgroup_probe_args_for_limits(limits, helper))
         .stdout(Stdio::null())
@@ -1304,7 +1320,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(scoped.program, PathBuf::from("systemd-run"));
+        assert_eq!(scoped.program, PathBuf::from("/usr/bin/systemd-run"));
         let strings = rendered_strings(&scoped.args);
         let boundary = strings
             .windows(2)

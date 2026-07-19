@@ -138,18 +138,21 @@ versioned readiness report.
 
 On a native Ubuntu 24.04 x86-64 or ARM64 host,
 `guard setup --install-linux-packages` is the separate host-package action. It is
-refused as root, under WSL/containers, on other distributions, or with another
-backend. If `/usr/bin/bwrap`, `/usr/bin/git`, and the system CA bundle are already
+refused as root, when common WSL/container markers are detected, on other
+distributions, or with another backend. If `/usr/bin/bwrap`, `/usr/bin/git`, and the system CA bundle are already
 usable it is an idempotent no-op. Otherwise the exact typed phrase
 `INSTALL LINUX PACKAGES ubuntu-24.04` (or `--yes`) authorizes fixed absolute
 `sudo`/`env -i`/`apt-get` argv that reinstall only the missing package subset from
-`bubblewrap`, `git`, and `ca-certificates`. Guard revalidates the distribution,
+`bubblewrap`, `git`, and `ca-certificates`, with APT removal forbidden. If the
+missing subset grows after confirmation, Guard aborts and requires fresh consent. Guard revalidates the distribution,
 installer executables, and artifacts around each APT mutation; it never changes
 user-namespace sysctls, AppArmor, setuid bits, systemd, cgroups, Guard binaries,
 or `guard-helper`. Package versions and root-run hooks remain trusted input from
 the host's configured Ubuntu repositories and APT configuration. Use
-`--require-cgroup` with setup or setup-check to make the runner's real transient
-cgroup-v2 probe readiness-blocking; it never downgrades required mode.
+`--require-cgroup` with setup or setup-check to explicitly launch the disposable
+namespace and transient cgroup-v2 probes and make them readiness-blocking. The
+flag performs no sudo, repair, or persistent policy change and never downgrades
+required mode. Without it, setup-check performs only static/presence diagnostics.
 
 On the macOS Lima backend, `guard setup --create-instance` is the only command
 that creates the dedicated VM, and only when it is absent. It runs exactly
@@ -338,10 +341,11 @@ when a delegated user systemd instance is available. Use `--cgroup required` to 
 is not. Before reporting cgroup enforcement, Guard launches a transient probe with the same
 memory, swap, task, and CPU controller properties required by the real scope, then reads the probe
 scope's cgroup v2 controller files back and requires exact effective values.
-Setup also requires the fixed `/usr/bin/env` clean-launch boundary, a nonempty
+Setup and the Linux runtime require fixed `/usr/bin/env`, `/usr/bin/bwrap`, and
+`/usr/bin/systemd-run` paths rather than PATH-selected boundary executables, a nonempty
 system CA bundle, GNU libc 2.39 or newer for release binaries, and a successful
-production-like Bubblewrap namespace probe; finding an executable on `PATH` is
-reported for transparency but is not a publisher-authenticity claim.
+production-like Bubblewrap namespace probe when explicitly requested; finding other executables
+on `PATH` is reported for transparency but is not a publisher-authenticity claim.
 
 ## macOS
 

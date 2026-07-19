@@ -96,7 +96,7 @@ is reported as explicit partial state and never hidden by rollback claims.
   interposes a fixed-argv `/usr/bin/env -i` boundary immediately before bwrap on every route (Linux
   host and Lima guest, interactive and noninteractive, cgroup-enforced and best-effort). Both
   executables at this boundary are fixed absolute paths (`/usr/bin/env`, and `/usr/bin/bwrap` in the
-  guest / the runner's resolved absolute `bwrap` on the host), so no PATH-selected binary can run
+  guest / fixed `/usr/bin/bwrap` on the host), so no PATH-selected binary can run
   before the environment is cleared. The launcher inherits a fully empty environment on both
   backends; the bwrap child still receives its own `PATH`/`HOME`/`LANG` through `--setenv`. The
   boundary is placed *after* the `systemd-run` scope so cgroup delegation to the user manager still
@@ -363,11 +363,13 @@ from this store and does not automatically re-verify them before every run.
 - The verified tool store has no network downloader, root-owned key policy, privileged installer,
   canonical wrapper enforcement, rollback policy, or automatic verification at execution time.
 - The explicit Linux package setup action is not a Guard-artifact installer. It is restricted to
-  a non-root native Ubuntu 24.04 x86-64/ARM64 owner session, refuses WSL and detected containers,
+  a non-root native Ubuntu 24.04 x86-64/ARM64 owner session and refuses common detected
+  WSL/container markers,
   and invokes fixed absolute host `sudo`, `env -i`, and APT argv only after exact confirmation.
   It installs only the missing subset of `bubblewrap`, `git`, and `ca-certificates`, revalidating
   the distribution, fixed installer paths, optional required-cgroup probe, and artifacts around
-  each mutation. It never changes sysctls, AppArmor, setuid bits, systemd/cgroup policy, Guard, or
+  each mutation. The consented missing-package set may shrink but cannot grow; APT removal is
+  forbidden. It never changes sysctls, AppArmor, setuid bits, systemd/cgroup policy, Guard, or
   `guard-helper`. The configured Ubuntu repositories, APT configuration, package versions, and
   root-run maintainer hooks remain trusted; partial APT state is never automatically cleaned up.
 - The macOS backend requires a pre-created, correctly provisioned dedicated Lima guest and a Linux
