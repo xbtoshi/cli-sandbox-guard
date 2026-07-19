@@ -22,7 +22,9 @@ use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, TempDir};
 use thiserror::Error;
 
-use crate::audit::{AuditManifest, ExcludedPath, ExclusionReason, IncludedFile};
+use crate::audit::{
+    AuditManifest, ExcludedPath, ExclusionReason, IncludedFile, MAX_AUDIT_MANIFEST_BYTES,
+};
 use crate::git::{self, GitError};
 use crate::policy::{CompiledPolicy, PolicyError};
 
@@ -597,6 +599,7 @@ fn collect_git_candidates(
 
 fn write_audit(path: &Path, manifest: &AuditManifest, create_new: bool) -> Result<(), StageError> {
     let bytes = serde_json::to_vec_pretty(manifest).map_err(StageError::SerializeAudit)?;
+    validate_audit_size(bytes.len() as u64)?;
     let mut options = OpenOptions::new();
     options
         .create(!create_new)
@@ -620,6 +623,16 @@ fn write_audit(path: &Path, manifest: &AuditManifest, create_new: bool) -> Resul
         path: path.to_path_buf(),
         source,
     })?;
+    Ok(())
+}
+
+fn validate_audit_size(bytes: u64) -> Result<(), StageError> {
+    if bytes > MAX_AUDIT_MANIFEST_BYTES {
+        return Err(StageError::AuditTooLarge {
+            bytes,
+            maximum: MAX_AUDIT_MANIFEST_BYTES,
+        });
+    }
     Ok(())
 }
 
@@ -860,6 +873,8 @@ pub enum StageError {
     Git(#[from] GitError),
     #[error("failed to serialize audit manifest: {0}")]
     SerializeAudit(serde_json::Error),
+    #[error("serialized audit is {bytes} bytes, exceeding the {maximum}-byte bound")]
+    AuditTooLarge { bytes: u64, maximum: u64 },
     #[error(transparent)]
     Policy(#[from] PolicyError),
 }
@@ -875,6 +890,15 @@ mod tests {
             display_path(Path::new("hello world/%name\n")),
             "hello world/%25name%0A"
         );
+    }
+
+    #[test]
+    fn audit_writer_and_reader_share_the_same_size_bound() {
+        assert!(validate_audit_size(MAX_AUDIT_MANIFEST_BYTES).is_ok());
+        assert!(matches!(
+            validate_audit_size(MAX_AUDIT_MANIFEST_BYTES + 1),
+            Err(StageError::AuditTooLarge { .. })
+        ));
     }
 
     #[test]

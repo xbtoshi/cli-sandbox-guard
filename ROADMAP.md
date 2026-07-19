@@ -115,9 +115,10 @@ We will not adopt these weaker postures:
   Partial (2026-07-19): successful controlled-egress tunnels and native approval decisions are now
   indexed after audit persistence. Denied runtime filesystem/environment/syscall/resource attempts
   are not yet observable, and staging exclusions are deliberately not mislabelled as violations.
-- [ ] Add `guard events`, `guard audit --tail`, and `guard inspect RUN_ID`.
-  Partial (2026-07-19): read-only `guard events [--limit 1..=1000] [--run UUID] [--json]` is
-  implemented over a bounded owner-private index. Audit tailing and per-run inspection remain.
+- [x] Add `guard events`, `guard audit --tail`, and `guard inspect RUN_ID`. Event queries use the
+  bounded privacy-reduced index; audit tailing and exact-run inspection use bounded no-follow
+  reads from the owner-private authoritative audit history and fail before rendering on unsafe
+  storage or corrupt selected manifests.
 - [ ] Summarize blocked actions after a run, grouped by capability and exact sandbox-visible path or
   destination.
 - [ ] Keep violation monitoring observational: monitor failure must not disable enforcement.

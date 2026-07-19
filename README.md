@@ -425,6 +425,25 @@ without emitting partial JSON. Lock contention is refused immediately rather tha
 Index-update failure produces only a generic warning and never changes enforcement, audit
 persistence, or the tool's exit status.
 
+The authoritative persisted audit history is separately available through bounded, read-only
+commands:
+
+    guard audit --tail
+    guard audit --tail --limit 25 --json
+    guard inspect 019f6389-2b2e-7b62-a650-2ff38c4b926e
+    guard inspect 019f6389-2b2e-7b62-a650-2ff38c4b926e --json
+
+`audit --tail` prints summaries newest first. `inspect` requires an exact run UUID and renders the
+full audit, including sandbox-visible included/excluded paths and recorded destinations. The
+reader never creates or repairs state: missing history is empty, while an unsafe directory,
+unexpected entry, symlink, multiply linked or over-permissive file, identity mismatch, oversized
+selected manifest, unsupported selected schema, or concurrent selected-file mutation fails before
+any JSON is emitted. Unrelated manifest contents are not parsed by an exact-run lookup. Human
+output terminal-escapes audit strings; JSON uses normal JSON escaping. Writer and reader share a
+64 MiB per-manifest bound. Tailing scans history without retaining full manifests, keeps at most
+4096 same-second cutoff candidates, and may read at most 256 MiB while deriving compact summaries
+sequentially.
+
 The tool must honor the standard HTTP proxy environment variables. Direct networking still fails.
 The proxy does not inspect HTTP paths or application payloads, and an allowed service can receive
 anything intentionally present in the sanitized workspace plus any forwarded credential. Wildcard

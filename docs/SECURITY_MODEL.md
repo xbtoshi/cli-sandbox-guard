@@ -182,6 +182,16 @@ every intentionally forwarded credential to an allowlisted service.
   no-follow, singly linked, owner-owned regular files with exact mode `0600` and fixed size bounds.
   Unknown schema fields/variants or future schema versions fail closed. `guard events` performs no
   repair and emits no partial JSON when validation fails.
+- `guard audit --tail` and `guard inspect RUN_ID` read only the fixed owner-private audit
+  directory. They bind the directory through a no-follow descriptor, require exact `0700`/`0600`
+  directory/file modes, current ownership, regular singly linked bounded manifests, bounded tail
+  candidate/read sets, stable metadata across each read, and filename-to-schema/run/timestamp identity. They
+  collect and validate selected manifests before rendering, so corrupt selected state cannot
+  produce partial JSON. Exact-run lookup does not parse unrelated manifest contents. The audit
+  writer and reader share a 64 MiB manifest bound; a tail query derives summaries sequentially and
+  refuses an aggregate read above 256 MiB. Unlike the reduced event index, an exact-run inspection
+  intentionally exposes the full local audit, including sandbox-visible paths and recorded
+  destinations; human output is terminal-escaped.
 
 ## Grok adapter invariants
 

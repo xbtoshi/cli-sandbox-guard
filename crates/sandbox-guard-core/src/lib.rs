@@ -4,6 +4,7 @@
 //! host before and after isolated execution.
 
 mod audit;
+mod audit_reader;
 mod change_apply;
 mod events;
 mod export;
@@ -17,8 +18,12 @@ mod staging;
 mod tool_store;
 
 pub use audit::{
-    AuditManifest, ExcludedPath, ExclusionReason, IncludedFile, ResourceLimitRecord, RunRecord,
-    StageTotals,
+    AuditManifest, ExcludedPath, ExclusionReason, IncludedFile, MAX_AUDIT_MANIFEST_BYTES,
+    ResourceLimitRecord, RunRecord, StageTotals,
+};
+pub use audit_reader::{
+    AuditReadError, MAX_AUDIT_TAIL_CANDIDATES, MAX_AUDIT_TAIL_READ_BYTES, PersistedAudit,
+    PersistedAuditSummary, find_persisted_audit, tail_persisted_audit_summaries,
 };
 pub use change_apply::{
     ApplyAuthorization, ApplyError, ApplyReport, apply_exported_changes, decode_change_path,

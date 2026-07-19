@@ -12,11 +12,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use sandbox_guard_core::{
-    ApplyAuthorization, ApprovalEventDecision, ChangeKind, CompiledPolicy, EventKind, EventRecord,
-    ExportReport, ResourceLimitRecord, RunRecord, Stage, StageOptions, append_events,
-    apply_exported_changes, decode_change_path, default_staging_base, events_from_audit,
-    export_changes, garbage_collect, install_verified_tool, is_valid_candidate_path,
-    read_event_index, select_events, verify_installed_tool,
+    ApplyAuthorization, ApprovalEventDecision, AuditManifest, ChangeKind, CompiledPolicy,
+    EventKind, EventRecord, ExportReport, PersistedAuditSummary, ResourceLimitRecord, RunRecord,
+    Stage, StageOptions, append_events, apply_exported_changes, decode_change_path,
+    default_staging_base, events_from_audit, export_changes, find_persisted_audit, garbage_collect,
+    install_verified_tool, is_valid_candidate_path, read_event_index, select_events,
+    tail_persisted_audit_summaries, verify_installed_tool,
 };
 use sandbox_guard_helper::ProbeReport;
 use sandbox_guard_runner::{
@@ -61,6 +62,10 @@ enum Command {
     Approvals(ApprovalArgs),
     /// Read the bounded, privacy-reduced observational event index.
     Events(EventArgs),
+    /// Read persisted run-audit summaries.
+    Audit(AuditArgs),
+    /// Inspect one exact persisted run audit.
+    Inspect(InspectArgs),
     /// Check host prerequisites without changing the system.
     Doctor(DoctorArgs),
     /// Check readiness, repair Guard-owned state, or explicitly provision the mountless VM.
@@ -232,6 +237,32 @@ struct EventArgs {
     run: Option<uuid::Uuid>,
 
     /// Emit one JSON array, with no partial output on error.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct AuditArgs {
+    /// Print the newest persisted run-audit summaries.
+    #[arg(long, required = true)]
+    tail: bool,
+
+    /// Maximum summaries to print, newest first.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    limit: u16,
+
+    /// Emit one versioned JSON report, with no partial output on error.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct InspectArgs {
+    /// Exact run UUID to inspect.
+    #[arg(value_name = "RUN_ID")]
+    run_id: uuid::Uuid,
+
+    /// Emit one versioned JSON report, with no partial output on error.
     #[arg(long)]
     json: bool,
 }
@@ -472,6 +503,8 @@ fn execute(cli: Cli) -> Result<i32> {
         Command::Policy(args) => policy_command(args),
         Command::Approvals(args) => approvals_command(args),
         Command::Events(args) => events_command(args),
+        Command::Audit(args) => audit_command(args),
+        Command::Inspect(args) => inspect_command(args),
         Command::Doctor(args) => doctor_command(args),
         Command::Setup(args) => setup::setup_command(args),
         Command::Uninstall(args) => uninstall::uninstall_command(args),
@@ -586,6 +619,159 @@ fn approval_decision_name(decision: ApprovalEventDecision) -> &'static str {
         ApprovalEventDecision::AllowSession => "allow-session",
         ApprovalEventDecision::AllowAlways => "allow-always",
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AuditTailReport {
+    schema: u32,
+    audits: Vec<PersistedAuditSummary>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct InspectReport {
+    schema: u32,
+    audit: AuditManifest,
+}
+
+fn audit_command(args: AuditArgs) -> Result<i32> {
+    audit_command_at(args, &default_audit_dir()?)
+}
+
+fn audit_command_at(args: AuditArgs, audit_dir: &Path) -> Result<i32> {
+    if !args.tail {
+        bail!("guard audit currently requires --tail");
+    }
+    let summaries = tail_persisted_audit_summaries(audit_dir, usize::from(args.limit))
+        .context("read private audit history")?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&AuditTailReport {
+                schema: 1,
+                audits: summaries,
+            })?
+        );
+        return Ok(0);
+    }
+    for summary in summaries {
+        println!(
+            "{}\t{}\tsuccess={} exit={} backend={} tool={} included-files={} included-bytes={} excluded-paths={}",
+            summary.created_at.to_rfc3339(),
+            summary.run_id,
+            summary
+                .success
+                .map_or("not-run", |success| if success { "true" } else { "false" }),
+            summary
+                .exit_code
+                .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+            terminal_safe(summary.backend.as_deref().unwrap_or("none")),
+            terminal_safe(summary.tool.as_deref().unwrap_or("none")),
+            summary.included_files,
+            summary.included_bytes,
+            summary.excluded_paths,
+        );
+    }
+    Ok(0)
+}
+
+fn inspect_command(args: InspectArgs) -> Result<i32> {
+    inspect_command_at(args, &default_audit_dir()?)
+}
+
+fn inspect_command_at(args: InspectArgs, audit_dir: &Path) -> Result<i32> {
+    let Some(entry) =
+        find_persisted_audit(audit_dir, args.run_id).context("read private run audit")?
+    else {
+        eprintln!("no persisted audit for run {}", args.run_id);
+        return Ok(1);
+    };
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&InspectReport {
+                schema: 1,
+                audit: entry.manifest,
+            })?
+        );
+        return Ok(0);
+    }
+    print_inspection(&entry.manifest);
+    Ok(0)
+}
+
+fn print_inspection(manifest: &AuditManifest) {
+    println!("schema: {}", manifest.schema_version);
+    println!("run: {}", manifest.run_id);
+    println!("created: {}", manifest.created_at.to_rfc3339());
+    println!("source: {}", terminal_safe(&manifest.source_root));
+    println!("policy: {}", terminal_safe(&manifest.policy_sha256));
+    println!("synthetic-git: {}", manifest.synthetic_git);
+    println!(
+        "stage: {} files, {} bytes, {} excluded paths",
+        manifest.totals.included_files,
+        manifest.totals.included_bytes,
+        manifest.totals.excluded_paths
+    );
+    if let Some(run) = &manifest.run {
+        println!(
+            "execution: backend={} network={} tool={} success={} exit={} interactive-egress-approval={} cgroup={} seccomp={}",
+            terminal_safe(&run.backend),
+            terminal_safe(&run.network),
+            terminal_safe(&run.tool),
+            run.success,
+            run.exit_code
+                .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+            run.interactive_egress_approval,
+            run.cgroup_enforced,
+            run.seccomp_enforced,
+        );
+        for destination in &run.allowed_egress_hosts {
+            println!("allowed-egress: {}", terminal_safe(destination));
+        }
+        for name in &run.forwarded_environment_names {
+            println!("forwarded-environment-name: {}", terminal_safe(name));
+        }
+        for record in &run.egress_audit {
+            println!("egress: {}", terminal_safe(record));
+        }
+        for record in &run.egress_approvals {
+            println!("approval: {}", terminal_safe(record));
+        }
+        for record in &run.clipboard_imports {
+            println!("clipboard-import: {}", terminal_safe(record));
+        }
+        println!(
+            "resource-limits: memory-bytes={} max-file-bytes={} cpu-seconds={} open-files={} max-processes={} cpu-percent={}",
+            run.resource_limits.memory_bytes,
+            run.resource_limits.max_file_bytes,
+            run.resource_limits.cpu_seconds,
+            run.resource_limits.open_files,
+            run.resource_limits.max_processes,
+            run.resource_limits.cpu_percent,
+        );
+    }
+    for included in &manifest.included {
+        println!(
+            "included: {} bytes={} executable={} sha256={}",
+            terminal_safe(&included.path),
+            included.bytes,
+            included.executable,
+            terminal_safe(&included.sha256),
+        );
+    }
+    for excluded in &manifest.excluded {
+        let reason = serde_json::to_string(&excluded.reason)
+            .unwrap_or_else(|_| "{\"kind\":\"unrenderable\"}".to_owned());
+        println!(
+            "excluded: {} reason={}",
+            terminal_safe(&excluded.path),
+            terminal_safe(&reason)
+        );
+    }
+}
+
+fn terminal_safe(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 pub(crate) trait PersistentRunState {
@@ -1690,6 +1876,47 @@ mod change_risk_tests {
         assert!(Cli::try_parse_from(["guard", "events", "--limit", "0"]).is_err());
         assert!(Cli::try_parse_from(["guard", "events", "--limit", "1001"]).is_err());
         assert!(Cli::try_parse_from(["guard", "events", "--run", "not-a-uuid"]).is_err());
+    }
+
+    #[test]
+    fn audit_and_inspect_cli_are_bounded_and_exact() {
+        let run = uuid::Uuid::new_v4().to_string();
+        assert!(Cli::try_parse_from(["guard", "audit", "--tail"]).is_ok());
+        assert!(Cli::try_parse_from(["guard", "audit", "--tail", "--limit", "1000"]).is_ok());
+        assert!(Cli::try_parse_from(["guard", "audit"]).is_err());
+        assert!(Cli::try_parse_from(["guard", "audit", "--tail", "--limit", "1001"]).is_err());
+        assert!(Cli::try_parse_from(["guard", "inspect", &run]).is_ok());
+        assert!(Cli::try_parse_from(["guard", "inspect", "not-a-uuid"]).is_err());
+    }
+
+    #[test]
+    fn missing_audit_history_is_read_only_and_not_found_is_distinct() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
+        assert_eq!(
+            audit_command_at(
+                AuditArgs {
+                    tail: true,
+                    limit: 10,
+                    json: true,
+                },
+                &missing,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            inspect_command_at(
+                InspectArgs {
+                    run_id: uuid::Uuid::new_v4(),
+                    json: true,
+                },
+                &missing,
+            )
+            .unwrap(),
+            1
+        );
+        assert!(!missing.exists());
     }
 
     #[test]

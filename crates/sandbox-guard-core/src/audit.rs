@@ -6,6 +6,9 @@ use uuid::Uuid;
 
 use crate::policy::CompiledPolicy;
 
+/// Maximum serialized size of an audit that Guard will persist or inspect.
+pub const MAX_AUDIT_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditManifest {
     pub schema_version: u32,
