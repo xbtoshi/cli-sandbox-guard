@@ -104,13 +104,13 @@ state and inspect every prerequisite before validating the live boundary:
 
 Plain `guard setup` is intentionally unprivileged: it creates or tightens only
 Guard-owned directories below the current user's data/configuration roots and
-prints commands for missing host dependencies. The explicit macOS-only
-`--create-instance` action is the sole exception: after confirmation it asks
-Lima to create one mountless VM, but still never invokes `sudo` or a guest
-package manager. `guard setup --check` is the read-only/reporting form; add
-`--json` for the versioned machine-readable schema. Exit status is 0 when
-ready, 1 when known repairs remain, and 3 when a required probe failed and
-readiness is unknown.
+prints commands for missing host dependencies. The explicit macOS-only creation,
+startup, and guest-package actions are separate confirmed exceptions. Creation
+and startup never invoke `sudo`; package installation invokes passwordless sudo
+only inside an already-running, verified-mountless guest. None invokes host sudo.
+`guard setup --check` is the read-only/reporting form; add `--json` for the
+versioned machine-readable schema. Exit status is 0 when ready, 1 when known
+repairs remain, and 3 when a required probe failed and readiness is unknown.
 
 ## Binary install — macOS (Apple Silicon)
 
@@ -170,12 +170,26 @@ equivalent manual command is:
 
     limactl --tty=false start --mount-none sandbox-guard
 
-Everything else about guest provisioning **remains a manual, trusted operation
-in v0.3**: everything you place inside the guest becomes part of the trusted
-computing base. Install the packages without adding credentials or host mounts:
+Install the fixed guest package-name set through the third explicit action:
 
-    limactl shell sandbox-guard sudo apt-get update
-    limactl shell sandbox-guard sudo apt-get install -y bubblewrap git ca-certificates rsync util-linux
+    guard setup --install-guest-packages --backend macos-lima
+
+The action requires a running instance with safe declared and live mounts. It
+is an idempotent no-op when `/usr/bin/bwrap`, `/usr/bin/git`, `/usr/bin/rsync`,
+`/usr/bin/findmnt`, and the CA bundle are already present. Otherwise it requires
+the typed phrase `INSTALL GUEST PACKAGES sandbox-guard` (or `--yes`), revalidates
+the instance around both package-manager mutations, and runs the equivalent of:
+
+    limactl --tty=false shell sandbox-guard -- /usr/bin/sudo --non-interactive -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none /usr/bin/apt-get update
+    limactl --tty=false shell sandbox-guard -- /usr/bin/sudo --non-interactive -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root DEBIAN_FRONTEND=noninteractive APT_LISTCHANGES_FRONTEND=none /usr/bin/apt-get install --yes --no-install-recommends --reinstall bubblewrap git ca-certificates rsync util-linux
+
+The package names are fixed, but versions come from—and therefore trust—the
+guest's configured APT repositories, package-manager configuration, and root-run
+hooks/scripts. This action does not use Guard's runtime egress broker. A partial
+failure is reported and left for inspection or an idempotent retry—Guard never
+runs package cleanup or stops/deletes the VM. The helper and selected vendor tool
+remain manual trusted operations: everything placed inside the guest joins the
+trusted computing base. Machine-readable `--json` mode requires `--yes`.
 
 Install the packaged Linux ARM64 helper inside the guest (the guest
 distribution needs glibc 2.39 or newer, e.g. Ubuntu 24.04+):

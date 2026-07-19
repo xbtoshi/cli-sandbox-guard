@@ -79,9 +79,11 @@ We will not adopt these weaker postures:
 - [ ] Provision the mountless Lima instance, Bubblewrap, `guard-helper`, and the selected verified
   vendor tool on macOS. Partial: `guard setup --create-instance` now creates the absent mountless
   instance, and the separate `guard setup --start-instance` action starts only an existing,
-  declared-mountless stopped instance and verifies its live mounts. Both are confirmed and never
-  reconfigure/delete the VM; guest packages, the helper, and the vendor tool remain manual and
-  open.
+  declared-mountless stopped instance and verifies its live mounts. The explicit
+  `guard setup --install-guest-packages` action installs and verifies the fixed package-name set only in
+  a running mountless guest, with revalidation around each guest package-manager mutation. These
+  actions are confirmed and never reconfigure/delete the VM; verified helper and vendor-tool
+  provisioning remain open.
 - [ ] Install and verify the Linux runtime dependencies without silently weakening namespace or
   cgroup requirements.
 - [x] Add `guard setup --check` and actionable diagnostics for the host/backend components it

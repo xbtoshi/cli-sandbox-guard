@@ -40,6 +40,12 @@ On macOS, the dedicated guest must contain no host filesystem mounts or durable 
 part of the trusted computing base. Vendor credentials should be short-lived and forwarded
 explicitly for one run.
 
+The explicit guest-package setup action runs a fixed APT package-name set through passwordless sudo
+inside that dedicated guest only after repeated declared/live mount checks. It trusts the guest's
+configured APT repositories, package-manager configuration, and root-run maintainer hooks/scripts;
+package versions are not pinned. It does not use the runtime egress broker, invoke host sudo, or
+automatically clean up a partial package-manager failure.
+
 ## Staging invariants
 
 1. Built-in denies cannot be removed by user policy.

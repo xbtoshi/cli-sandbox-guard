@@ -52,7 +52,8 @@ conflict-checked host code; the tool never receives access to the source tree or
 - Offline Ed25519 verification against a pinned signer fingerprint before atomic tool install.
 - Hostile denied-network and controlled-proxy probes through the real backend with `guard test`.
 - `guard setup` for idempotent owner-only state initialization plus actionable, machine-readable
-  host and Lima readiness diagnostics without `sudo`, package installation, or VM mutation.
+  host and Lima readiness diagnostics. Explicit confirmed macOS actions can create/start the
+  dedicated mountless VM and install its fixed package-name set; plain setup remains unprivileged.
 
 ## One-command Grok workflow
 
@@ -125,7 +126,7 @@ Alpha release archives for macOS ARM64 and Linux x86-64/ARM64, with
 `SHA256SUMS` and a per-file manifest, are published from signed tags as
 GitHub prereleases. Verify the tag signature and checksums first, then follow
 [docs/INSTALL.md](docs/INSTALL.md) for install, upgrade, rollback, and removal
-steps, including manual Lima guest provisioning on macOS. The artifacts are
+steps, including the remaining Lima helper and vendor-tool provisioning on macOS. The artifacts are
 alpha prototypes, not production-ready. Maintainers cut releases with
 [docs/RELEASE.md](docs/RELEASE.md).
 
@@ -155,8 +156,22 @@ filesystems. It never stops, reconfigures, or deletes a VM; a failed post-check
 leaves the running instance for manual inspection. An already-running mountless
 instance is left unchanged and still passes through the normal readiness checks.
 The start action conflicts with `--check` and `--create-instance`, and JSON mode
-requires `--yes`. Guest packages, the helper, and the selected vendor tool all
-remain separate manual provisioning steps.
+requires `--yes`.
+
+`guard setup --install-guest-packages` is the separate package action. It accepts
+only a running instance whose declared configuration and live mount table are
+mountless. If the fixed package artifacts are already present, it is a no-op
+without prompting or network access. Otherwise it requires the typed phrase
+`INSTALL GUEST PACKAGES <instance>` (or `--yes`) and runs fixed absolute guest
+executables to update APT and install `bubblewrap`, `git`, `ca-certificates`,
+`rsync`, and `util-linux`. Guard revalidates the instance before each mutation
+and verifies exact executable paths plus the CA bundle afterward. This invokes
+passwordless sudo only inside the guest. The package names are fixed, but their
+versions come from—and therefore trust—the guest's configured APT repositories,
+package-manager configuration, and root-run hooks/scripts. It never invokes host
+sudo or starts, reconfigures, stops, or deletes the VM. The helper and selected
+vendor tool remain manual. As with the other mutating setup actions, `--json`
+requires `--yes`.
 
 `guard uninstall` is the matching non-mutating removal plan. Confirmed state
 removal requires `--remove` and the exact terminal phrase (or explicit
@@ -273,8 +288,7 @@ Sandbox Guard therefore uses a dedicated Linux VM:
     brew install lima
     limactl create --name=sandbox-guard --mount-none template:default
     limactl start --mount-none sandbox-guard
-    limactl shell sandbox-guard sudo apt-get update
-    limactl shell sandbox-guard sudo apt-get install -y bubblewrap git ca-certificates rsync
+    guard setup --install-guest-packages --backend macos-lima
 
 Install a Linux build of `guard-helper` at `/usr/local/bin/guard-helper` inside the guest, together
 with the selected AI CLI. The guest must be dedicated to Guard and contain no credentials or host

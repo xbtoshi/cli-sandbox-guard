@@ -20,6 +20,25 @@ const DEFAULT_GUEST_HELPER: &str = "/usr/local/bin/guard-helper";
 /// Fixed absolute bubblewrap path the runtime invokes at the clean-environment boundary; the guest
 /// diagnostic requires this exact executable.
 const GUEST_BWRAP: &str = "/usr/bin/bwrap";
+const GUEST_TEST: &str = "/usr/bin/test";
+const GUEST_SUDO: &str = "/usr/bin/sudo";
+const GUEST_ENV: &str = "/usr/bin/env";
+const GUEST_APT_GET: &str = "/usr/bin/apt-get";
+const GUEST_FINDMNT: &str = "/usr/bin/findmnt";
+const GUEST_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+const GUEST_PACKAGE_EXECUTABLES: &[(&str, &str)] = &[
+    ("bubblewrap", GUEST_BWRAP),
+    ("git", "/usr/bin/git"),
+    ("rsync", "/usr/bin/rsync"),
+    ("findmnt", GUEST_FINDMNT),
+];
+const GUEST_PACKAGE_NAMES: &[&str] = &[
+    "bubblewrap",
+    "git",
+    "ca-certificates",
+    "rsync",
+    "util-linux",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -234,6 +253,12 @@ pub(super) fn setup_command(args: SetupArgs) -> Result<i32> {
         {
             actions.push(action);
         }
+    } else if args.install_guest_packages {
+        if let Some(action) =
+            run_install_guest_packages(&probes, backend, &args.lima_instance, args.yes, args.json)?
+        {
+            actions.push(action);
+        }
     }
 
     let initial = diagnose(&probes, backend, &args.lima_instance, &paths)?;
@@ -315,6 +340,26 @@ fn run_start_instance(
     }
     validate_instance_action_target("--start-instance", backend, std::env::consts::OS)?;
     start_lima_instance(probes, instance, assume_yes)
+}
+
+/// Resolve the explicit guest-package installation request.
+///
+/// Machine-readable mode requires `--yes`, and only the macOS Lima backend may reach the guest.
+/// The action independently verifies a running mountless instance before invoking guest sudo.
+fn run_install_guest_packages(
+    probes: &dyn SetupProbes,
+    backend: BackendKind,
+    instance: &str,
+    assume_yes: bool,
+    json: bool,
+) -> Result<Option<String>> {
+    if json && !assume_yes {
+        bail!(
+            "--install-guest-packages with --json requires --yes so machine-readable output is never mixed with an interactive prompt"
+        );
+    }
+    validate_instance_action_target("--install-guest-packages", backend, std::env::consts::OS)?;
+    install_lima_guest_packages(probes, instance, assume_yes)
 }
 
 fn backend_label(backend: BackendKind) -> &'static str {
@@ -651,24 +696,242 @@ fn verify_live_mountlessness(
     limactl: &Path,
     instance: &str,
 ) -> Result<()> {
+    verify_live_mountlessness_for_phase(probes, limactl, instance, "after startup")
+}
+
+fn verify_live_mountlessness_for_phase(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    phase: &str,
+) -> Result<()> {
     let output = lima_shell(
         probes,
         limactl,
         instance,
-        &["findmnt", "--noheadings", "--output", "TARGET,FSTYPE"],
+        &[GUEST_FINDMNT, "--noheadings", "--output", "TARGET,FSTYPE"],
     )
-    .map_err(|error| anyhow!("failed to inspect live Lima mounts after startup: {error}"))?;
+    .map_err(|error| anyhow!("failed to inspect live Lima mounts {phase}: {error}"))?;
     if !output.success {
         bail!(
-            "live mount inspection failed after startup: {}; inspect the running instance manually, and Guard will not stop or delete it",
+            "live mount inspection failed {phase}: {}; inspect the running instance manually, and Guard will not modify, stop, or delete it",
             concise_failure(&output)
         );
     }
     let mounts = String::from_utf8_lossy(&output.stdout);
     if let Some(line) = mounts.lines().find(|line| is_host_sharing_mount(line)) {
         bail!(
-            "unsafe live host-sharing mount detected after startup: {}; inspect and remove the instance manually, and Guard will not stop or delete it",
+            "unsafe live host-sharing mount detected {phase}: {}; inspect the instance manually, and Guard will not modify, stop, or delete it",
             sanitize_terminal_fragment(line.trim())
+        );
+    }
+    Ok(())
+}
+
+/// Install the fixed runtime package-name set inside an already-running, mountless Lima instance.
+///
+/// The package manager runs only after independent configuration, status, and live-mount checks.
+/// Those checks are repeated after confirmation, between update and install, and after install.
+/// Existing complete installations are an idempotent no-op. Partial package-manager changes are
+/// never guessed at or rolled back automatically.
+fn install_lima_guest_packages(
+    probes: &dyn SetupProbes,
+    instance: &str,
+    assume_yes: bool,
+) -> Result<Option<String>> {
+    validate_lima_instance(instance)?;
+    let Some(limactl) = probes.which("limactl") else {
+        bail!("limactl was not found on PATH; install Lima before provisioning guest packages");
+    };
+
+    require_safe_package_target(probes, &limactl, instance, "before package inspection")?;
+    if guest_packages_probe(probes, &limactl, instance)
+        .map_err(|error| anyhow!("failed to inspect guest package artifacts: {error}"))?
+        .success
+    {
+        eprintln!("Lima instance {instance:?} already contains the required guest packages");
+        return Ok(None);
+    }
+    require_guest_package_installer(probes, &limactl, instance)?;
+
+    confirm_guest_package_install(instance, assume_yes)?;
+    require_safe_package_target(
+        probes,
+        &limactl,
+        instance,
+        "immediately before apt-get update",
+    )?;
+    run_guest_apt(probes, &limactl, instance, &["update"], "apt-get update")?;
+
+    require_safe_package_target(probes, &limactl, instance, "before apt-get install").context(
+        "guest state changed after apt-get update; package-manager state may be partial and Guard will not continue or roll it back",
+    )?;
+    let mut install_args = vec!["install", "--yes", "--no-install-recommends", "--reinstall"];
+    install_args.extend_from_slice(GUEST_PACKAGE_NAMES);
+    run_guest_apt(probes, &limactl, instance, &install_args, "apt-get install")?;
+
+    require_safe_package_target(probes, &limactl, instance, "after package installation").context(
+        "guest package post-condition failed; package-manager state may be partial and Guard will not clean up, stop, or delete the instance",
+    )?;
+    require_guest_package_artifacts(probes, &limactl, instance).context(
+        "guest package post-condition failed; package-manager state may be partial and Guard will not uninstall or roll back packages",
+    )?;
+    Ok(Some(format!(
+        "installed and verified the fixed Lima guest package-name set in {instance}"
+    )))
+}
+
+fn require_safe_package_target(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    phase: &str,
+) -> Result<()> {
+    let Some(record) = find_lima_instance(probes, limactl, instance)? else {
+        bail!(
+            "Lima instance {instance:?} does not exist {phase}; Guard will not create or modify it"
+        );
+    };
+    require_declared_mountless(&record, instance, phase)?;
+    let Some(status) = record.get("status").and_then(serde_json::Value::as_str) else {
+        bail!(
+            "Lima instance {instance:?} reported no string status {phase}; Guard will not modify it"
+        );
+    };
+    if status != "Running" {
+        bail!(
+            "Lima instance {instance:?} has status {:?} {phase}; start it explicitly with --start-instance before installing packages",
+            sanitize_terminal_fragment(status)
+        );
+    }
+    verify_live_mountlessness_for_phase(probes, limactl, instance, phase)
+}
+
+fn guest_packages_probe(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+) -> std::io::Result<ProbeOutput> {
+    let mut command = vec![GUEST_TEST];
+    for (index, (_, path)) in GUEST_PACKAGE_EXECUTABLES.iter().enumerate() {
+        if index > 0 {
+            command.push("-a");
+        }
+        command.extend(["-x", *path]);
+    }
+    command.extend(["-a", "-s", GUEST_CA_BUNDLE]);
+    lima_shell(probes, limactl, instance, &command)
+}
+
+fn require_guest_package_installer(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+) -> Result<()> {
+    for (label, path) in [
+        ("non-interactive privilege helper", GUEST_SUDO),
+        ("clean-environment launcher", GUEST_ENV),
+        ("APT package manager", GUEST_APT_GET),
+    ] {
+        let output = lima_shell(probes, limactl, instance, &[GUEST_TEST, "-x", path])
+            .map_err(|error| anyhow!("failed to inspect {label} at {path}: {error}"))?;
+        if !output.success {
+            bail!(
+                "guest {label} is not executable at {path}: {}; Guard will not attempt package installation",
+                concise_failure(&output)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn confirm_guest_package_install(instance: &str, assume_yes: bool) -> Result<()> {
+    if assume_yes {
+        return Ok(());
+    }
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        bail!(
+            "guest package installation requires an interactive terminal or --yes; nothing was changed"
+        );
+    }
+    let phrase = format!("INSTALL GUEST PACKAGES {instance}");
+    eprintln!(
+        "This runs apt-get through passwordless sudo inside the dedicated Lima guest {instance:?}. It trusts that guest's configured APT repositories and root-run package scripts; it never invokes host sudo."
+    );
+    print!("Type {phrase} to confirm: ");
+    io::stdout()
+        .flush()
+        .context("flush guest package installation confirmation prompt")?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0
+        || !guest_package_install_phrase_matches(instance, &answer)
+    {
+        bail!("guest package installation was not confirmed; nothing was changed");
+    }
+    Ok(())
+}
+
+fn guest_package_install_phrase_matches(instance: &str, answer: &str) -> bool {
+    answer.trim_end_matches(['\r', '\n']) == format!("INSTALL GUEST PACKAGES {instance}")
+}
+
+fn run_guest_apt(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+    apt_args: &[&str],
+    phase: &str,
+) -> Result<()> {
+    let mut command = vec![
+        GUEST_SUDO,
+        "--non-interactive",
+        "--",
+        GUEST_ENV,
+        "-i",
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME=/root",
+        "DEBIAN_FRONTEND=noninteractive",
+        "APT_LISTCHANGES_FRONTEND=none",
+        GUEST_APT_GET,
+    ];
+    command.extend_from_slice(apt_args);
+    let output = lima_shell(probes, limactl, instance, &command)
+        .map_err(|error| anyhow!("failed to run guest {phase}: {error}"))?;
+    if !output.success {
+        bail!(
+            "guest {phase} failed: {}; package-manager state may be partial, and Guard will not run cleanup, stop, or delete the instance",
+            concise_failure(&output)
+        );
+    }
+    Ok(())
+}
+
+fn require_guest_package_artifacts(
+    probes: &dyn SetupProbes,
+    limactl: &Path,
+    instance: &str,
+) -> Result<()> {
+    for (package, path) in GUEST_PACKAGE_EXECUTABLES {
+        let output = lima_shell(probes, limactl, instance, &[GUEST_TEST, "-x", path])
+            .map_err(|error| anyhow!("failed to verify guest package {package}: {error}"))?;
+        if !output.success {
+            bail!(
+                "guest package {package} did not provide executable {path}: {}",
+                concise_failure(&output)
+            );
+        }
+    }
+    let certificates = lima_shell(
+        probes,
+        limactl,
+        instance,
+        &[GUEST_TEST, "-s", GUEST_CA_BUNDLE],
+    )
+    .map_err(|error| anyhow!("failed to verify guest CA certificate bundle: {error}"))?;
+    if !certificates.success {
+        bail!(
+            "guest ca-certificates did not provide a nonempty bundle at {GUEST_CA_BUNDLE}: {}",
+            concise_failure(&certificates)
         );
     }
     Ok(())
@@ -1010,7 +1273,7 @@ fn diagnose_macos(
         probes,
         &limactl,
         instance,
-        &["findmnt", "--noheadings", "--output", "TARGET,FSTYPE"],
+        &[GUEST_FINDMNT, "--noheadings", "--output", "TARGET,FSTYPE"],
     );
     checks.push(match mounts {
         Ok(output) if !output.success => error_check(
@@ -1054,48 +1317,29 @@ fn diagnose_macos(
     // The runtime invokes bwrap by its fixed absolute path `/usr/bin/bwrap` at the clean-environment
     // boundary, so the diagnostic requires that exact executable rather than a PATH lookup. No
     // fallback path is accepted.
-    let bwrap = lima_shell(probes, &limactl, instance, &["test", "-x", GUEST_BWRAP]);
+    let package_repair = manual_repair(
+        "Install and verify the fixed runtime package-name set inside the dedicated guest.",
+        &["guest-sudo", "network", "confirmation"],
+        &[&format!(
+            "guard setup --install-guest-packages --backend macos-lima --lima-instance {shell_instance}"
+        )],
+    );
+    let bwrap = lima_shell(probes, &limactl, instance, &[GUEST_TEST, "-x", GUEST_BWRAP]);
     checks.push(command_result_check(
         "lima.guest.bwrap",
         "lima-guest",
         bwrap,
         &format!("guest bubblewrap is executable at {GUEST_BWRAP}"),
-        manual_repair(
-            "Install bubblewrap inside the guest; Guard never invokes guest sudo.",
-            &["sudo", "network"],
-            &[
-                &format!("limactl shell {shell_instance} -- sudo apt-get update"),
-                &format!("limactl shell {shell_instance} -- sudo apt-get install -y bubblewrap"),
-            ],
-        ),
+        package_repair.clone(),
     ));
 
-    let packages = lima_shell(
-        probes,
-        &limactl,
-        instance,
-        &[
-            "sh",
-            "-c",
-            "missing=0; for name in git rsync findmnt; do command -v \"$name\" >/dev/null || { echo \"$name\"; missing=1; }; done; exit \"$missing\"",
-        ],
-    );
+    let packages = guest_packages_probe(probes, &limactl, instance);
     checks.push(command_result_check(
         "lima.guest.packages",
         "lima-guest",
         packages,
-        "guest contains git, rsync, and findmnt",
-        manual_repair(
-            "Install the required packages inside the guest; Guard never invokes guest sudo.",
-            &["sudo", "network"],
-            &[
-                &format!("limactl shell {shell_instance} -- sudo apt-get update"),
-                &format!(
-                    "limactl shell {} -- sudo apt-get install -y git rsync util-linux ca-certificates",
-                    shell_instance
-                ),
-            ],
-        ),
+        "guest contains the exact runtime executables and a nonempty CA certificate bundle",
+        package_repair,
     ));
 
     let helper_test = lima_shell(
@@ -1768,6 +2012,7 @@ fn probe_openat2() -> std::result::Result<bool, String> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::ffi::OsStr;
     use tempfile::TempDir;
 
@@ -1776,6 +2021,7 @@ mod tests {
         executables: BTreeMap<String, PathBuf>,
         host_helper: Option<PathBuf>,
         outputs: BTreeMap<String, ProbeOutput>,
+        queued_outputs: RefCell<BTreeMap<String, VecDeque<ProbeOutput>>>,
         calls: RefCell<Vec<String>>,
         files: BTreeMap<PathBuf, String>,
         openat2: bool,
@@ -1793,6 +2039,14 @@ mod tests {
         fn output(&self, program: &Path, args: &[OsString]) -> std::io::Result<ProbeOutput> {
             let key = command_key(program, args);
             self.calls.borrow_mut().push(key.clone());
+            if let Some(output) = self
+                .queued_outputs
+                .borrow_mut()
+                .get_mut(&key)
+                .and_then(VecDeque::pop_front)
+            {
+                return Ok(output);
+            }
             self.outputs.get(&key).cloned().ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::NotFound, format!("no fake for {key}"))
             })
@@ -1954,7 +2208,7 @@ mod tests {
                     "shell",
                     "sandbox-guard",
                     "--",
-                    "findmnt",
+                    GUEST_FINDMNT,
                     "--noheadings",
                     "--output",
                     "TARGET,FSTYPE",
@@ -2281,20 +2535,62 @@ mod tests {
         )
     }
 
+    fn shell_key(instance: &str, command: &[&str]) -> String {
+        let mut args = vec![
+            OsString::from("--tty=false"),
+            OsString::from("shell"),
+            OsString::from(instance),
+            OsString::from("--"),
+        ];
+        args.extend(command.iter().map(OsString::from));
+        command_key(Path::new(LIMACTL), &args)
+    }
+
     fn mount_inspection_key(instance: &str) -> String {
-        command_key(
-            Path::new(LIMACTL),
-            &[
-                OsString::from("--tty=false"),
-                OsString::from("shell"),
-                OsString::from(instance),
-                OsString::from("--"),
-                OsString::from("findmnt"),
-                OsString::from("--noheadings"),
-                OsString::from("--output"),
-                OsString::from("TARGET,FSTYPE"),
-            ],
+        shell_key(
+            instance,
+            &[GUEST_FINDMNT, "--noheadings", "--output", "TARGET,FSTYPE"],
         )
+    }
+
+    fn package_probe_key(instance: &str) -> String {
+        let mut command = vec![GUEST_TEST];
+        for (index, (_, path)) in GUEST_PACKAGE_EXECUTABLES.iter().enumerate() {
+            if index > 0 {
+                command.push("-a");
+            }
+            command.extend(["-x", *path]);
+        }
+        command.extend(["-a", "-s", GUEST_CA_BUNDLE]);
+        shell_key(instance, &command)
+    }
+
+    fn guest_test_key(instance: &str, predicate: &str, path: &str) -> String {
+        shell_key(instance, &[GUEST_TEST, predicate, path])
+    }
+
+    fn guest_apt_key(instance: &str, apt_args: &[&str]) -> String {
+        let mut command = vec![
+            GUEST_SUDO,
+            "--non-interactive",
+            "--",
+            GUEST_ENV,
+            "-i",
+            "PATH=/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME=/root",
+            "DEBIAN_FRONTEND=noninteractive",
+            "APT_LISTCHANGES_FRONTEND=none",
+            GUEST_APT_GET,
+        ];
+        command.extend_from_slice(apt_args);
+        shell_key(instance, &command)
+    }
+
+    fn queue_outputs(probes: &FakeProbes, key: String, outputs: Vec<ProbeOutput>) {
+        probes
+            .queued_outputs
+            .borrow_mut()
+            .insert(key, outputs.into());
     }
 
     fn assert_no_lifecycle_mutation(probes: &FakeProbes) {
@@ -2324,6 +2620,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn assert_no_package_mutation(probes: &FakeProbes) {
+        assert!(
+            probes
+                .calls
+                .borrow()
+                .iter()
+                .all(|call| !call.contains(GUEST_APT_GET)),
+            "unexpected guest package mutation: {:?}",
+            probes.calls.borrow()
+        );
     }
 
     #[test]
@@ -2484,6 +2792,8 @@ mod tests {
         let probes = lima_probes();
         for bad in ["bad;rm", "../evil", "a b", "-leading", ""] {
             assert!(create_lima_instance(&probes, bad, true).is_err());
+            assert!(start_lima_instance(&probes, bad, true).is_err());
+            assert!(install_lima_guest_packages(&probes, bad, true).is_err());
         }
         assert!(probes.calls.borrow().is_empty());
     }
@@ -2690,6 +3000,316 @@ mod tests {
     }
 
     #[test]
+    fn missing_guest_packages_are_installed_with_fixed_argv_and_verified() {
+        let mut probes = lima_probes();
+        probes.outputs.insert(
+            list_key(None),
+            output(
+                true,
+                r#"{"name":"sandbox-guard","status":"Running","config":{"mounts":[]}}"#,
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            mount_inspection_key("sandbox-guard"),
+            output(true, "/ ext4\n/workspace tmpfs\n", ""),
+        );
+        probes.outputs.insert(
+            package_probe_key("sandbox-guard"),
+            output(false, "", "missing packages"),
+        );
+        for path in [GUEST_SUDO, GUEST_ENV, GUEST_APT_GET] {
+            probes.outputs.insert(
+                guest_test_key("sandbox-guard", "-x", path),
+                output(true, "", ""),
+            );
+        }
+        let update = guest_apt_key("sandbox-guard", &["update"]);
+        let mut install_args = vec!["install", "--yes", "--no-install-recommends", "--reinstall"];
+        install_args.extend_from_slice(GUEST_PACKAGE_NAMES);
+        let install = guest_apt_key("sandbox-guard", &install_args);
+        probes.outputs.insert(update.clone(), output(true, "", ""));
+        probes.outputs.insert(install.clone(), output(true, "", ""));
+        for (_, path) in GUEST_PACKAGE_EXECUTABLES {
+            probes.outputs.insert(
+                guest_test_key("sandbox-guard", "-x", path),
+                output(true, "", ""),
+            );
+        }
+        probes.outputs.insert(
+            guest_test_key("sandbox-guard", "-s", GUEST_CA_BUNDLE),
+            output(true, "", ""),
+        );
+
+        let action = install_lima_guest_packages(&probes, "sandbox-guard", true).unwrap();
+        assert_eq!(
+            action.as_deref(),
+            Some("installed and verified the fixed Lima guest package-name set in sandbox-guard")
+        );
+        let calls = probes.calls.borrow();
+        assert_eq!(calls.iter().filter(|call| **call == update).count(), 1);
+        assert_eq!(calls.iter().filter(|call| **call == install).count(), 1);
+        assert!(install.contains("/usr/bin/sudo --non-interactive -- /usr/bin/env -i"));
+        assert!(install.contains("DEBIAN_FRONTEND=noninteractive"));
+        assert!(install.contains("--no-install-recommends --reinstall"));
+        assert!(install.contains("bubblewrap git ca-certificates rsync util-linux"));
+        assert_eq!(
+            calls.iter().filter(|call| **call == list_key(None)).count(),
+            4
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == mount_inspection_key("sandbox-guard"))
+                .count(),
+            4
+        );
+        assert!(calls.iter().all(|call| !call.contains(" sh -c ")));
+        drop(calls);
+        assert_no_destructive_lifecycle_mutation(&probes);
+    }
+
+    #[test]
+    fn complete_guest_package_set_is_an_idempotent_noop_before_confirmation() {
+        let mut probes = lima_probes();
+        probes.outputs.insert(
+            list_key(None),
+            output(
+                true,
+                r#"{"name":"sandbox-guard","status":"Running","config":{}}"#,
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            mount_inspection_key("sandbox-guard"),
+            output(true, "/ ext4\n", ""),
+        );
+        probes
+            .outputs
+            .insert(package_probe_key("sandbox-guard"), output(true, "", ""));
+
+        // assume_yes=false proves the complete branch returns before prompting.
+        assert_eq!(
+            install_lima_guest_packages(&probes, "sandbox-guard", false).unwrap(),
+            None
+        );
+        assert_eq!(
+            probes.calls.borrow().clone(),
+            vec![
+                list_key(None),
+                mount_inspection_key("sandbox-guard"),
+                package_probe_key("sandbox-guard"),
+            ]
+        );
+        assert_no_package_mutation(&probes);
+    }
+
+    #[test]
+    fn missing_post_install_artifact_fails_without_recording_success_or_cleanup() {
+        let mut probes = lima_probes();
+        probes.outputs.insert(
+            list_key(None),
+            output(
+                true,
+                r#"{"name":"sandbox-guard","status":"Running","config":{}}"#,
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            mount_inspection_key("sandbox-guard"),
+            output(true, "/ ext4\n", ""),
+        );
+        probes.outputs.insert(
+            package_probe_key("sandbox-guard"),
+            output(false, "", "missing"),
+        );
+        for path in [GUEST_SUDO, GUEST_ENV, GUEST_APT_GET] {
+            probes.outputs.insert(
+                guest_test_key("sandbox-guard", "-x", path),
+                output(true, "", ""),
+            );
+        }
+        probes.outputs.insert(
+            guest_apt_key("sandbox-guard", &["update"]),
+            output(true, "", ""),
+        );
+        let mut install_args = vec!["install", "--yes", "--no-install-recommends", "--reinstall"];
+        install_args.extend_from_slice(GUEST_PACKAGE_NAMES);
+        probes.outputs.insert(
+            guest_apt_key("sandbox-guard", &install_args),
+            output(true, "", ""),
+        );
+        probes.outputs.insert(
+            guest_test_key("sandbox-guard", "-x", GUEST_BWRAP),
+            output(false, "", "missing after apt"),
+        );
+
+        let error = install_lima_guest_packages(&probes, "sandbox-guard", true).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("post-condition failed"));
+        assert!(rendered.contains("will not uninstall or roll back"));
+        assert!(probes.calls.borrow().iter().all(|call| {
+            !call.contains(" autoremove") && !call.contains(" remove ") && !call.contains(" clean")
+        }));
+        assert_no_destructive_lifecycle_mutation(&probes);
+    }
+
+    #[test]
+    fn unsafe_or_nonrunning_guest_is_never_provisioned() {
+        for (listing, mounts) in [
+            (output(true, "", ""), None),
+            (
+                output(
+                    true,
+                    r#"{"name":"sandbox-guard","status":"Stopped","config":{}}"#,
+                    "",
+                ),
+                None,
+            ),
+            (
+                output(
+                    true,
+                    r#"{"name":"sandbox-guard","status":"Running","config":{"mounts":[{"location":"/Users"}]}}"#,
+                    "",
+                ),
+                None,
+            ),
+            (
+                output(
+                    true,
+                    r#"{"name":"sandbox-guard","status":"Running","config":{}}"#,
+                    "",
+                ),
+                Some(output(true, "/Users virtiofs\n", "")),
+            ),
+        ] {
+            let mut probes = lima_probes();
+            probes.outputs.insert(list_key(None), listing);
+            if let Some(mounts) = mounts {
+                probes
+                    .outputs
+                    .insert(mount_inspection_key("sandbox-guard"), mounts);
+            }
+            assert!(install_lima_guest_packages(&probes, "sandbox-guard", true).is_err());
+            assert_no_package_mutation(&probes);
+            assert_no_lifecycle_mutation(&probes);
+        }
+    }
+
+    #[test]
+    fn guest_state_change_after_update_prevents_package_install() {
+        let mut probes = lima_probes();
+        let running = output(
+            true,
+            r#"{"name":"sandbox-guard","status":"Running","config":{}}"#,
+            "",
+        );
+        let stopped = output(
+            true,
+            r#"{"name":"sandbox-guard","status":"Stopped","config":{}}"#,
+            "",
+        );
+        queue_outputs(
+            &probes,
+            list_key(None),
+            vec![running.clone(), running, stopped],
+        );
+        probes.outputs.insert(
+            mount_inspection_key("sandbox-guard"),
+            output(true, "/ ext4\n", ""),
+        );
+        probes.outputs.insert(
+            package_probe_key("sandbox-guard"),
+            output(false, "", "missing"),
+        );
+        for path in [GUEST_SUDO, GUEST_ENV, GUEST_APT_GET] {
+            probes.outputs.insert(
+                guest_test_key("sandbox-guard", "-x", path),
+                output(true, "", ""),
+            );
+        }
+        let update = guest_apt_key("sandbox-guard", &["update"]);
+        probes.outputs.insert(update.clone(), output(true, "", ""));
+        let mut install_args = vec!["install", "--yes", "--no-install-recommends", "--reinstall"];
+        install_args.extend_from_slice(GUEST_PACKAGE_NAMES);
+        let install = guest_apt_key("sandbox-guard", &install_args);
+
+        let error = install_lima_guest_packages(&probes, "sandbox-guard", true).unwrap_err();
+        assert!(format!("{error:#}").contains("package-manager state may be partial"));
+        let calls = probes.calls.borrow();
+        assert!(calls.contains(&update));
+        assert!(!calls.contains(&install));
+        drop(calls);
+        assert_no_destructive_lifecycle_mutation(&probes);
+    }
+
+    #[test]
+    fn guest_apt_failure_is_terminal_safe_and_never_runs_cleanup() {
+        let mut probes = lima_probes();
+        probes.outputs.insert(
+            list_key(None),
+            output(
+                true,
+                r#"{"name":"sandbox-guard","status":"Running","config":{}}"#,
+                "",
+            ),
+        );
+        probes.outputs.insert(
+            mount_inspection_key("sandbox-guard"),
+            output(true, "/ ext4\n", ""),
+        );
+        probes.outputs.insert(
+            package_probe_key("sandbox-guard"),
+            output(false, "", "missing"),
+        );
+        for path in [GUEST_SUDO, GUEST_ENV, GUEST_APT_GET] {
+            probes.outputs.insert(
+                guest_test_key("sandbox-guard", "-x", path),
+                output(true, "", ""),
+            );
+        }
+        let update = guest_apt_key("sandbox-guard", &["update"]);
+        probes.outputs.insert(
+            update,
+            output(false, "", "boom\u{1b}]0;title\u{7}\u{202e}reversed"),
+        );
+
+        let error = install_lima_guest_packages(&probes, "sandbox-guard", true).unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(probes.calls.borrow().iter().all(|call| {
+            !call.contains(" autoremove") && !call.contains(" remove ") && !call.contains(" clean")
+        }));
+        assert_no_destructive_lifecycle_mutation(&probes);
+    }
+
+    #[test]
+    fn guest_package_install_confirmation_phrase_is_exact() {
+        assert!(guest_package_install_phrase_matches(
+            "sandbox-guard",
+            "INSTALL GUEST PACKAGES sandbox-guard\n"
+        ));
+        assert!(guest_package_install_phrase_matches(
+            "sandbox-guard",
+            "INSTALL GUEST PACKAGES sandbox-guard\r\n"
+        ));
+        for answer in [
+            "yes\n",
+            " INSTALL GUEST PACKAGES sandbox-guard\n",
+            "INSTALL GUEST PACKAGES sandbox-guard \n",
+            "INSTALL GUEST PACKAGES other\n",
+        ] {
+            assert!(!guest_package_install_phrase_matches(
+                "sandbox-guard",
+                answer
+            ));
+        }
+    }
+
+    #[test]
     fn instance_start_confirmation_phrase_is_exact() {
         assert!(instance_start_phrase_matches(
             "sandbox-guard",
@@ -2740,6 +3360,21 @@ mod tests {
     }
 
     #[test]
+    fn json_guest_packages_without_yes_is_rejected_before_probing() {
+        let probes = lima_probes();
+        let error = run_install_guest_packages(
+            &probes,
+            BackendKind::MacosLima,
+            "sandbox-guard",
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("--yes"));
+        assert!(probes.calls.borrow().is_empty());
+    }
+
+    #[test]
     fn linux_backend_rejects_create_before_mutation() {
         let probes = lima_probes();
         assert!(
@@ -2757,6 +3392,14 @@ mod tests {
             validate_instance_action_target("--create-instance", BackendKind::MacosLima, "linux")
                 .is_err()
         );
+        assert!(
+            validate_instance_action_target(
+                "--install-guest-packages",
+                BackendKind::LinuxBwrap,
+                "macos"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2764,11 +3407,35 @@ mod tests {
         assert!(Cli::try_parse_from(["guard", "setup", "--check"]).is_ok());
         assert!(Cli::try_parse_from(["guard", "setup", "--create-instance", "--yes"]).is_ok());
         assert!(Cli::try_parse_from(["guard", "setup", "--start-instance", "--yes"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["guard", "setup", "--install-guest-packages", "--yes"]).is_ok()
+        );
         assert!(Cli::try_parse_from(["guard", "setup", "--check", "--create-instance"]).is_err());
         assert!(Cli::try_parse_from(["guard", "setup", "--check", "--start-instance"]).is_err());
         assert!(
             Cli::try_parse_from(["guard", "setup", "--create-instance", "--start-instance"])
                 .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["guard", "setup", "--check", "--install-guest-packages"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "guard",
+                "setup",
+                "--start-instance",
+                "--install-guest-packages",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "guard",
+                "setup",
+                "--create-instance",
+                "--install-guest-packages",
+            ])
+            .is_err()
         );
         // `--yes` is deliberately inert without an explicit action, which lets future setup
         // actions reuse the confirmation flag without widening any current command path.

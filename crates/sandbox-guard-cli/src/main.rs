@@ -233,16 +233,30 @@ struct SetupArgs {
 
     /// Create the dedicated mountless Lima instance when it is absent (macOS backend only).
     /// This is the only command path that creates a VM; it never starts or reconfigures one.
-    #[arg(long, conflicts_with_all = ["check", "start_instance"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["check", "start_instance", "install_guest_packages"]
+    )]
     create_instance: bool,
 
     /// Start the dedicated Lima instance with host mounts disabled (macOS backend only).
     /// The instance must already exist and declare no host mounts.
-    #[arg(long, conflicts_with_all = ["check", "create_instance"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["check", "create_instance", "install_guest_packages"]
+    )]
     start_instance: bool,
 
+    /// Install the fixed runtime package-name set inside a running, verified-mountless Lima guest.
+    /// This invokes passwordless sudo only inside the dedicated guest, never on the host.
+    #[arg(
+        long,
+        conflicts_with_all = ["check", "create_instance", "start_instance"]
+    )]
+    install_guest_packages: bool,
+
     /// Confirm a mutating setup action without an interactive prompt. Required with
-    /// an instance action under --json, and the only way to mutate Lima on a non-interactive host.
+    /// a Lima action under --json, and the only way to mutate Lima on a non-interactive host.
     #[arg(long)]
     yes: bool,
 
