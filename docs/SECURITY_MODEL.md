@@ -362,6 +362,14 @@ from this store and does not automatically re-verify them before every run.
   not commit or push; those remain explicit host-side Git operations after review.
 - The verified tool store has no network downloader, root-owned key policy, privileged installer,
   canonical wrapper enforcement, rollback policy, or automatic verification at execution time.
+- The explicit Linux package setup action is not a Guard-artifact installer. It is restricted to
+  a non-root native Ubuntu 24.04 x86-64/ARM64 owner session, refuses WSL and detected containers,
+  and invokes fixed absolute host `sudo`, `env -i`, and APT argv only after exact confirmation.
+  It installs only the missing subset of `bubblewrap`, `git`, and `ca-certificates`, revalidating
+  the distribution, fixed installer paths, optional required-cgroup probe, and artifacts around
+  each mutation. It never changes sysctls, AppArmor, setuid bits, systemd/cgroup policy, Guard, or
+  `guard-helper`. The configured Ubuntu repositories, APT configuration, package versions, and
+  root-run maintainer hooks remain trusted; partial APT state is never automatically cleaned up.
 - The macOS backend requires a pre-created, correctly provisioned dedicated Lima guest and a Linux
   `guard-helper` installed inside it. The explicit helper setup action verifies a caller-supplied
   current-user-owned, single-link Linux AArch64 ELF against a caller-supplied SHA-256, copies only

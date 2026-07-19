@@ -102,12 +102,35 @@ state and inspect every prerequisite before validating the live boundary:
     guard setup --check
     guard test
 
+On a native, non-containerized Ubuntu 24.04 x86-64 or ARM64 host, Guard can
+install only the missing fixed runtime package subset after explicit consent:
+
+    guard setup --install-linux-packages
+
+Review the exact action, then type `INSTALL LINUX PACKAGES ubuntu-24.04`, or add
+`--yes` for an already-reviewed noninteractive invocation. The command uses
+fixed absolute `/usr/bin/sudo --non-interactive -- /usr/bin/env -i ...
+/usr/bin/apt-get` argv and only the package names `bubblewrap`, `git`, and
+`ca-certificates`. Versions, repository metadata, package-manager configuration,
+and root-run package hooks come from and therefore trust the host's configured
+Ubuntu APT sources. Guard refuses root, WSL and detected container execution, other distro
+versions, and unsupported architectures. It does not change sysctls, AppArmor,
+setuid bits, systemd/cgroup policy, Guard binaries, or `guard-helper`, and it
+does not clean up partial APT state automatically.
+
+When cgroup enforcement is required for deployment, make the exact runtime
+probe part of setup readiness and then run the complete hostile probe:
+
+    guard setup --check --require-cgroup
+    guard test --require-cgroup
+
 Plain `guard setup` is intentionally unprivileged: it creates or tightens only
 Guard-owned directories below the current user's data/configuration roots and
-prints commands for missing host dependencies. The explicit macOS-only creation,
-startup, and guest-package actions are separate confirmed exceptions. Creation
-and startup never invoke `sudo`; package installation invokes passwordless sudo
-only inside an already-running, verified-mountless guest. None invokes host sudo.
+prints commands for missing host dependencies. The explicit Linux package action
+above and the macOS-only creation, startup, and guest-package actions are separate
+confirmed exceptions. Creation and startup never invoke `sudo`; guest-package
+installation invokes passwordless sudo only inside an already-running,
+verified-mountless guest; only `--install-linux-packages` invokes host sudo.
 `guard setup --check` is the read-only/reporting form; add `--json` for the
 versioned machine-readable schema. Exit status is 0 when ready, 1 when known
 repairs remain, and 3 when a required probe failed and readiness is unknown.

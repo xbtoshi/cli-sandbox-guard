@@ -93,7 +93,13 @@ We will not adopt these weaker postures:
   artifact-signing identity, and no selected official artifact has the required live
   mountless-Lima evidence.
 - [ ] Install and verify the Linux runtime dependencies without silently weakening namespace or
-  cgroup requirements.
+  cgroup requirements. Partial: setup now diagnoses fixed `/usr/bin/env`, the CA bundle, glibc
+  2.39+, a real production-like Bubblewrap namespace launch, and the runner's exact transient
+  cgroup-v2 probe (`--require-cgroup` makes it readiness-blocking). The explicit Ubuntu 24.04-only
+  `--install-linux-packages` action installs and revalidates only the missing `bubblewrap`, `git`,
+  and `ca-certificates` subset without changing namespace/AppArmor/setuid/cgroup policy. The box
+  remains open pending live release-artifact qualification on both Linux architectures; Phase 5's
+  privileged signed Guard-artifact installer remains separate and open.
 - [x] Add `guard setup --check` and actionable diagnostics for the host/backend components it
   checks, including root-owned selected-tool receipt/artifact identity in the Lima guest.
 - [x] Add an explicit removal command that deletes only Guard-owned state.

@@ -136,6 +136,21 @@ private directories and prints manual commands for missing external
 dependencies. `guard setup --check --json` performs no repairs and emits the
 versioned readiness report.
 
+On a native Ubuntu 24.04 x86-64 or ARM64 host,
+`guard setup --install-linux-packages` is the separate host-package action. It is
+refused as root, under WSL/containers, on other distributions, or with another
+backend. If `/usr/bin/bwrap`, `/usr/bin/git`, and the system CA bundle are already
+usable it is an idempotent no-op. Otherwise the exact typed phrase
+`INSTALL LINUX PACKAGES ubuntu-24.04` (or `--yes`) authorizes fixed absolute
+`sudo`/`env -i`/`apt-get` argv that reinstall only the missing package subset from
+`bubblewrap`, `git`, and `ca-certificates`. Guard revalidates the distribution,
+installer executables, and artifacts around each APT mutation; it never changes
+user-namespace sysctls, AppArmor, setuid bits, systemd, cgroups, Guard binaries,
+or `guard-helper`. Package versions and root-run hooks remain trusted input from
+the host's configured Ubuntu repositories and APT configuration. Use
+`--require-cgroup` with setup or setup-check to make the runner's real transient
+cgroup-v2 probe readiness-blocking; it never downgrades required mode.
+
 On the macOS Lima backend, `guard setup --create-instance` is the only command
 that creates the dedicated VM, and only when it is absent. It runs exactly
 `limactl create --name <instance> --mount-none template:default`, then re-inspects
@@ -307,7 +322,9 @@ current user; advisory locks protect active stages.
 
 Install Bubblewrap and Git, then run:
 
+    guard setup --install-linux-packages
     guard setup
+    guard setup --check --require-cgroup   # when cgroups are deployment-required
     guard run -- my-ai-cli
 
 Static tools outside `/usr` and `/bin` are mounted individually. Tools needing adjacent runtime
@@ -321,6 +338,10 @@ when a delegated user systemd instance is available. Use `--cgroup required` to 
 is not. Before reporting cgroup enforcement, Guard launches a transient probe with the same
 memory, swap, task, and CPU controller properties required by the real scope, then reads the probe
 scope's cgroup v2 controller files back and requires exact effective values.
+Setup also requires the fixed `/usr/bin/env` clean-launch boundary, a nonempty
+system CA bundle, GNU libc 2.39 or newer for release binaries, and a successful
+production-like Bubblewrap namespace probe; finding an executable on `PATH` is
+reported for transparency but is not a publisher-authenticity claim.
 
 ## macOS
 
