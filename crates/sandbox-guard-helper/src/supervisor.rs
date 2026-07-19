@@ -431,6 +431,18 @@ pub struct ProbeReport {
     pub host_loopback_hidden: bool,
     pub namespace_escape_blocked: bool,
     pub process_memory_syscall_blocked: bool,
+    /// Every unconditional syscall in the seccomp deny list was issued live with non-destructive
+    /// arguments and rejected with EPERM.
+    pub denied_syscalls_blocked: bool,
+    /// Names and observed errnos for denied syscalls that did not return EPERM. Diagnostic only;
+    /// empty when the deny profile is fully enforced. Never contains argument contents.
+    pub denied_syscall_failures: Vec<String>,
+    /// A live clone call carrying a namespace flag was rejected with EPERM. The probe combines
+    /// CLONE_NEWNS with CLONE_FS, which the kernel otherwise rejects with EINVAL before creating a
+    /// child, so the call is non-destructive and distinguishes the seccomp argument filter.
+    pub namespace_clone_blocked: bool,
+    /// clone3 is intentionally shimmed to ENOSYS so libc falls back to the filterable clone ABI.
+    pub clone3_unavailable: bool,
     pub supervisor_memory_protected: bool,
     pub thread_creation_allowed: bool,
     pub core_dumps_disabled: bool,
@@ -475,6 +487,19 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
     let process_memory_syscall_blocked = process_memory_read_is_blocked();
     #[cfg(not(target_os = "linux"))]
     let process_memory_syscall_blocked = false;
+    #[cfg(target_os = "linux")]
+    let (denied_syscalls_blocked, denied_syscall_failures) = probe_denied_syscalls();
+    #[cfg(not(target_os = "linux"))]
+    let (denied_syscalls_blocked, denied_syscall_failures): (bool, Vec<String>) =
+        (false, Vec::new());
+    #[cfg(target_os = "linux")]
+    let namespace_clone_blocked = namespace_clone_is_blocked();
+    #[cfg(not(target_os = "linux"))]
+    let namespace_clone_blocked = false;
+    #[cfg(target_os = "linux")]
+    let clone3_unavailable = clone3_is_unavailable();
+    #[cfg(not(target_os = "linux"))]
+    let clone3_unavailable = false;
 
     let core = get_limit(libc::RLIMIT_CORE)?;
     let nofile = get_limit(libc::RLIMIT_NOFILE)?;
@@ -503,6 +528,9 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
             && host_loopback_hidden
             && namespace_escape_blocked
             && process_memory_syscall_blocked
+            && denied_syscalls_blocked
+            && namespace_clone_blocked
+            && clone3_unavailable
             && supervisor_memory_protected
             && thread_creation_allowed
             && core == 0,
@@ -515,6 +543,10 @@ pub fn run_probe(config: ProbeConfig) -> Result<ProbeReport, SupervisorError> {
         host_loopback_hidden,
         namespace_escape_blocked,
         process_memory_syscall_blocked,
+        denied_syscalls_blocked,
+        denied_syscall_failures,
+        namespace_clone_blocked,
+        clone3_unavailable,
         supervisor_memory_protected,
         thread_creation_allowed,
         core_dumps_disabled: core == 0,
@@ -577,6 +609,11 @@ fn classify_launcher_environment(raw: &[u8]) -> (bool, Vec<String>) {
 
 #[cfg(target_os = "linux")]
 fn process_memory_read_is_blocked() -> bool {
+    process_memory_read_errno() == Some(libc::EPERM)
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_read_errno() -> Option<i32> {
     let source = [0x5a_u8];
     let mut destination = [0_u8];
     let local = libc::iovec {
@@ -601,7 +638,155 @@ fn process_memory_read_is_blocked() -> bool {
             0_usize,
         )
     };
-    result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    syscall_errno(result)
+}
+
+#[cfg(target_os = "linux")]
+fn process_memory_write_errno() -> Option<i32> {
+    let source = [0x5a_u8];
+    let mut destination = [0_u8];
+    let local = libc::iovec {
+        iov_base: source.as_ptr().cast_mut().cast(),
+        iov_len: source.len(),
+    };
+    let remote = libc::iovec {
+        iov_base: destination.as_mut_ptr().cast(),
+        iov_len: destination.len(),
+    };
+    // Writing our own memory is permitted without capabilities, so EPERM here specifically proves
+    // the installed seccomp rule; a regressed filter only overwrites our own one-byte buffer.
+    // SAFETY: both iovec values refer to valid one-byte buffers for the duration of the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_process_vm_writev,
+            libc::getpid(),
+            &local as *const libc::iovec,
+            1_usize,
+            &remote as *const libc::iovec,
+            1_usize,
+            0_usize,
+        )
+    };
+    syscall_errno(result)
+}
+
+/// Issue every syscall in the seccomp deny list with non-destructive arguments and expect EPERM.
+/// Returns whether all were blocked plus diagnostics (names and errnos only) for any that were not.
+/// For capability-gated families (module, reboot, swap, kexec, ...) EPERM can also stem from the
+/// Bubblewrap capability drop; the self-process-memory calls and the separate namespace-clone
+/// probe specifically distinguish the installed filter.
+#[cfg(target_os = "linux")]
+fn probe_denied_syscalls() -> (bool, Vec<String>) {
+    let mut failures = Vec::new();
+    for syscall in crate::seccomp::DENIED_SYSCALLS {
+        let observed = match syscall.number as i64 {
+            libc::SYS_process_vm_readv => process_memory_read_errno(),
+            libc::SYS_process_vm_writev => process_memory_write_errno(),
+            number => raw_syscall_errno(number, denied_syscall_args(number)),
+        };
+        match observed {
+            Some(libc::EPERM) => {}
+            Some(errno) => failures.push(format!(
+                "{}: expected EPERM, observed errno {errno}",
+                syscall.name
+            )),
+            None => failures.push(format!(
+                "{}: expected EPERM, syscall succeeded",
+                syscall.name
+            )),
+        }
+    }
+    (failures.is_empty(), failures)
+}
+
+/// Exercise the filter's argument-sensitive clone branch without risking creation of a process or
+/// namespace. Linux rejects CLONE_NEWNS combined with CLONE_FS as EINVAL before creating a child;
+/// the installed seccomp filter must intercept the namespace flag first and return EPERM.
+#[cfg(target_os = "linux")]
+fn namespace_clone_is_blocked() -> bool {
+    let flags = i64::from(libc::CLONE_NEWNS | libc::CLONE_FS | libc::SIGCHLD);
+    // SAFETY: CLONE_NEWNS and CLONE_FS are an invalid kernel-defined combination, so this call
+    // cannot create a child even if the seccomp argument filter regresses.
+    let result = unsafe { libc::syscall(libc::SYS_clone, flags, 0_i64, 0_i64, 0_i64, 0_i64) };
+    syscall_errno(result) == Some(libc::EPERM)
+}
+
+/// The filter shims clone3 to ENOSYS so libc falls back to the filterable clone ABI. A null
+/// argument pointer cannot create a process even if the shim regresses.
+#[cfg(target_os = "linux")]
+fn clone3_is_unavailable() -> bool {
+    // SAFETY: no valid pointer is passed; a regressed filter fails with EFAULT or EINVAL instead.
+    let result = unsafe { libc::syscall(libc::SYS_clone3, 0_usize, 0_usize) };
+    result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS)
+}
+
+/// Call one syscall with the given side-effect-free arguments and report the resulting errno, or
+/// None when the syscall succeeded.
+#[cfg(target_os = "linux")]
+fn raw_syscall_errno(number: i64, args: [i64; 6]) -> Option<i32> {
+    // SAFETY: denied_syscall_args never produces a valid userspace pointer, so the kernel
+    // dereferences nothing, and every argument set fails validation before any side effect.
+    let result =
+        unsafe { libc::syscall(number, args[0], args[1], args[2], args[3], args[4], args[5]) };
+    syscall_errno(result)
+}
+
+#[cfg(target_os = "linux")]
+fn syscall_errno(result: i64) -> Option<i32> {
+    if result == -1 {
+        io::Error::last_os_error().raw_os_error()
+    } else {
+        None
+    }
+}
+
+/// Side-effect-free arguments for a live denial probe of one syscall. Pointers use the invalid
+/// address 1 (EFAULT), fds and pids use -1 (EBADF/ESRCH), and request, flag, and magic values are
+/// invalid, so every call fails — at the latest during argument validation — even if the seccomp
+/// filter regresses.
+#[cfg(target_os = "linux")]
+fn denied_syscall_args(number: i64) -> [i64; 6] {
+    const BAD_POINTER: i64 = 1;
+    const BAD_FD: i64 = -1;
+    match number {
+        libc::SYS_unshare => [-1, 0, 0, 0, 0, 0],
+        libc::SYS_setns => [BAD_FD, 0, 0, 0, 0, 0],
+        libc::SYS_mount => [BAD_POINTER, BAD_POINTER, BAD_POINTER, 0, 0, 0],
+        libc::SYS_umount2 => [BAD_POINTER, 0, 0, 0, 0, 0],
+        libc::SYS_pivot_root => [BAD_POINTER, BAD_POINTER, 0, 0, 0, 0],
+        libc::SYS_open_tree => [BAD_FD, BAD_POINTER, 0, 0, 0, 0],
+        libc::SYS_move_mount => [BAD_FD, BAD_POINTER, BAD_FD, BAD_POINTER, 0, 0],
+        libc::SYS_fsopen => [BAD_POINTER, 0, 0, 0, 0, 0],
+        libc::SYS_fsconfig => [BAD_FD, 0, 0, 0, 0, 0],
+        libc::SYS_fsmount => [BAD_FD, 0, 0, 0, 0, 0],
+        libc::SYS_mount_setattr => [BAD_FD, BAD_POINTER, 0, 0, 0, 0],
+        libc::SYS_bpf => [-1, 0, 0, 0, 0, 0],
+        libc::SYS_perf_event_open => [BAD_POINTER, -1, -1, BAD_FD, 0, 0],
+        libc::SYS_io_uring_setup => [0, BAD_POINTER, 0, 0, 0, 0],
+        libc::SYS_io_uring_enter => [BAD_FD, 0, 0, 0, 0, 0],
+        libc::SYS_io_uring_register => [BAD_FD, 0, 0, 0, 0, 0],
+        libc::SYS_open_by_handle_at => [BAD_FD, BAD_POINTER, 0, 0, 0, 0],
+        libc::SYS_name_to_handle_at => [BAD_FD, BAD_POINTER, BAD_POINTER, BAD_POINTER, 0, 0],
+        libc::SYS_process_madvise => [BAD_FD, BAD_POINTER, 1, 0, 0, 0],
+        libc::SYS_pidfd_open => [-1, 0, 0, 0, 0, 0],
+        libc::SYS_pidfd_send_signal => [BAD_FD, 0, 0, 0, 0, 0],
+        libc::SYS_pidfd_getfd => [BAD_FD, BAD_FD, 0, 0, 0, 0],
+        libc::SYS_ptrace => [-1, 0, 0, 0, 0, 0],
+        libc::SYS_userfaultfd => [-1, 0, 0, 0, 0, 0],
+        libc::SYS_kexec_load => [0, 0, BAD_POINTER, -1, 0, 0],
+        libc::SYS_kexec_file_load => [BAD_FD, BAD_FD, 0, BAD_POINTER, -1, 0],
+        libc::SYS_init_module => [BAD_POINTER, 0, BAD_POINTER, 0, 0, 0],
+        libc::SYS_finit_module => [BAD_FD, BAD_POINTER, 0, 0, 0, 0],
+        libc::SYS_delete_module => [BAD_POINTER, 0, 0, 0, 0, 0],
+        libc::SYS_reboot => [-1, -1, -1, 0, 0, 0],
+        libc::SYS_swapon => [BAD_POINTER, 0, 0, 0, 0, 0],
+        libc::SYS_swapoff => [BAD_POINTER, 0, 0, 0, 0, 0],
+        libc::SYS_acct => [BAD_POINTER, 0, 0, 0, 0, 0],
+        libc::SYS_add_key => [BAD_POINTER, BAD_POINTER, 0, 0, 0, 0],
+        libc::SYS_request_key => [BAD_POINTER, BAD_POINTER, 0, 0, 0, 0],
+        libc::SYS_keyctl => [-1, 0, 0, 0, 0, 0],
+        _ => unreachable!("denied syscall without probe arguments"),
+    }
 }
 
 #[cfg(target_os = "linux")]

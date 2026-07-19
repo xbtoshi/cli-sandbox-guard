@@ -216,9 +216,12 @@ isolation remains the pathname boundary.
 
 Audit enforcement booleans mean the corresponding setup completed: a failed seccomp `pre_exec`
 aborts process creation, while cgroup `true` requires the real-property capability probe and the
-controller-file readback plus the systemd-wrapped invocation. `guard test` separately executes a
-capability-independent denied
-process-memory syscall, compares every configured rlimit, and exercises controlled-proxy denial.
+controller-file readback plus the systemd-wrapped invocation. `guard test` separately issues every
+unconditional deny-list syscall with non-destructive arguments and requires EPERM. Self-process
+memory reads and writes are capability-independent, while capability-gated calls confirm the
+complete sandbox boundary rather than attributing EPERM to seccomp alone. The probe also exercises
+the namespace-flagged `clone` branch with a kernel-invalid flag combination, verifies the `clone3`
+ENOSYS shim, compares every configured rlimit, and exercises controlled-proxy denial.
 
 ## Change-export and apply invariants
 

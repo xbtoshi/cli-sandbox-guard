@@ -152,10 +152,11 @@ label in place:
 - [x] Live `/proc` probe sees no host PID and cannot read the trusted supervisor's memory.
 - [x] Every configured rlimit is read back exactly; CI requires the real cgroup controller-property
   probe and scope.
-- [~] Live `unshare` and self-`process_vm_readv` denial probes plus filter-construction tests for
-  `setns`, `clone3`, namespace
-  `clone` flags, BPF, perf, io_uring, and cross-process memory. Direct live probes for every denied
-  syscall remain to be added.
+- [x] Live denial probes for every syscall in the seccomp deny list (namespace, mount, BPF, perf,
+  io_uring, file-handle, cross-process memory, ptrace, pidfd, userfaultfd, module, reboot, swap,
+  accounting, and keyring families), each issued with non-destructive arguments and required to
+  return EPERM, plus a live namespace-flagged `clone` probe, the `clone3` ENOSYS shim, and exact
+  namespace `clone` mask filter-construction tests.
 - [ ] Live Lima backend in CI and end-to-end login/API/subprocess tests for each supported vendor
   CLI.
 

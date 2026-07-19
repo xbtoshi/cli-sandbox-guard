@@ -813,6 +813,18 @@ fn test_command(args: TestArgs) -> Result<i32> {
     let report: ProbeReport = serde_json::from_slice(
         &fs::read(&output).context("hostile backend probe did not produce its report")?,
     )?;
+    if !report.denied_syscalls_blocked {
+        bail!(
+            "the sandbox did not reject every configured denied syscall with EPERM: {:?}",
+            report.denied_syscall_failures
+        );
+    }
+    if !report.namespace_clone_blocked {
+        bail!("seccomp did not reject namespace-bearing clone with EPERM");
+    }
+    if !report.clone3_unavailable {
+        bail!("seccomp profile did not shim clone3 to ENOSYS");
+    }
     if !report.success {
         bail!("hostile backend probe reported a failed invariant: {report:#?}");
     }
@@ -912,7 +924,9 @@ fn test_command(args: TestArgs) -> Result<i32> {
     println!("PID namespace: ok");
     println!("host loopback isolation: ok");
     println!("controlled egress denial and direct-bypass isolation: ok");
-    println!("seccomp namespace and process-memory denial: ok");
+    println!("configured denied syscall outcomes (EPERM): ok");
+    println!("seccomp namespace clone-flag denial: ok");
+    println!("seccomp clone3 shim (ENOSYS): ok");
     println!("seccomp thread compatibility: ok");
     println!("trusted supervisor memory: protected");
     println!("trusted preflight sequencing: ok");

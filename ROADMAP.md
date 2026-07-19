@@ -184,7 +184,12 @@ still allowing approved authenticated API calls.
 - [ ] Replace the focused seccomp deny list with maintained, architecture-generated syscall groups
   qualified against each supported vendor workload.
 - [ ] Generate and test filters for x86-64 and ARM64 from one reviewed source definition.
-- [ ] Add live probes for every denied syscall family, not only filter-structure tests.
+- [x] Add live probes for every denied syscall family, not only filter-structure tests. The
+  hostile backend probe issues every unconditional deny-list syscall with non-destructive
+  arguments and requires EPERM, separately exercises the namespace-flagged `clone` branch with a
+  kernel-invalid flag combination, and verifies the `clone3` ENOSYS shim. Capability-independent
+  probes cross-check seccomp enforcement; capability-gated outcomes confirm the complete sandbox
+  boundary and remain structurally pinned to the shared deny table.
 - [ ] Enforce aggregate writable-disk, file-count, memory, PID, CPU, and network-bandwidth quotas.
 - [ ] Add crash recovery for interrupted multi-file apply transactions.
 - [ ] Add live credential refresh brokerage without exposing the refresh token.
