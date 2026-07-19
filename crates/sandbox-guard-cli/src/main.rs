@@ -63,7 +63,7 @@ enum Command {
     Events(EventArgs),
     /// Check host prerequisites without changing the system.
     Doctor(DoctorArgs),
-    /// Check readiness, repair Guard-owned state, or explicitly create/start the mountless VM.
+    /// Check readiness, repair Guard-owned state, or explicitly provision the mountless VM.
     Setup(SetupArgs),
     /// Inspect Guard-owned state and print a non-mutating removal plan.
     Uninstall(UninstallArgs),
@@ -253,7 +253,7 @@ struct SetupArgs {
     /// This is the only command path that creates a VM; it never starts or reconfigures one.
     #[arg(
         long,
-        conflicts_with_all = ["check", "start_instance", "install_guest_packages"]
+        conflicts_with_all = ["check", "start_instance", "install_guest_packages", "install_guest_helper"]
     )]
     create_instance: bool,
 
@@ -261,7 +261,7 @@ struct SetupArgs {
     /// The instance must already exist and declare no host mounts.
     #[arg(
         long,
-        conflicts_with_all = ["check", "create_instance", "install_guest_packages"]
+        conflicts_with_all = ["check", "create_instance", "install_guest_packages", "install_guest_helper"]
     )]
     start_instance: bool,
 
@@ -269,9 +269,27 @@ struct SetupArgs {
     /// This invokes passwordless sudo only inside the dedicated guest, never on the host.
     #[arg(
         long,
-        conflicts_with_all = ["check", "create_instance", "start_instance"]
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_helper"]
     )]
     install_guest_packages: bool,
+
+    /// Install a caller-supplied Linux ARM64 guard-helper into the verified mountless guest.
+    #[arg(
+        long,
+        value_name = "ARTIFACT",
+        requires = "guest_helper_sha256",
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages"]
+    )]
+    install_guest_helper: Option<PathBuf>,
+
+    /// Exact SHA-256 digest of the guest helper artifact.
+    #[arg(
+        long,
+        value_name = "HEX",
+        requires = "install_guest_helper",
+        conflicts_with_all = ["check", "create_instance", "start_instance", "install_guest_packages"]
+    )]
+    guest_helper_sha256: Option<String>,
 
     /// Confirm a mutating setup action without an interactive prompt. Required with
     /// a Lima action under --json, and the only way to mutate Lima on a non-interactive host.

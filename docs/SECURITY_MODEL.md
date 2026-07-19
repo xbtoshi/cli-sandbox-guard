@@ -329,7 +329,14 @@ from this store and does not automatically re-verify them before every run.
 - The verified tool store has no network downloader, root-owned key policy, privileged installer,
   canonical wrapper enforcement, rollback policy, or automatic verification at execution time.
 - The macOS backend requires a pre-created, correctly provisioned dedicated Lima guest and a Linux
-  `guard-helper` installed inside it.
+  `guard-helper` installed inside it. The explicit helper setup action verifies a caller-supplied
+  current-user-owned, single-link Linux AArch64 ELF against a caller-supplied SHA-256, copies only
+  an owner-private read-only snapshot, and revalidates the unique running mountless guest around
+  mutation. It verifies a root-owned mode-0755 single-link regular sibling before atomically
+  renaming it into place, then repeats the hash, metadata, and exact-version checks. Setup does not
+  download or authenticate the release source; selecting a signed, pinned artifact and digest
+  remains the operator's responsibility. A failed activation is not rolled back, and diagnostics
+  truthfully identify possible guest temporary leftovers.
 - Lima host-share detection fails closed when mount inspection cannot run but recognizes known
   share filesystem families by type. A new or manually configured sharing mechanism could require
   an updated check.

@@ -81,9 +81,11 @@ We will not adopt these weaker postures:
   instance, and the separate `guard setup --start-instance` action starts only an existing,
   declared-mountless stopped instance and verifies its live mounts. The explicit
   `guard setup --install-guest-packages` action installs and verifies the fixed package-name set only in
-  a running mountless guest, with revalidation around each guest package-manager mutation. These
-  actions are confirmed and never reconfigure/delete the VM; verified helper and vendor-tool
-  provisioning remain open.
+  a running mountless guest, with revalidation around each guest package-manager mutation. The
+  separate `guard setup --install-guest-helper ARTIFACT --guest-helper-sha256 HEX` action securely
+  snapshots a caller-verified Linux AArch64 helper, verifies it before and after an atomic guest
+  install, and fails closed on unsafe guest state. These actions are confirmed and never
+  reconfigure/delete the VM; selected verified vendor-tool provisioning remains open.
 - [ ] Install and verify the Linux runtime dependencies without silently weakening namespace or
   cgroup requirements.
 - [x] Add `guard setup --check` and actionable diagnostics for the host/backend components it

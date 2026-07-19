@@ -127,7 +127,7 @@ Alpha release archives for macOS ARM64 and Linux x86-64/ARM64, with
 `SHA256SUMS` and a per-file manifest, are published from signed tags as
 GitHub prereleases. Verify the tag signature and checksums first, then follow
 [docs/INSTALL.md](docs/INSTALL.md) for install, upgrade, rollback, and removal
-steps, including the remaining Lima helper and vendor-tool provisioning on macOS. The artifacts are
+steps, including verified Lima helper setup and the remaining vendor-tool provisioning on macOS. The artifacts are
 alpha prototypes, not production-ready. Maintainers cut releases with
 [docs/RELEASE.md](docs/RELEASE.md).
 
@@ -170,9 +170,26 @@ and verifies exact executable paths plus the CA bundle afterward. This invokes
 passwordless sudo only inside the guest. The package names are fixed, but their
 versions come from—and therefore trust—the guest's configured APT repositories,
 package-manager configuration, and root-run hooks/scripts. It never invokes host
-sudo or starts, reconfigures, stops, or deletes the VM. The helper and selected
-vendor tool remain manual. As with the other mutating setup actions, `--json`
+sudo or starts, reconfigures, stops, or deletes the VM. The selected vendor tool
+remains manual. As with the other mutating setup actions, `--json`
 requires `--yes`.
+
+`guard setup --install-guest-helper ARTIFACT --guest-helper-sha256 HEX` is the
+separate verified-helper action. `ARTIFACT` must be a current-user-owned,
+single-link regular Linux AArch64 ELF64 file and `HEX` must be its exact SHA-256.
+Guard opens it without following symlinks, rejects changes while reading it, and
+copies only a read-only snapshot from an owner-private temporary directory. It
+accepts only the running, uniquely identified mountless instance and requires the
+typed phrase `INSTALL GUEST HELPER <instance>` (or `--yes`). Inside the guest it
+verifies the copied digest, installs and verifies a unique root-owned mode-0755
+sibling in `/usr/local/bin`, atomically renames that file to `guard-helper`, and
+then verifies the installed digest, single-link regular-file metadata, and exact
+`guard-helper` version. An exact installed hash, metadata, and version is a no-op.
+Every command uses fixed absolute guest executables and discrete argv; no shell or
+host sudo is used. Failure reports whether temporary files may remain and never
+rolls back an existing helper or changes the VM lifecycle/configuration. Obtain
+the artifact and checksum from the same signed, pinned Guard release; setup does
+not download or authenticate a release for you.
 
 `guard uninstall` is the matching non-mutating removal plan. Confirmed state
 removal requires `--remove` and the exact terminal phrase (or explicit
@@ -290,10 +307,10 @@ Sandbox Guard therefore uses a dedicated Linux VM:
     limactl create --name=sandbox-guard --mount-none template:default
     limactl start --mount-none sandbox-guard
     guard setup --install-guest-packages --backend macos-lima
+    guard setup --install-guest-helper <linux-aarch64-guard-helper> --guest-helper-sha256 <sha256> --backend macos-lima
 
-Install a Linux build of `guard-helper` at `/usr/local/bin/guard-helper` inside the guest, together
-with the selected AI CLI. The guest must be dedicated to Guard and contain no credentials or host
-mounts. Then run:
+Use the helper and digest from the same verified release, then install the selected AI CLI. The
+guest must be dedicated to Guard and contain no credentials or host mounts. Then run:
 
     guard setup --backend macos-lima
     guard setup --check --backend macos-lima

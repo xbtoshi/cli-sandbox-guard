@@ -187,16 +187,36 @@ The package names are fixed, but versions come from—and therefore trust—the
 guest's configured APT repositories, package-manager configuration, and root-run
 hooks/scripts. This action does not use Guard's runtime egress broker. A partial
 failure is reported and left for inspection or an idempotent retry—Guard never
-runs package cleanup or stops/deletes the VM. The helper and selected vendor tool
-remain manual trusted operations: everything placed inside the guest joins the
-trusted computing base. Machine-readable `--json` mode requires `--yes`.
+runs package cleanup or stops/deletes the VM. The selected vendor tool remains a
+manual trusted operation: everything placed inside the guest joins the trusted
+computing base. Machine-readable `--json` mode requires `--yes`.
 
-Install the packaged Linux ARM64 helper inside the guest (the guest
-distribution needs glibc 2.39 or newer, e.g. Ubuntu 24.04+):
+Install the packaged Linux ARM64 helper with its exact digest from the verified
+release manifest (the guest distribution needs glibc 2.39 or newer, e.g. Ubuntu
+24.04+):
 
-    limactl copy sandbox-guard-<version>-macos-arm64/lima-guest/guard-helper sandbox-guard:/tmp/guard-helper
-    limactl shell sandbox-guard sudo install -m 0755 /tmp/guard-helper /usr/local/bin/guard-helper
-    limactl shell sandbox-guard rm /tmp/guard-helper
+    guard setup --install-guest-helper sandbox-guard-<version>-macos-arm64/lima-guest/guard-helper \
+      --guest-helper-sha256 <64-hex-digest-from-the-verified-manifest> \
+      --backend macos-lima
+
+The action requires the exact typed phrase `INSTALL GUEST HELPER sandbox-guard`
+(or `--yes`; JSON mode requires it). It does not download the artifact or decide
+which release to trust. It opens the caller-selected file with `O_NOFOLLOW`,
+requires current-user ownership, a regular file with one link and a stable bounded
+size, checks the exact digest and Linux AArch64 ELF header, then copies only a
+read-only snapshot from an owner-private temporary directory. The running Lima
+instance is revalidated as uniquely present, declared mountless, and live
+mountless around mutation.
+
+The guest copy is hashed before installation. Guard installs a unique root-owned
+mode-0755 sibling in `/usr/local/bin`, verifies its hash, regular/single-link
+metadata, and exact version, then atomically renames it to
+`/usr/local/bin/guard-helper` and repeats those checks. An already exact helper is
+an idempotent no-op. Fixed absolute guest executables and discrete argv are used
+throughout—never a shell or host sudo. If a copy, install, rename, cleanup, or
+postcondition fails, the diagnostic states whether guest temporary artifacts may
+remain. Guard does not restore an earlier helper and never starts, stops,
+reconfigures, or deletes the VM as part of this action.
 
 Install the AI CLI you intend to confine inside the guest as well (for Grok:
 `/opt/sandbox-guard/tools/grok`). Then validate:
